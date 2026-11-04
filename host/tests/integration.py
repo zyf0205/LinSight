@@ -53,26 +53,25 @@ def main():
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
     )
-    try:
-        _run_test(port, ctl, cli, log_dir, proc)
-    except BaseException:
+
+    def _stop_daemon():
         if proc.poll() is None:
             proc.send_signal(signal.SIGTERM)
             try:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 proc.kill()
+
+    try:
+        _run_test(port, ctl, cli, log_dir, proc)
+    except BaseException:
+        _stop_daemon()
         err = proc.stderr.read().decode(errors="replace")
         print("--- daemon stderr ---")
         print(err[-3000:])
         raise
     finally:
-        if proc.poll() is None:
-            proc.send_signal(signal.SIGTERM)
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+        _stop_daemon()
     print("integration: all passed")
 
 
@@ -105,29 +104,20 @@ def _run_test(port, ctl, cli, log_dir, proc):
     if not os.path.exists(log_path):
         fail(f"log file missing: {log_path}")
 
-    # pause -> daemon forwards CONTROL; fake device answers ACK; CLI echoes it.
-    # The CLI blocks until the ACK, so the command runs while the device side
-    # receives the CONTROL and replies.
-    with ThreadPoolExecutor(max_workers=1) as ex:
-        fut = ex.submit(_ctl_roundtrip, ctl, b"pause\n", False)
-        ftype, payload = _recv_frame(dev)
-        if ftype != 7 or b"pause" not in payload:
-            fail(f"expected CONTROL pause, got type={ftype} {payload!r}")
-        _reply_ack(dev, payload)
-        ack = fut.result(timeout=5)
-    if '"code":0' not in ack:
-        fail(f"expected ACK echo, got: {ack!r}")
+    def _control_roundtrip(cmd, needle):
+        """CLI sends cmd; device sees CONTROL, answers ACK; CLI gets the echo."""
+        with ThreadPoolExecutor(max_workers=1) as ex:
+            fut = ex.submit(_ctl_roundtrip, ctl, cmd)
+            ftype, payload = _recv_frame(dev)
+            if ftype != 7 or needle not in payload:
+                fail(f"expected CONTROL {cmd.decode()}, got type={ftype} {payload!r}")
+            _reply_ack(dev, payload)
+            ack = fut.result(timeout=5)
+        if '"code":0' not in ack:
+            fail(f"expected ACK echo, got: {ack!r}")
 
-    # resume the same way.
-    with ThreadPoolExecutor(max_workers=1) as ex:
-        fut = ex.submit(_ctl_roundtrip, ctl, b"resume\n", False)
-        ftype, payload = _recv_frame(dev)
-        if ftype != 7 or b"resume" not in payload:
-            fail(f"expected CONTROL resume, got type={ftype} {payload!r}")
-        _reply_ack(dev, payload)
-        ack = fut.result(timeout=5)
-    if '"code":0' not in ack:
-        fail(f"expected ACK echo, got: {ack!r}")
+    _control_roundtrip(b"pause\n", b"pause")
+    _control_roundtrip(b"resume\n", b"resume")
 
     # .lsc content check: header + 10 raw records.
     with open(log_path, "rb") as f:
@@ -188,28 +178,25 @@ def _free_port():
     return port
 
 
-def _ctl_roundtrip(ctl_path, msg, expect_ack=False):
-    """Send one control command, read the reply, return it as text."""
+def _ctl_roundtrip(ctl_path, msg):
+    """Send one control command, read the reply until EOF or an ACK arrives."""
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.settimeout(5)
     s.connect(ctl_path)
     s.sendall(msg)
-    if expect_ack:
-        data = s.recv(4096)
-    else:
-        # pause/resume replies arrive when the device ACKs; poll briefly.
-        data = b""
-        deadline = time.time() + 3
-        while time.time() < deadline:
-            try:
-                chunk = s.recv(4096)
-            except socket.timeout:
-                break
-            if not chunk:
-                break
-            data += chunk
-            if b"code" in data:
-                break
+    # pause/resume replies arrive when the device ACKs; poll briefly.
+    data = b""
+    deadline = time.time() + 3
+    while time.time() < deadline:
+        try:
+            chunk = s.recv(4096)
+        except socket.timeout:
+            break
+        if not chunk:
+            break
+        data += chunk
+        if b"code" in data:
+            break
     s.close()
     return data.decode(errors="replace")
 

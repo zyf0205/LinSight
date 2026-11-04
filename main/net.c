@@ -438,7 +438,9 @@ static int tcp_connect(const char *host, uint16_t port, int timeout_ms)
 
     int rc = connect(fd, (struct sockaddr *)&dest, sizeof(dest));
     if (rc < 0 && errno != EINPROGRESS) {
-        ESP_LOGW(TAG, "connect failed: errno %d", errno);
+        /* Per-attempt failures are routine (host offline) — summary is logged
+         * by the caller every 10th attempt. */
+        ESP_LOGD(TAG, "connect failed: errno %d", errno);
         close(fd);
         return -1;
     }
@@ -452,14 +454,14 @@ static int tcp_connect(const char *host, uint16_t port, int timeout_ms)
         };
         rc = select(fd + 1, NULL, &wfds, NULL, &tv);
         if (rc <= 0) {
-            ESP_LOGW(TAG, "connect timeout to %s:%u", host, (unsigned)port);
+            ESP_LOGD(TAG, "connect timeout to %s:%u", host, (unsigned)port);
             close(fd);
             return -1;
         }
         int so_error = 0;
         socklen_t optlen = sizeof(so_error);
         if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_error, &optlen) != 0 || so_error != 0) {
-            ESP_LOGW(TAG, "connect error: %d", so_error);
+            ESP_LOGD(TAG, "connect error: %d", so_error);
             close(fd);
             return -1;
         }

@@ -43,6 +43,7 @@
 #define CLI_MAX 8
 #define RX_BUF_SIZE 4096
 #define IDLE_TIMEOUT_MS 30000u
+#define LOG_BATCH 512u /* records per writer iteration */
 
 static const char *g_port = "8888";
 static const char *g_ctl_path = "/tmp/linsight.sock";
@@ -91,7 +92,7 @@ static void *writer_thread(void *arg)
 {
     (void)arg;
     lsc_writer_t w = {0};
-    bool open = false;
+    bool log_open = false;
 
     for (;;) {
         pthread_mutex_lock(&g_ring.lock);
@@ -100,18 +101,22 @@ static void *writer_thread(void *arg)
         }
         const bool finish = g_ring.done;
         const bool open_now = g_ring.open_req;
-        const bool close_now = g_ring.close_req;
+        /* A close must not clobber a just-issued open (session replacement), so
+         * close is ordered first, and deferred while records are still queued. */
+        const bool close_now = g_ring.close_req && g_ring.count == 0;
         char path[512] = {0};
         if (open_now) {
             memcpy(path, g_ring.open_path, sizeof(path));
             g_ring.open_req = false;
         }
-        g_ring.close_req = false;
+        if (close_now) {
+            g_ring.close_req = false;
+        }
 
+        static linsight_can_record_t batch[LOG_BATCH];
         uint32_t n = g_ring.count;
-        static linsight_can_record_t batch[512];
-        if (n > 512) {
-            n = 512;
+        if (n > LOG_BATCH) {
+            n = LOG_BATCH;
         }
         for (uint32_t i = 0; i < n; i++) {
             batch[i] = g_ring.rec[g_ring.head];
@@ -120,38 +125,44 @@ static void *writer_thread(void *arg)
         g_ring.count -= n;
         pthread_mutex_unlock(&g_ring.lock);
 
+        if (close_now && log_open) {
+            lsc_writer_close(&w);
+            log_open = false;
+        }
         if (open_now) {
-            if (open) {
+            if (log_open) {
                 lsc_writer_close(&w);
             }
             const uint32_t bitrate = 500000;
-            open = lsc_writer_open(&w, path, bitrate, (uint64_t)time(NULL)) == 0;
-            if (!open) {
+            log_open = lsc_writer_open(&w, path, bitrate, (uint64_t)time(NULL)) == 0;
+            if (!log_open) {
                 fprintf(stderr, TAG ": cannot open %s: %s\n", path, strerror(errno));
             }
         }
-        if (close_now && open) {
-            lsc_writer_close(&w);
-            open = false;
-        }
 
+        uint32_t ok = 0;
         for (uint32_t i = 0; i < n; i++) {
             if (lsc_writer_write(&w, &batch[i]) != 0) {
                 fprintf(stderr, TAG ": log write failed: %s\n", strerror(errno));
                 break;
             }
-            g_ring.written++;
+            ok++;
         }
-        if (n > 0 && open) {
+        if (ok > 0) {
+            pthread_mutex_lock(&g_ring.lock);
+            g_ring.written += ok;
+            pthread_mutex_unlock(&g_ring.lock);
+        }
+        if (n > 0 && log_open) {
             lsc_writer_flush(&w);
         }
 
         if (finish) {
             pthread_mutex_lock(&g_ring.lock);
-            const bool empty = g_ring.count == 0;
+            const bool empty = g_ring.count == 0 && !g_ring.open_req && !g_ring.close_req;
             pthread_mutex_unlock(&g_ring.lock);
             if (empty) {
-                if (open) {
+                if (log_open) {
                     lsc_writer_close(&w);
                 }
                 break;
@@ -167,9 +178,7 @@ typedef struct {
     int fd;
     linsight_parser_t parser;
     uint8_t payload[LINSIGHT_MAX_CAN_BATCH];
-    char peer[64];
     uint64_t recs;
-    uint64_t batches;
     char stats[512]; /* latest STATS JSON from the device */
     time_t last_rx;
 } device_t;
@@ -206,6 +215,15 @@ static bool send_all(int fd, const void *data, size_t len)
             if (errno == EINTR) {
                 continue;
             }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                /* Socket buffer full: wait briefly instead of tearing down the
+                 * connection over a transient stall. */
+                struct pollfd pfd = {.fd = fd, .events = POLLOUT};
+                if (poll(&pfd, 1, 2000) <= 0) {
+                    return false;
+                }
+                continue;
+            }
             return false;
         }
         p += n;
@@ -238,6 +256,8 @@ static bool send_control(int fd, const char *action)
 
 /* ------------------------------------------------------------- frames */
 
+static void cli_close(cli_conn_t *c);
+
 static void deliver_live(const linsight_can_record_t *recs, uint32_t n)
 {
     char line[128];
@@ -247,8 +267,7 @@ static void deliver_live(const linsight_can_record_t *recs, uint32_t n)
                 const int len = canlog_format_candump(&recs[i], g_session_start, line,
                                                       sizeof(line));
                 if (len > 0 && !send_all(g_cli[c].fd, line, (size_t)len)) {
-                    close(g_cli[c].fd);
-                    g_cli[c].fd = -1;
+                    cli_close(&g_cli[c]);
                 }
             }
         }
@@ -261,7 +280,10 @@ static void handle_batch(const uint8_t *payload, uint16_t len)
         return;
     }
     const uint16_t count = linsight_get_u16(payload);
-    if (count == 0 || len < (uint16_t)(2u + (uint32_t)count * LINSIGHT_REC_SIZE)) {
+    /* 32-bit length math: a u16 cast here would wrap for count > 3276 and
+     * let a malformed frame read/write far past the buffers. */
+    const uint32_t need = 2u + (uint32_t)count * LINSIGHT_REC_SIZE;
+    if (count == 0 || count > LINSIGHT_BATCH_MAX_RECORDS || (uint32_t)len < need) {
         fprintf(stderr, TAG ": bad batch len %u count %u\n", (unsigned)len,
                 (unsigned)count);
         return;
@@ -281,7 +303,6 @@ static void handle_batch(const uint8_t *payload, uint16_t len)
     }
 
     g_dev.recs += valid;
-    g_dev.batches++;
     if (valid) {
         wring_push(recs, valid);
         deliver_live(recs, valid);
@@ -316,11 +337,14 @@ static void handle_frame(void *ctx, uint8_t type, const uint8_t *payload, uint16
     case LINSIGHT_FRAME_ACK: {
         char ack[64] = {0};
         memcpy(ack, payload, len < sizeof(ack) - 1 ? len : sizeof(ack) - 1);
+        unsigned ack_id = 0;
+        sscanf(ack, "{\"id\":%u", &ack_id);
         for (int c = 0; c < CLI_MAX; c++) {
-            if (g_cli[c].fd >= 0 && g_cli[c].pending_id != 0) {
+            if (g_cli[c].fd >= 0 && g_cli[c].pending_id == (uint16_t)ack_id) {
                 g_cli[c].pending_id = 0;
                 send_all(g_cli[c].fd, ack, strlen(ack));
                 send_all(g_cli[c].fd, "\n", 1);
+                cli_close(&g_cli[c]); /* one reply, then EOF */
             }
         }
         break;
@@ -361,28 +385,30 @@ static void device_accept(int listen_fd)
     }
 
     set_nonblock(fd);
-    static uint8_t one = 1;
+    static int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 
     g_dev.fd = fd;
     g_dev.recs = 0;
-    g_dev.batches = 0;
     g_dev.last_rx = time(NULL);
     g_dev.stats[0] = '\0';
     linsight_parser_reset(&g_dev.parser);
     g_session_start = (uint64_t)time(NULL);
 
-    snprintf(g_dev.peer, sizeof(g_dev.peer), "device");
-    struct epoll_event ev = {.events = EPOLLIN, .data.u32 = 0}; /* u32 0 = device */
+    struct epoll_event ev = {.events = EPOLLIN, .data.u64 = 0}; /* u64 0 = device */
     epoll_ctl(g_epoll, EPOLL_CTL_ADD, fd, &ev);
 
     pthread_mutex_lock(&g_ring.lock);
     time_t t = time(NULL);
     struct tm tm;
     localtime_r(&t, &tm);
+    /* Monotonic suffix: two sessions in the same second must not truncate
+     * each other's log. */
+    static uint32_t session_seq;
+    session_seq++;
     snprintf(g_ring.open_path, sizeof(g_ring.open_path),
-             "%s/can-%04d%02d%02d-%02d%02d%02d.lsc", g_log_dir, tm.tm_year + 1900,
-             tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
+             "%s/can-%04d%02d%02d-%02d%02d%02d-%03u.lsc", g_log_dir, tm.tm_year + 1900,
+             tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec, session_seq);
     snprintf(g_current_log, sizeof(g_current_log), "%s", g_ring.open_path);
     g_ring.open_req = true;
     pthread_cond_signal(&g_ring.cond);
@@ -426,14 +452,16 @@ static void cli_dispatch(cli_conn_t *c)
             (unsigned long long)written, (unsigned long long)dropped,
             g_current_log[0] ? g_current_log : "",
             g_dev.stats[0] ? g_dev.stats : "{}");
-        send_all(c->fd, out, (size_t)n);
+        size_t out_len =
+            (n <= 0) ? 0 : ((size_t)n >= sizeof(out) ? sizeof(out) - 1 : (size_t)n);
+        send_all(c->fd, out, out_len);
         cli_close(c);
     } else if (strcmp(cmd, "live") == 0) {
         c->live = true; /* records stream until the client goes away */
     } else if (strcmp(cmd, "pause") == 0 || strcmp(cmd, "resume") == 0 ||
                strcmp(cmd, "clear") == 0) {
         if (g_dev.fd < 0) {
-            send_all(c->fd, "ERR no device\n", 14);
+            send_all(c->fd, "ERR no device\n", strlen("ERR no device\n"));
             cli_close(c);
             return;
         }
@@ -441,7 +469,7 @@ static void cli_dispatch(cli_conn_t *c)
         send_control(g_dev.fd, strcmp(cmd, "clear") == 0 ? "clear_stats" : cmd);
         c->pending_id = g_ctrl_id;
     } else {
-        send_all(c->fd, "ERR unknown command\n", 21);
+        send_all(c->fd, "ERR unknown command\n", strlen("ERR unknown command\n"));
         cli_close(c);
     }
 }
@@ -515,7 +543,12 @@ int main(int argc, char **argv)
 {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
-            g_port = argv[++i];
+            const int p = atoi(argv[++i]);
+            if (p <= 0 || p > 65535) {
+                fprintf(stderr, "linsightd: bad port '%s'\n", argv[i]);
+                return 1;
+            }
+            g_port = argv[i];
         } else if (strcmp(argv[i], "--ctl") == 0 && i + 1 < argc) {
             g_ctl_path = argv[++i];
         } else if (strcmp(argv[i], "--log-dir") == 0 && i + 1 < argc) {
@@ -534,7 +567,8 @@ int main(int argc, char **argv)
     sigaddset(&mask, SIGINT);
     sigaddset(&mask, SIGPIPE);
     sigprocmask(SIG_BLOCK, &mask, NULL);
-    const int sigfd = signalfd(-1, &mask, 0);
+    /* Nonblocking: the drain loops below must never block the main loop. */
+    const int sigfd = signalfd(-1, &mask, SFD_NONBLOCK);
 
     const int tcp_fd = make_listener(g_port, false);
     const int unix_fd = make_listener(g_ctl_path, true);
@@ -548,27 +582,38 @@ int main(int argc, char **argv)
         g_cli[i].fd = -1;
     }
     linsight_parser_init(&g_dev.parser, g_dev.payload, LINSIGHT_MAX_CAN_BATCH);
+    if (g_epoll < 0) {
+        fprintf(stderr, TAG ": epoll_create1 failed: %s\n", strerror(errno));
+        return 1;
+    }
 
-    struct epoll_event ev;
+    struct epoll_event ev = {0}; /* zero-init: u64 tags must not carry stack garbage */
     ev.events = EPOLLIN;
-    ev.data.u32 = 1; /* tcp listener */
+    ev.data.u64 = 1; /* tcp listener */
     epoll_ctl(g_epoll, EPOLL_CTL_ADD, tcp_fd, &ev);
-    ev.data.u32 = 2; /* unix listener */
+    ev.data.u64 = 2; /* unix listener */
     epoll_ctl(g_epoll, EPOLL_CTL_ADD, unix_fd, &ev);
-    ev.data.u32 = 3; /* signalfd */
+    ev.data.u64 = 3; /* signalfd */
     epoll_ctl(g_epoll, EPOLL_CTL_ADD, sigfd, &ev);
 
-    const int tfd = timerfd_create(CLOCK_MONOTONIC, 0);
+    const int tfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
+    if (tfd < 0) {
+        fprintf(stderr, TAG ": timerfd_create failed: %s\n", strerror(errno));
+        return 1;
+    }
     struct itimerspec its = {
         .it_interval = {.tv_sec = 1},
         .it_value = {.tv_sec = 1},
     };
     timerfd_settime(tfd, 0, &its, NULL);
-    ev.data.u32 = 4; /* timer */
+    ev.data.u64 = 4; /* timer */
     epoll_ctl(g_epoll, EPOLL_CTL_ADD, tfd, &ev);
 
     pthread_t writer;
-    pthread_create(&writer, NULL, writer_thread, NULL);
+    if (pthread_create(&writer, NULL, writer_thread, NULL) != 0) {
+        fprintf(stderr, TAG ": writer thread failed\n");
+        return 1;
+    }
 
     fprintf(stderr, TAG ": listening on :%s, ctl %s, logs %s\n", g_port, g_ctl_path,
             g_log_dir);
@@ -592,6 +637,14 @@ int main(int argc, char **argv)
             } else if (tag == 4) { /* 1 Hz stats */
                 uint64_t misses;
                 while (read(tfd, &misses, sizeof(misses)) == sizeof(misses)) {
+                }
+                /* Idle watchdog: the device pings every 5 s; a silent session
+                 * for IDLE_TIMEOUT_MS is a dead link (e.g. lost Wi-Fi). */
+                if (g_dev.fd >= 0 && g_dev.last_rx &&
+                    time(NULL) - g_dev.last_rx > IDLE_TIMEOUT_MS / 1000u) {
+                    fprintf(stderr, TAG ": device idle > %us, closing\n",
+                            (unsigned)(IDLE_TIMEOUT_MS / 1000u));
+                    device_close();
                 }
                 pthread_mutex_lock(&g_ring.lock);
                 const uint64_t written = g_ring.written;

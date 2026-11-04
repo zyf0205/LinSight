@@ -58,11 +58,19 @@ static int ctl_cmd(const char *path, const char *cmd)
 
     static char buf[REPLY_MAX];
     ssize_t got;
-    while ((got = read(fd, buf, sizeof(buf))) > 0) {
-        fwrite(buf, 1, (size_t)got, stdout);
-        if (got < (ssize_t)sizeof(buf)) {
-            /* Likely drained; try once more with a short poll effect via EOF loop */
+    for (;;) {
+        got = read(fd, buf, sizeof(buf));
+        if (got > 0) {
+            fwrite(buf, 1, (size_t)got, stdout);
+            continue;
         }
+        if (got < 0 && errno == EINTR) {
+            continue;
+        }
+        if (got < 0 && errno != 0) {
+            fprintf(stderr, "linsight-cli: read failed: %s\n", strerror(errno));
+        }
+        break;
     }
     close(fd);
     return 0;

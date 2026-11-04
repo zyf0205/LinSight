@@ -34,6 +34,9 @@ int lsc_writer_open(lsc_writer_t *w, const char *path, uint32_t bitrate, uint64_
 
 int lsc_writer_write(lsc_writer_t *w, const linsight_can_record_t *r)
 {
+    if (!w->f) {
+        return -1; /* caller must not write to a closed log */
+    }
     uint8_t buf[LINSIGHT_REC_SIZE];
     linsight_record_pack(r, buf);
     if (fwrite(buf, 1, LINSIGHT_REC_SIZE, w->f) != LINSIGHT_REC_SIZE) {
@@ -76,6 +79,11 @@ long lsc_read(const char *path, lsc_record_cb cb, void *ctx)
     linsight_can_record_t rec;
     while (fread(buf, 1, LINSIGHT_REC_SIZE, f) == LINSIGHT_REC_SIZE) {
         linsight_record_unpack(buf, &rec);
+        /* The file may be untrusted (truncated tail, foreign writer): clamp
+         * dlc so export loops never read past data[]. */
+        if (rec.dlc > LINSIGHT_DLC_MAX) {
+            rec.dlc = LINSIGHT_DLC_MAX;
+        }
         cb(&rec, ctx);
         count++;
     }
@@ -187,6 +195,13 @@ int canlog_format_candump(const linsight_can_record_t *r, uint64_t start_wall, c
                           size_t cap)
 {
     const double ts = (double)start_wall + (double)r->ts_ms / 1000.0;
+    if (r->flags & LINSIGHT_REC_FLAG_RTR) {
+        const size_t used =
+            (size_t)snprintf(buf, cap, "(%.6f) can0 %s%08X remote request (%u)", ts,
+                             (r->flags & LINSIGHT_REC_FLAG_EXT) ? "" : "   ",
+                             (unsigned)r->id, (unsigned)r->dlc);
+        return used >= cap ? -1 : (int)used;
+    }
     size_t used = (size_t)snprintf(buf, cap, "(%.6f) can0 %s%08X [%u]", ts,
                                    (r->flags & LINSIGHT_REC_FLAG_EXT) ? "" : "   ",
                                    (unsigned)r->id, (unsigned)r->dlc);

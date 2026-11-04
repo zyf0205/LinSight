@@ -80,7 +80,7 @@ linsightd ─→ .lsc 日志 / ASC 导出 / linsight-cli（Unix socket）
 |---|---|---|---|
 | M0 台架 ✅ | 2d | USB-CAN + 3.3V 收发器（GPIO10=TX，GPIO11=RX）；TWAI listen-only 500k | 139/139 帧逐字节比对通过，中位间隔 10.1 ms |
 | M1 设备 UI ✅ | 1w | ring、trace、统计、设置、Wi-Fi 流式 | 自测突发 30000 帧 @4330 fps（96% 负载）零丢失；ring 52428 条无溢出 |
-| M2 主机 MVP ✅ | 1w | epoll daemon、`.lsc`、CLI stats/live/export、CONTROL/ACK | ctest 3/3 绿（单元 + 假设备集成）；慢速写盘路径有界 ring |
+| M2 主机 MVP ✅ | 1w | epoll daemon、`.lsc`、CLI stats/live/export、CONTROL/ACK | ctest 3/3 绿；真实设备端到端验证（HELLO/STATS/PING→PONG/CONTROL→ACK/SIGTERM 优雅退出） |
 | M3 健壮性 | 1w | 过滤、触发、bus-off 恢复验证、双路对照 | 注入故障可恢复 |
 | M4 工具链 | 1w | 回放、DBC、systemd、fuzz/CI | ASC 可读，fuzz 全绿 |
 | M5 soak/演示 | 3–5d | 24h soak、文档、演示视频 | P0 指标 |
