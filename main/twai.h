@@ -49,10 +49,13 @@ typedef struct {
  * UI starts: the 20 Hz refresh timer reads stats as soon as it exists. */
 esp_err_t twai_capture_init(void);
 
-/* Start the TWAI task on core 0. One instance only. */
+/* Start the TWAI task on core 0. One instance only. Called by app_main and by
+ * twai_capture_restart() while it holds the restart lock, so this function
+ * must never take that lock itself. */
 esp_err_t twai_capture_start(can_bitrate_t bitrate, can_mode_t mode);
 
-/* Stop and re-configure (Settings page / CONTROL.set_config). */
+/* Stop and re-configure (Settings page / CONTROL.set_config). Serialized
+ * against other restarts and manual recovery; paused state is preserved. */
 esp_err_t twai_capture_restart(can_bitrate_t bitrate, can_mode_t mode);
 
 void twai_capture_set_paused(bool paused);

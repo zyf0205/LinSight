@@ -4,6 +4,7 @@
 #include "esp_chip_info.h"
 #include "esp_log.h"
 #include "esp_psram.h"
+#include "esp_system.h"
 #include "esp_lvgl_port.h"
 #include "frame.h"
 #include "freertos/FreeRTOS.h"
@@ -15,6 +16,34 @@
 #include "sdkconfig.h"
 
 static const char *TAG = "linsight";
+
+static const char *reset_reason_name(esp_reset_reason_t reason)
+{
+    switch (reason) {
+    case ESP_RST_POWERON:
+        return "POWERON";
+    case ESP_RST_EXT:
+        return "EXT";
+    case ESP_RST_SW:
+        return "SW";
+    case ESP_RST_PANIC:
+        return "PANIC";
+    case ESP_RST_INT_WDT:
+        return "INT_WDT";
+    case ESP_RST_TASK_WDT:
+        return "TASK_WDT";
+    case ESP_RST_WDT:
+        return "WDT";
+    case ESP_RST_DEEPSLEEP:
+        return "DEEPSLEEP";
+    case ESP_RST_BROWNOUT:
+        return "BROWNOUT";
+    case ESP_RST_SDIO:
+        return "SDIO";
+    default:
+        return "UNKNOWN";
+    }
+}
 
 static void user_button_cb(bsp_button_event_t event)
 {
@@ -32,11 +61,12 @@ void app_main(void)
     esp_chip_info(&chip);
     ESP_LOGI(TAG, "chip model=%d cores=%d revision=%d", chip.model, chip.cores, chip.revision);
     ESP_LOGI(TAG, "PSRAM size: %u bytes", (unsigned)esp_psram_get_size());
+    ESP_LOGI(TAG, "reset reason: %s", reset_reason_name(esp_reset_reason()));
 
     ESP_ERROR_CHECK(bsp_init());
 
     /* 1 MB PSRAM ring at 20 B/record: ~52k frames of offline buffering. */
-    ESP_ERROR_CHECK(can_ring_init(1048576u / LINSIGHT_REC_SIZE));
+    ESP_ERROR_CHECK(can_ring_init(1048576u / sizeof(linsight_can_record_t)));
     ESP_ERROR_CHECK(twai_capture_init());
 
 #if CONFIG_LINSIGHT_BENCH_SELFTEST

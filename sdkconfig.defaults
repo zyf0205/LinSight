@@ -37,8 +37,9 @@ CONFIG_LV_FONT_MONTSERRAT_16=y
 CONFIG_LV_FONT_MONTSERRAT_20=y
 CONFIG_LV_FONT_MONTSERRAT_24=y
 
-# LinSight host connection (Wi-Fi credentials are set in menuconfig)
-CONFIG_LINSIGHT_HOST="10.100.2.199"
+# LinSight host connection (Wi-Fi credentials and the real host IP are set in
+# menuconfig and live only in the ignored sdkconfig).
+CONFIG_LINSIGHT_HOST=""
 CONFIG_LINSIGHT_PORT=8888
 
 # Custom partition table: 4MB factory app + 64KB coredump

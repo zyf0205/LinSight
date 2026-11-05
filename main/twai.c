@@ -32,7 +32,7 @@ typedef struct {
     can_mode_t mode;
     volatile bool paused;
     volatile bool running;
-    TaskHandle_t task;
+    TaskHandle_t volatile task;
     SemaphoreHandle_t lock;
     QueueHandle_t events;
     const char *state; /* "RUNNING" / "BUS_OFF" / "RECOVERING" / "STOPPED" */
@@ -45,6 +45,11 @@ typedef struct {
 static can_state_t s_can = {
     .state = "STOPPED",
 };
+
+/* Serializes start/restart/recover: the Settings page (LVGL task) and
+ * CONTROL.set_config (net_task) can otherwise stop and reinstall the driver
+ * concurrently. Never take this lock from within the TWAI task itself. */
+static SemaphoreHandle_t s_restart_lock;
 
 /* Capture-side UI history: unlike the network ring, these records are never
  * popped by net_task, so the display always has a complete recent window. */
@@ -297,6 +302,7 @@ static void twai_task(void *arg)
         window_start = now;
     }
 
+    set_state("STOPPED");
     twai_stop();
     twai_driver_uninstall();
     s_can.task = NULL;
@@ -305,12 +311,18 @@ static void twai_task(void *arg)
 
 esp_err_t twai_capture_init(void)
 {
-    if (s_can.lock && s_can.events) {
-        return ESP_OK;
+    /* Create each object once: a caller may reach here after a partial init
+     * (or another task may have initialized it concurrently). */
+    if (!s_can.lock) {
+        s_can.lock = xSemaphoreCreateMutex();
     }
-    s_can.lock = xSemaphoreCreateMutex();
-    s_can.events = xQueueCreate(EVENT_QUEUE_LEN, sizeof(can_event_t));
-    return (s_can.lock && s_can.events) ? ESP_OK : ESP_ERR_NO_MEM;
+    if (!s_can.events) {
+        s_can.events = xQueueCreate(EVENT_QUEUE_LEN, sizeof(can_event_t));
+    }
+    if (!s_restart_lock) {
+        s_restart_lock = xSemaphoreCreateMutex();
+    }
+    return (s_can.lock && s_can.events && s_restart_lock) ? ESP_OK : ESP_ERR_NO_MEM;
 }
 
 esp_err_t twai_capture_start(can_bitrate_t bitrate, can_mode_t mode)
@@ -319,14 +331,9 @@ esp_err_t twai_capture_start(can_bitrate_t bitrate, can_mode_t mode)
         return ESP_ERR_INVALID_STATE;
     }
 
-    if (!s_can.lock || !s_can.events) {
+    if (!s_can.lock || !s_can.events || !s_restart_lock) {
         ESP_RETURN_ON_ERROR(twai_capture_init(), TAG, "twai init");
     }
-
-    s_can.bitrate = bitrate;
-    s_can.mode = mode;
-    s_can.paused = false;
-    s_can.state = "RUNNING";
 
     twai_general_config_t general = TWAI_GENERAL_CONFIG_DEFAULT(TWAI_TX_GPIO, TWAI_RX_GPIO,
                                                                TWAI_MODE_LISTEN_ONLY);
@@ -347,22 +354,39 @@ esp_err_t twai_capture_start(can_bitrate_t bitrate, can_mode_t mode)
                              TWAI_ALERT_ERR_PASS | TWAI_ALERT_BUS_ERROR |
                              TWAI_ALERT_RX_QUEUE_FULL;
 
-    ESP_RETURN_ON_ERROR(twai_driver_install(&general, timing_for(bitrate), &FILTER_ACCEPT_ALL),
-                        TAG, "twai install");
+    const esp_err_t install_err = twai_driver_install(&general, timing_for(bitrate),
+                                                      &FILTER_ACCEPT_ALL);
+    if (install_err != ESP_OK) {
+        set_state("STOPPED");
+        ESP_LOGE(TAG, "twai install: %s", esp_err_to_name(install_err));
+        return install_err;
+    }
     const esp_err_t start_err = twai_start();
     if (start_err != ESP_OK) {
         twai_driver_uninstall();
+        set_state("STOPPED");
         ESP_LOGE(TAG, "twai start: %s", esp_err_to_name(start_err));
         return start_err;
     }
 
+    /* Commit only after the driver is live: a failed install/start must not
+     * leave STATS/UI advertising a configuration that never took effect. */
+    stats_lock();
+    s_can.bitrate = bitrate;
+    s_can.mode = mode;
+    s_can.state = "RUNNING";
+    stats_unlock();
+
     s_can.running = true;
+    TaskHandle_t handle = NULL;
     const BaseType_t ok = xTaskCreatePinnedToCore(twai_task, "twai", TWAI_TASK_STACK, NULL,
-                                                  TWAI_TASK_PRIO, &s_can.task, TWAI_CORE);
+                                                  TWAI_TASK_PRIO, &handle, TWAI_CORE);
+    s_can.task = handle;
     if (ok != pdPASS) {
         s_can.running = false;
         twai_stop();
         twai_driver_uninstall();
+        set_state("STOPPED");
         return ESP_ERR_NO_MEM;
     }
 
@@ -373,10 +397,15 @@ esp_err_t twai_capture_start(can_bitrate_t bitrate, can_mode_t mode)
 
 esp_err_t twai_capture_restart(can_bitrate_t bitrate, can_mode_t mode)
 {
-    const bool was_paused = s_can.paused;
+    if (!s_restart_lock) {
+        ESP_RETURN_ON_ERROR(twai_capture_init(), TAG, "twai init");
+    }
+    xSemaphoreTake(s_restart_lock, portMAX_DELAY);
 
+    esp_err_t err;
     if (!s_can.task) {
-        return twai_capture_start(bitrate, mode);
+        err = twai_capture_start(bitrate, mode);
+        goto out;
     }
 
     s_can.running = false; /* the task stops, uninstalls the driver, clears .task */
@@ -384,14 +413,15 @@ esp_err_t twai_capture_restart(can_bitrate_t bitrate, can_mode_t mode)
         vTaskDelay(pdMS_TO_TICKS(50));
     }
     if (s_can.task) {
-        return ESP_ERR_INVALID_STATE;
+        err = ESP_ERR_INVALID_STATE;
+        goto out;
     }
 
-    const esp_err_t err = twai_capture_start(bitrate, mode);
-    if (err == ESP_OK && was_paused) {
-        /* A bitrate/mode change is not a resume; keep the capture state. */
-        s_can.paused = true;
-    }
+    /* paused is deliberately not touched: a bitrate/mode change is not a
+     * resume, and twai_capture_start() no longer clears it. */
+    err = twai_capture_start(bitrate, mode);
+out:
+    xSemaphoreGive(s_restart_lock);
     return err;
 }
 
@@ -403,32 +433,40 @@ void twai_capture_set_paused(bool paused)
 
 esp_err_t twai_capture_recover(void)
 {
+    if (!s_restart_lock) {
+        ESP_RETURN_ON_ERROR(twai_capture_init(), TAG, "twai init");
+    }
+    xSemaphoreTake(s_restart_lock, portMAX_DELAY);
+
+    esp_err_t err;
     if (!s_can.task) {
-        return ESP_ERR_INVALID_STATE;
+        err = ESP_ERR_INVALID_STATE;
+        goto out;
     }
 
     twai_status_info_t status = {0};
-    const esp_err_t info_err = twai_get_status_info(&status);
-    if (info_err != ESP_OK) {
-        return info_err;
+    err = twai_get_status_info(&status);
+    if (err != ESP_OK) {
+        goto out;
     }
 
     if (status.state == TWAI_STATE_BUS_OFF) {
-        const esp_err_t err = twai_initiate_recovery();
+        err = twai_initiate_recovery();
         if (err == ESP_OK) {
             set_state("RECOVERING");
             ESP_LOGW(TAG, "manual bus-off recovery");
         }
-        return err;
-    }
-    if (status.state == TWAI_STATE_STOPPED) {
-        const esp_err_t err = twai_start();
+    } else if (status.state == TWAI_STATE_STOPPED) {
+        err = twai_start();
         if (err == ESP_OK) {
             set_state("RUNNING");
         }
-        return err;
+    } else {
+        err = ESP_OK; /* running or already recovering */
     }
-    return ESP_OK; /* running or already recovering */
+out:
+    xSemaphoreGive(s_restart_lock);
+    return err;
 }
 
 void twai_stats_snapshot(can_stats_t *out)

@@ -22,7 +22,7 @@ esp_err_t can_ring_init(uint32_t capacity_records)
         return ESP_ERR_INVALID_ARG;
     }
 
-    s_buf = heap_caps_malloc((size_t)capacity_records * LINSIGHT_REC_SIZE,
+    s_buf = heap_caps_malloc((size_t)capacity_records * sizeof(*s_buf),
                              MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!s_buf) {
         return ESP_ERR_NO_MEM;
@@ -42,9 +42,10 @@ void can_ring_push(linsight_can_record_t *rec)
     xSemaphoreTake(s_lock, portMAX_DELAY);
 
     if (s_count == s_cap) {
-        /* Full: drop the oldest record and overwrite it. */
+        /* Full: s_head points at the oldest record (head == tail when full),
+         * so drop it in place. Advancing head here would overwrite the
+         * second-oldest record and keep the stale oldest one instead. */
         s_dropped++;
-        s_head = (s_head + 1) % s_cap;
         s_count--;
     }
 
@@ -78,28 +79,6 @@ uint32_t can_ring_pop(linsight_can_record_t *out, uint32_t max)
 
     xSemaphoreGive(s_lock);
     return n;
-}
-
-uint32_t can_ring_tail(linsight_can_record_t *out, uint32_t n)
-{
-    if (n == 0) {
-        return 0;
-    }
-
-    xSemaphoreTake(s_lock, portMAX_DELAY);
-
-    const uint32_t avail = s_count < n ? s_count : n;
-    /* Newest last: copy records [count-avail, count). */
-    for (uint32_t i = 0; i < avail; i++) {
-        uint32_t idx = s_head + s_cap - avail + i;
-        if (idx >= s_cap) {
-            idx -= s_cap;
-        }
-        out[i] = s_buf[idx];
-    }
-
-    xSemaphoreGive(s_lock);
-    return avail;
 }
 
 void can_ring_get_info(can_ring_info_t *out)

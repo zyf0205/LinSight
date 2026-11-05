@@ -39,9 +39,6 @@ void can_ring_push(linsight_can_record_t *rec);
 /* Pop up to max records for streaming. Returns how many were copied. */
 uint32_t can_ring_pop(linsight_can_record_t *out, uint32_t max);
 
-/* Copy the newest n records (oldest first) for the trace view. */
-uint32_t can_ring_tail(linsight_can_record_t *out, uint32_t n);
-
 void can_ring_get_info(can_ring_info_t *out);
 
 /* Clear the overflow counter shown as OVF (Clear Stats); records are untouched. */

@@ -13,9 +13,10 @@ menu "LinSight"
 
     config LINSIGHT_HOST
         string "Host IPv4 address"
-        default "10.100.2.199"
+        default ""
         help
             Address of the machine running the LinSight host daemon.
+            Set this in menuconfig; do not commit a real address.
 
     config LINSIGHT_PORT
         int "Host TCP port"

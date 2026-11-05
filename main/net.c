@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 
 #include "cJSON.h"
@@ -138,6 +139,53 @@ static void send_ack(int fd, uint16_t id, uint8_t code)
     }
 }
 
+/* CONTROL.set_config accepts an optional bitrate and mode. Missing fields keep
+ * the current configuration; present-but-invalid fields reject the whole
+ * request instead of silently falling back to 500k/LISTEN_ONLY. */
+static bool parse_bitrate(const cJSON *item, can_bitrate_t *out)
+{
+    if (!cJSON_IsNumber(item)) {
+        return false;
+    }
+    switch ((int)item->valuedouble) {
+    case 125000:
+        *out = CAN_BITRATE_125K;
+        return true;
+    case 250000:
+        *out = CAN_BITRATE_250K;
+        return true;
+    case 500000:
+        *out = CAN_BITRATE_500K;
+        return true;
+    case 1000000:
+        *out = CAN_BITRATE_1M;
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool parse_mode(const cJSON *item, can_mode_t *out)
+{
+    if (!cJSON_IsString(item)) {
+        return false;
+    }
+    const char *s = item->valuestring;
+    if (strcasecmp(s, "listen") == 0 || strcasecmp(s, "listen_only") == 0) {
+        *out = CAN_MODE_LISTEN_ONLY;
+        return true;
+    }
+    if (strcasecmp(s, "normal") == 0) {
+        *out = CAN_MODE_NORMAL;
+        return true;
+    }
+    if (strcasecmp(s, "selftest") == 0 || strcasecmp(s, "no_ack") == 0) {
+        *out = CAN_MODE_SELFTEST;
+        return true;
+    }
+    return false;
+}
+
 /* Handles one CONTROL frame. Returns false when the socket is broken. */
 static bool handle_control(int fd, const uint8_t *payload, uint16_t len)
 {
@@ -173,21 +221,24 @@ static bool handle_control(int fd, const uint8_t *payload, uint16_t len)
     } else if (strcmp(act, LINSIGHT_CTRL_CONFIG) == 0) {
         const cJSON *bitrate = cJSON_GetObjectItemCaseSensitive(root, "bitrate");
         const cJSON *mode = cJSON_GetObjectItemCaseSensitive(root, "mode");
-        can_bitrate_t br;
-        if (cJSON_IsNumber(bitrate) && bitrate->valuedouble == 125000.0) {
-            br = CAN_BITRATE_125K;
-        } else if (cJSON_IsNumber(bitrate) && bitrate->valuedouble == 250000.0) {
-            br = CAN_BITRATE_250K;
-        } else if (cJSON_IsNumber(bitrate) && bitrate->valuedouble == 1000000.0) {
-            br = CAN_BITRATE_1M;
+        can_bitrate_t br = twai_current_bitrate();
+        can_mode_t m = twai_current_mode();
+        bool valid = true;
+
+        if (bitrate && !parse_bitrate(bitrate, &br)) {
+            valid = false;
+        }
+        if (mode && !parse_mode(mode, &m)) {
+            valid = false;
+        }
+
+        if (!valid) {
+            err = ESP_ERR_INVALID_ARG;
+        } else if (br == twai_current_bitrate() && m == twai_current_mode()) {
+            err = ESP_OK; /* no-op: do not tear down capture for nothing */
         } else {
-            br = CAN_BITRATE_500K;
+            err = twai_capture_restart(br, m);
         }
-        can_mode_t m = CAN_MODE_LISTEN_ONLY;
-        if (cJSON_IsString(mode) && strcmp(mode->valuestring, "normal") == 0) {
-            m = CAN_MODE_NORMAL;
-        }
-        err = twai_capture_restart(br, m);
     }
 
     cJSON_Delete(root);
@@ -212,9 +263,11 @@ static bool handle_control(int fd, const uint8_t *payload, uint16_t len)
         }
         linsight_ui_sync_control(st.paused ? 1 : 0, kbps, 0xFFFFFFFFu);
     }
-    send_ack(fd, ctrl_id, err == ESP_OK     ? LINSIGHT_ACK_OK
-                          : err == ESP_ERR_NOT_SUPPORTED ? LINSIGHT_ACK_BAD_ARG
-                                                         : LINSIGHT_ACK_FAILED);
+    const uint8_t ack_code =
+        err == ESP_OK ? LINSIGHT_ACK_OK
+        : (err == ESP_ERR_NOT_SUPPORTED || err == ESP_ERR_INVALID_ARG) ? LINSIGHT_ACK_BAD_ARG
+                                                                       : LINSIGHT_ACK_FAILED;
+    send_ack(fd, ctrl_id, ack_code);
     ESP_LOGI(TAG, "CONTROL id=%u action=%s -> %s", (unsigned)ctrl_id, act,
              esp_err_to_name(err));
     return true;

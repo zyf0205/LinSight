@@ -24,7 +24,6 @@ static const char *TAG = "bsp";
 
 /* PCA9557 IO expander */
 #define PCA9557_ADDR 0x19
-#define PCA9557_REG_INPUT 0x00
 #define PCA9557_REG_OUTPUT 0x01
 #define PCA9557_REG_CONFIG 0x03
 #define PCA9557_BIT_LCD_CS 0

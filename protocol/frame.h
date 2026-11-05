@@ -41,7 +41,12 @@ extern "C" {
 #define LINSIGHT_MAX_ACK 32u /* {"id":N,"code":N} needs 17+ bytes */
 #define LINSIGHT_MAX_FLOW 1u
 
-/* One 20-byte record: seq u16 | ts_ms u32 | id u32 | flags u8 | dlc u8 | data[8] */
+/* One 20-byte record, wire order:
+ * seq u16 | ts_ms u32 | id u32 | flags u8 | dlc u8 | data[8]
+ *
+ * The in-memory fields are ordered to avoid struct padding so sizeof() equals
+ * LINSIGHT_REC_SIZE; linsight_record_pack/unpack define the wire order and must
+ * not be replaced with a raw struct copy. */
 #define LINSIGHT_REC_SIZE 20u
 #define LINSIGHT_REC_FLAG_EXT 0x01u
 #define LINSIGHT_REC_FLAG_RTR 0x02u
@@ -76,13 +81,21 @@ typedef enum {
 } linsight_ack_code_t;
 
 typedef struct {
-    uint16_t seq;
     uint32_t ts_ms;
     uint32_t id;
+    uint16_t seq;
     uint8_t flags; /* LINSIGHT_REC_FLAG_* */
     uint8_t dlc;
     uint8_t data[LINSIGHT_DLC_MAX];
 } linsight_can_record_t;
+
+#if defined(__cplusplus)
+static_assert(sizeof(linsight_can_record_t) == LINSIGHT_REC_SIZE,
+              "CAN record must stay 20 bytes in memory");
+#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+_Static_assert(sizeof(linsight_can_record_t) == LINSIGHT_REC_SIZE,
+               "CAN record must stay 20 bytes in memory");
+#endif
 
 static inline uint16_t linsight_get_u16(const uint8_t *p)
 {
