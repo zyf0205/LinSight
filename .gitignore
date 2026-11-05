@@ -20,3 +20,22 @@ Thumbs.db
 # Python
 __pycache__/
 *.pyc
+.venv/
+venv/
+.pytest_cache/
+
+# captures / logs / exports
+*.lsc
+*.log
+*.asc
+*.candump
+
+# out-of-tree or in-source builds
+build-*/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Testing/
+compile_commands.json
+core
+core.*

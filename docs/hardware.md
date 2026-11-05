@@ -1,7 +1,6 @@
 # LinSight 硬件
 
-> 立创·实战派 ESP32-S3（无电池 / 无摄像头）。
-> 来源：官方 wiki + 官方例程 `08-lcd_lvgl` BSP。更新：2026-11-04。
+> 立创·实战派 ESP32-S3（无电池 / 无摄像头）；来源：官方 wiki + `08-lcd_lvgl` BSP。更新：2026-11-05。
 
 ## 1. 板卡
 
@@ -9,11 +8,9 @@
 |---|---|
 | 模组 | ESP32-S3-WROOM-1-N16R8（16MB Flash + 8MB Octal PSRAM） |
 | 屏幕 | 2.0" IPS **320×240**，ST7789，SPI3 |
-| 触摸 | FT6336，I2C0 |
-| IMU | QMI8658，I2C0 |
+| 触摸 / IMU | FT6336 / QMI8658，I2C0 |
 | USB | Type-C → CH334F HUB → CH340K 串口 + 原生 USB |
-| 按键 | RESET + GPIO0 用户键 |
-| 本版本无 | GC0308 摄像头、电池 |
+| 按键 / 本版无 | RESET + GPIO0 用户键；无 GC0308 摄像头、无电池 |
 
 ## 2. 引脚
 
@@ -30,8 +27,7 @@
 | 39 / 40 / 41 / 42 | LCD DC / MOSI / CLK / 背光 | 背光低电平点亮 |
 | 43 / 44 | UART0 TX / RX | CH340K |
 
-- 除扩展口外没有引出其他 GPIO；GPIO12、22–25 未使用，需焊测试点。
-- 所有 IO 为 **3.3V 电平，不耐 5V**。
+- 除扩展口外没有引出其他 GPIO（GPIO12、22–25 需焊测试点）；所有 IO 为 **3.3V，不耐 5V**。
 
 ## 3. 显示与触摸
 
@@ -64,17 +60,9 @@ PCA9557 地址 **0x19**，寄存器：`0x00` 输入、`0x01` 输出、`0x02` 极
 
 初始化：输出寄存器写 `0x05`，配置寄存器写 `0xF8`（低 3 位输出）。
 
-| 设备 | 地址 |
-|---|---|
-| PCA9557 | 0x19 |
-| FT6336 | 0x38 |
-| QMI8658 | 0x6A |
-| ES7210 | 0x41 |
-| ES8311 | 0x18 |
+设备：PCA9557 `0x19`、FT6336 `0x38`、QMI8658 `0x6A`、ES7210 `0x41`、ES8311 `0x18`。
 
 ## 5. 扩展口（HC-GH-5PWT，5P）
-
-丝印从 5V 端到信号端：
 
 ```text
 多功能 J2：5V  3V3  GND  IO10  IO11
@@ -85,8 +73,7 @@ I2C   J1：5V  3V3  GND  SDA   SCL
 
 - 多功能口：1=**GPIO11**，2=**GPIO10**；可 GPIO/UART/I2C/CAN/PWM/ADC。GPIO10=ADC1_CH9，GPIO11=ADC2_CH0（Wi-Fi 下受限）。
 - I2C 口：1=**GPIO2/SCL**，2=**GPIO1/SDA**；与板载设备共用总线，地址不能冲突。
-- 线序用万用表确认，不要凭线色；5V 只在 USB 供电时存在。
-- 引脚 1 位置以连接器小三角和板上丝印为准。
+- 线序用万用表确认（引脚 1 以连接器小三角和丝印为准）；5V 只在 USB 供电时存在。
 
 ### CAN 接线（M0 台架已验证）
 
@@ -97,20 +84,28 @@ USB-CAN            CAN_H ── 收发器 CANH
 收发器 TXD ── GPIO10 (J2 引脚2)  收发器 RXD ── GPIO11 (J2 引脚1)
 ```
 
-- 3.3V 收发器（SN65HVD230 类）；总线两端 120Ω 终端电阻；PCAN 与板共地（USB 已共地）。
+- 3.3V 收发器（SN65HVD230 类）；总线两端 120Ω 终端电阻；PCAN 与板共地（USB 已共地）。仅 CAN 2.0A/B（S3 不支持 FD），默认 500k。
 - 固件 `TWAI_MODE_LISTEN_ONLY` 为默认（不 ACK，安全）；台架单对节点测试需切 `NORMAL`，否则发送方收不到 ACK 会重发。
-- 持续发送时任一 ACK 中断都会让 PCAN 进入 bus-off；GUI 已启用自动复位，设备端自恢复需总线静默约 3 ms（对端停发）。
-- 帧格式仅 CAN 2.0A/B（S3 TWAI 不支持 CAN FD）；比特率两端一致（默认 500k）。
+
+| 比特率 | 8B 标准帧理论上限 | 80% 负载 | 台架建议 |
+|---|---:|---:|---:|
+| 500k | ~3800 fps | ~3000 fps | ≤2000 fps |
+| 1M | ~7600 fps | ~6000 fps | ≤4000 fps |
+
+- 高速连续发送会让部分 PCAN-USB 假活（`CAN_Write` OK、status 0x0，回显/上行停摆）；
+  软复位无效，只能拔插或管理员 `pnputil /restart-device`。
+- 台架改用 **WSL2 SocketCAN**：管理员 `usbipd bind --busid 2-1` 一次；每次拔插/WSL 重启后 `usbipd attach --wsl --busid 2-1`。WSL 内 `sudo modprobe peak_usb`、
+  `sudo ip link set can0 type can bitrate 500000 && sudo ip link set can0 up`；
+  `cangen can0 -n 500 -g 20 -I 0x123 -L 8` 发帧，以设备 `total` 为判据（不依赖回显）。
+  实测 50 fps/10 s +500、1000 fps/3 s +3000，`missed/rxq_full/dropped` 全 0；3500 fps 待亚毫秒节拍。
 
 ## 6. sdkconfig 必改
 
 | 项 | 改为 |
 |---|---|
 | `CONFIG_COMPILER_OPTIMIZATION_DEBUG` | `CONFIG_COMPILER_OPTIMIZATION_PERF=y`（-O2） |
-| `CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ` | 240 |
-| `CONFIG_FREERTOS_HZ` | 1000 |
-| `CONFIG_LWIP_TCP_WND_DEFAULT` / `SND_BUF_DEFAULT` | 32768 |
-| `CONFIG_LWIP_TCP_RECVMBOX_SIZE` | 32 |
+| CPU / RTOS | 240 MHz，`CONFIG_FREERTOS_HZ=1000` |
+| TCP 窗口 / 发送缓冲 / RECVMBOX | 32768 / 32768 / 32 |
 | `CONFIG_ESPTOOLPY_FLASHMODE_DIO` | QIO（先验证启动） |
 | `CONFIG_LV_COLOR_16_SWAP` | y |
 | 分区表 | 加 64KB `coredump` 分区 |
@@ -122,5 +117,4 @@ USB-CAN            CAN_H ── 收发器 CANH
 - [ ] `esp_psram_get_size()` = 8MB
 - [ ] I2C 扫描到 0x19 / 0x38 / 0x6A
 - [ ] 纯色全屏正常（红/绿）
-- [ ] 背光 0% / 100% 可控
-- [ ] 触摸四角坐标准确
+- [ ] 背光 0% / 100% 可控，触摸四角坐标准确

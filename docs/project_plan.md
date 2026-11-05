@@ -1,141 +1,119 @@
 # LinSight 项目计划：无线 CAN 总线分析仪
 
-> ESP32-S3 手持 CAN 分析仪 + Linux 分析服务。设备独立工作：采集/显示/触发；
-> 主机负责长时记录、解码、回放与对照。接线见 [hardware.md](hardware.md)，UI 见
-> [ui_design.md](ui_design.md)，线格式以 `protocol/frame.h` 为准。
+> ESP32-S3 手持 CAN 分析仪（TWAI 采集 + LVGL 触摸 UI + Wi-Fi 流式）与 Linux 主机
+> 工具链（epoll 守护进程 + `.lsc` 日志 + CLI）。接线见 [hardware.md](hardware.md)，
+> UI 见 [ui_design.md](ui_design.md)，线格式以 `protocol/frame.h` 为准。
 
-## 1. 定位
+## 1. 定位与技能矩阵
 
-- 用户：汽车/工业现场调试人员；不接电脑也能看总线，接电脑可长时记录和分析。
-- 卖点：实时采集 + 本地触摸 UI + Wi-Fi 流式 + Linux 主机工具链，不是“桌面副屏”。
-- 不做：CAN FD（S3 不支持）、多通道、多设备集群、内核驱动、云端。
-- `host/gui` 只是台架测试台；产品级主机 UI 在 M5 重做。
+面向嵌入式 / Linux 求职作品集：一台设备覆盖 MCU、LVGL 与 Linux 系统编程。
 
-## 2. 现状与本次修复（2026-11-05）
+| 支柱 | 实现载体 | 验收证据 |
+|---|---|---|
+| MCU / RTOS | TWAI 采集、PSRAM ring、双子历史缓冲、Wi-Fi/TCP、任务优先级 | M3.4 / M3.5 |
+| LVGL | 320×240 双页 UI、4 列固定坐标 trace、过滤/触发、跨任务邮箱 | M3.1 的 UI 项 |
+| Linux 系统 | epoll/signalfd/timerfd、非阻塞 socket、Unix socket、写线程 + 有界 ring、二进制日志 | M4 P0、M6 soak |
+| 工程化 | 共享纯 C 协议、fuzz、ctest/ASan、台架工具、文档单一事实源 | M3.0、M4 CI |
 
-M0–M2 已完成：采集、LVGL UI、Wi-Fi 流式、daemon/CLI/`.lsc`、CONTROL/ACK 均跑通。
+非目标：CAN FD（S3 不支持）、多通道、多设备集群、云端、Web/PySide6 产品 UI
+（主机 UI 采用 CLI-first；`host/gui` 仅是台架测试台）。
 
-台架“持续发送就卡死、必须重插 USB-CAN”的根因链：任一次 ≥100 ms 的 ACK 中断
-（设备重启/掉电/毛刺）→ PCAN 无 ACK 重发 → 硬件 bus-off；python-can 默认不自动复位、
-GUI 不读 status 也不 reset → `send()` 永远抛错但 `sent > 0` 使循环不退出；设备端
-恢复需 128×11 隐性位静默，PCAN 持续重发与其互锁。
+## 2. 仓库与数据流
 
-已落地：
-- GUI：`auto_reset=True`、status 解码、检测 BUSOFF 后 `reset()` + 0.5 s 退避、
-  连续 200 次失败熔断；不再无限自旋。
-- 固件：net_task 的 UI 调用改为无锁邮箱（消除 `lvgl_port_lock(0)` 永久等待）；
-  `SO_RCVTIMEO` 500→50 ms；`tools/gui_tx_smoke.py` 覆盖恢复路径。
-- 待实机定案：`idf.py monitor` + Flash coredump（已开启）确认设备是否重启。
-
-## 3. 验收（P0）
-
-| 项 | 标准 |
+| 路径 | 内容 |
 |---|---|
-| 采集 | 500 kbps / 80% 负载，连续 10 min 丢帧 0（与 USB-CAN 对照） |
-| 时间戳 | 分辨率 ≤1 ms；主机日志可按时间排序 |
-| UI | trace 20 fps；触摸响应 <100 ms；断网不影响本地显示 |
-| 主机 | 3000 帧/s 持续写入不丢；断线 5 s 内重连；24 h soak 无崩溃/泄漏 |
-| 导出 | ASC/candump 可被 can-utils/Vector 读取；回放时间误差 <5% |
-| 故障 | bus-off 自动恢复；ring 溢出计数可见；磁盘满不崩溃 |
-| 测试 | 单元/集成/HIL 全绿；协议解析器可 fuzz |
-
-P1：1 Mbps 短时、触发/过滤、DBC、双路对照、systemd。P2：发送、BLE 配网、签名 OTA、SQLite、TF 卡。
-
-## 4. 架构
+| `main/` | 固件：`twai.c` 采集、`can_ring.c` PSRAM ring、`net.c` 流式、`ui.c` LVGL、`bsp.c` 板级 |
+| `protocol/` | `frame.h/.c` 协议 v2.0，纯 C、无 IDF/分配，固件与主机共用 |
+| `host/src/` | `linsightd`：epoll 主循环、设备 TCP、控制口、writer 线程、`.lsc` |
+| `host/cli/`、`host/gui/` | `linsight-cli` 工具；Windows Tkinter 台架 GUI（legacy；主台架已转 WSL SocketCAN） |
+| `host/tests/` | 单元、协议 fuzz、Python 集成、ring 回归、GUI TX 冒烟 |
+| `tools/can_probe/` | M0 接线验证用 TWAI 探针；`tools/bench_can.py` 台架收发 |
+| `docs/` | 计划、硬件、UI；根目录只有 `CLAUDE.md` |
 
 ```text
-CAN 总线 ── SN65HVD230 ── ESP32-S3
-                            ├─ twai_task ─→ PSRAM ring ─→ ui_task（LVGL trace/统计）
-                            │                         └→ net_task ─Wi-Fi/TCP→ linsightd
-                            └─ 触摸/用户键
-USB-CAN ── SocketCAN(can0) ── linsightd（对照/回放）
-linsightd ─→ .lsc 日志 / ASC 导出 / linsight-cli（Unix socket）
+CAN ── 收发器 ── ESP32-S3
+                  ├─ twai_task → PSRAM ring → net_task ─Wi-Fi/TCP→ linsightd → .lsc
+                  │            └→ 捕获侧 512 条 UI history → LVGL 20 Hz
+                  └─ 触摸 / GPIO0
 ```
 
-- 固件任务：twai_task（核 0，10，收帧/时间戳/告警）；net_task（核 0，5，批量/控制/重连）；
-  LVGL 任务（核 1，20 Hz 拉取快照）；STATS 1 Hz。跨任务 UI 更新只写无锁邮箱。
-- 内存：ring ≈1 MB PSRAM（52428 条）；批量 4×16 KB；draw buffer 内部 DMA。
+ring（约 52k 条）供网络排空，UI history 独立；主机追数据时 trace 不会被抽空。
 
-## 5. 协议 v2.0（详见 `protocol/frame.h`）
+## 3. 现状与缺陷
 
-5 字节帧头 `AA 55 type len_lo len_hi`；记录 20 B：
-`seq u16 | ts_ms u32 | id u32 | flags u8 | dlc u8 | data[8]`，flags：EXT/RTR/ERR。
+M0–M2 已跑通：采集/UI/流式/CONTROL-ACK/daemon/CLI/`.lsc`/导出。ESP32 自测
+30000 帧启动突发 4330 fps、96% 负载零丢失（未触发 ring 溢出）；外部 PCAN 经
+WSL2 SocketCAN 50 fps/10 s、1000 fps/3 s 零丢帧；主机 ctest 5/5。
 
-| type | 方向 | 负载 |
+| 缺陷 | 影响 | 修复 |
 |---|---|---|
-| 01 HELLO | 设备→主机 | proto、fw、device id、bitrate |
-| 02 CAN_BATCH | 设备→主机 | `u16 count` + N 条记录 |
-| 03 STATS | 设备→主机 | fps、负载、总数、丢帧、TEC/REC、状态 |
-| 04 EVENT | 设备→主机 | bus-off / error-passive / overflow |
-| 05 PING / 06 PONG | 双向 | 4 B 回显，测 RTT/保活 |
-| 07 CONTROL | 主机→设备 | 过滤、暂停/恢复、清统计、发送（P2） |
-| 08 ACK | 设备→主机 | id、code |
-| 09 FLOW | 主机→设备 | 最大批速率/暂停 |
+| ring 满时先前进 head | 丢第二旧记录、保留最旧记录 | 满时原地覆盖 head，`dropped++` |
+| 记录结构体 24 B，ring 按 20 B 分配 | 越界、槽位重叠、随机错帧 | 字段重排为 20 B + `_Static_assert` |
+| `set_config` 缺字段时静默改模式 | 只改比特率却切走 NORMAL | 缺失保持、非法整体拒绝、同配置不重启 |
+| `twai` restart/recover 无互斥 | 并发重启、paused 丢失、状态提前提交 | 重启锁；成功后才提交 bitrate/mode/state；保留 paused |
+| PCAN 假活无检测 | 高速灌帧后必须拔插 USB | 速率建议、单帧探测、stats 新鲜度、失败锁存 |
 
-断网继续采集，重连只发新帧；丢帧在 STATS/UI 显示。
+M4 P0 待修：epoll 循环内阻塞 `send_all`、writer 丢帧计数未上报、`.lsc` 缺版本校验、
+ASC 格式需 can-utils 对照。
 
-## 6. 主机软件与 UI 路线
+PCAN “假活”的复现与恢复见 [hardware.md](hardware.md) §5。
 
-- `linsightd`：epoll + 非阻塞 TCP；协议解析；writer 线程 + 有界 ring；Unix socket /
-  `--ctl-port` 控制口；SIGTERM 优雅退出。
-- `linsight-cli`：`stats`、`live`、`pause`/`resume`/`clear`、`export asc|candump`。
-- 主机 UI 路线（M3 后定稿；本次先修问题，暂缓决策）：
-  - **Web（推荐）**：FastAPI + WebSocket + Canvas；跨平台、图表与远程查看容易。
-  - PySide6：原生桌面、离线好；依赖与打包更重。
-  - Tkinter：零依赖但图表/交互上限低，仅保留为台架测试台。
+## 4. M3 台架健壮性
 
-## 7. 分步计划
+| 项 | 方法 | 通过标准 |
+|---|---|---|
+| M3.0 ring 溢出 | 连续 push 60k（>52k），排空后检查 `seq` | 模 65536 严格递增，`dropped` 正确；已有小容量单测 |
+| M3.1 500k/80% ×10 min | PCAN 发送，payload 前 4 B 32 位计数器逐帧对照 | 3500 fps ±5%；设备 `rx_missed=0`、ring `dropped=0`、主机 writer `dropped=0` |
+| M3.2 无 ACK 注入 | 运行中切 LISTEN_ONLY 或摘 CAN_H | 发送端 1.5 s 内停发并分类提示；恢复后无需重插 PCAN |
+| M3.3 断线重连 | 杀 daemon，5 s 内重启 | 重连先补发断线积压（≤~52k 条），不是只发新帧 |
+| M3.4 1 Mbps ×60 s | SELFTEST 自发或 PCAN 发送 | 允许 ring drop 但必须可见；无复位/WDT |
+| M3.5 10 min 资源 | 1 Hz 日志补 `esp_get_free_heap_size()` / PSRAM free | 内部堆增量 <8 KB，PSRAM 增量 <64 KB |
 
-### M3 台架健壮性（1 周，优先）
+Windows 定时达不到 3500 fps 时降级为 1000 fps ×10 min 严格对照 + 60 s 高负载，并写明实际速率。
 
-1. 对照验证：PCAN 发 500 kbps/80% ×10 min，设备 `.lsc` 与发送端逐帧/序号对比。
-2. bus-off 注入：运行中摘 CAN_H、停设备 ACK，确认 PCAN 自动复位、GUI 不断流、EVENT 可见。
-3. 断线重连：拔网线/关 daemon 5 s 内恢复；设备继续采集，重连只补新帧。
-4. 1 Mbps 短时（≤60 s）：记录 fps/负载/丢帧，写入本文档。
-5. 稳定性：10 min 后检查空闲堆/PSRAM；若设备重启，抓 coredump 并修复。
+## 5. M4 Linux 工具链
 
-验收：P0 采集/故障两行全绿；全程无需重插 USB-CAN。
+P0（先做，单周可交付）：
 
-### M4 工具链（1 周）
+- `linsight-cli config`：只发显式字段，等待 ACK；非法值显示 `BAD_ARG`。
+- `replay`：AF_CAN/CAN_RAW + `clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME)`，p99 误差 <5 ms。
+- `compare`：按 `(id, flags, dlc, data)` FIFO 匹配，报告 missing/duplicate/order；不做跨设备延迟分位。
+- `.lsc` 魔数 + 版本校验；ASan/UBSan + ctest 接入 CI。
+- 删除 `.lsc` 随机索引（顺序回放不需要）。
 
-1. 回放：`linsight-cli replay FILE.lsc` → SocketCAN/vcan，时间误差 <5%。
-2. DBC：Python + cantools 解码，导出 CSV/绘图。
-3. 双路对照：`--reference can0` 报告缺失/重复/延迟分位。
-4. 部署：systemd unit + 日志轮转；README 命令。
-5. 测试：协议 parser fuzz（host harness）+ CI（build + ctest）。
+P1：systemd/journald/logrotate、DBC（cantools）；物理 PCAN 的 SocketCAN 对照已打通
+（usbipd + `peak_usb` + `can0`，50/1000 fps 零丢帧；3500 fps 待亚毫秒节拍）。
 
-验收：ASC/candump 可被 can-utils 读取；fuzz/CI 全绿。
+## 6. M5 CLI 深化
 
-### M5 主机 UI 重做（1–2 周，路线见 §6）
+不新增 Web/PySide6/Tkinter 产品 UI：`live` 增加过滤/着色，`stats --watch` 周期刷新，
+`export` 支持时间与 ID 过滤；全部通过 Unix socket / `--ctl-port` 复用 daemon。
+验收：1 h 连续 `live` 不卡；3000 帧/s 时可抽样核对 CLI 输出。
 
-1. 定稿路线与信息架构（实时 trace、统计、过滤、回放、导出）。
-2. 后端：复用 daemon 控制口，加 WebSocket 推送与历史查询。
-3. 前端：虚拟化 trace 列表 + 负载/错误图 + 控制面板；断线自动重连。
-4. 联调：CONTROL/FLOW、REMOTE SYNC、暂停/恢复/清统计。
+## 7. M6 Soak 与交付
 
-验收：浏览器 1 h 不卡；3000 帧/s 渲染不丢（抽样校验）；Windows/WSL 均可访问。
+24 h soak（设备 + daemon + CLI）：1000 fps 约 1.7 GB、3500 fps 约 6.9 GB，必须配置
+日志轮转。指标：RSS/句柄稳定、无复位、writer 与设备丢帧计数符合预期。
+交付：README、接线图、3 min 演示、tag + changelog；简历数字按实测回填。
 
-### M6 soak 与交付（3–5 天）
+## 8. 工程约定
 
-1. 24 h soak（设备 + daemon + UI），监控 RSS/句柄/磁盘。
-2. 演示：接线图、脚本、3 min 视频；简历数字按实测回填。
-3. 发布 tag + changelog，docs 与代码对齐。
+- 固件只在 Windows 构建：
+  `. 'C:\Espressif\tools\Microsoft.v5.5.4.PowerShell_profile.ps1'; idf.py build`。
+- 上位机只在 WSL `~/linsight` 开发/构建/运行；Windows 不构建 `host/`：
+  `cd ~/linsight/host && cmake -S . -B build && cmake --build build -j"$(nproc)"`。
+- 台架 GUI 为 legacy；主台架用 WSL `can0`（见 [hardware.md](hardware.md) §5）。
+- 文档只放 `docs/`；协议以 `protocol/frame.h` 为准，不复制表格。
+- Wi-Fi 密码与主机 IP 只存在于忽略的 `sdkconfig`。
+- 不提交 `build/`、`sdkconfig`、`managed_components/`；提交信息用中文。
 
-验收：P0 全部达标。
+## 9. 风险与简历
 
-## 8. 风险与约束
-
-- 台架物理层：3.3 V 收发器、120 Ω 终端、共地；默认 LISTEN_ONLY，NORMAL 仅两节点。
-- 高负载：ring + 批量 + 对照；1 Mbps 只做短时验证。
-- Wi-Fi 抖动：本地缓冲 + 重连 + 状态可见；写盘阻塞：writer 线程 + 有界 ring + 丢弃计数。
-- 范围膨胀：M3 验收前不做 UI 重写、不加新功能。
-
-## 9. 简历写法
+风险：3.3 V 收发器/120 Ω/共地必须确认；高负载只在两节点台架；Wi-Fi 抖动与写盘
+阻塞靠本地 ring + 丢弃计数兜底；M3 验收前不扩功能。
 
 > **LinSight CAN — 无线 CAN 总线分析仪（ESP32-S3 + Linux）**
-> - TWAI 500 kbps/1 Mbps 采集，PSRAM 环形缓冲与时间戳；LVGL 触摸屏实时显示 trace、总线负载、错误计数，20 fps。
-> - Linux C 守护进程：epoll + 非阻塞 TCP + 环形缓冲 + 二进制日志/ASC 导出 + Unix socket CLI；SocketCAN 回放与 USB-CAN 双路对照。
-> - 500 kbps/80% 负载 10 min 零丢帧；bus-off 自动恢复；24 h soak 无泄漏；协议解析器 fuzz + CI。
-> - 可选：DBC 解码、触发/过滤、签名 OTA。
-
-数字（丢帧、fps、延迟、soak）实现后按实测填写，不预先写死。
+> - TWAI 采集 + PSRAM ring + 时间戳；LVGL 触摸屏 20 fps 实时 trace/负载/错误。
+> - Linux C 守护进程：epoll + 非阻塞 TCP + 写线程 + 二进制日志/ASC 导出 + CLI。
+> - 500 kbps/80% 10 min 零丢帧、bus-off 自愈、24 h soak 无泄漏（数字待实测回填）。
+> - 共享协议解析器 fuzz + ctest/ASan CI；SocketCAN 回放与双路对照（M4）。
