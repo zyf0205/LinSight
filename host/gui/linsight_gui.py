@@ -80,6 +80,19 @@ PCAN_STATUS_BUSOFF = 0x10
 # before that, bus-off gets a reset + backoff and transient errors retry.
 TX_MAX_CONSEC_ERRORS = 200
 TX_BUSOFF_BACKOFF_S = 0.5
+# A PCAN self-reception echo only appears after the frame completed on the
+# bus (was ACKed). No echo while sending means the peer is not ACKing; stop
+# before the adapter is pushed into a bus-off it cannot leave without replug.
+TX_ECHO_STALL_S = 1.5
+# 500 kbit/s, 8-byte standard frames top out near 3800 fps; 20000 fps only
+# overflows the PCAN TX queue and makes a no-ACK window much more likely.
+TX_RATE_MAX = 5000
+TX_RATE_ADVISORY_DIV = 250  # 500k -> 2000 fps, 1M -> 4000 fps
+# Refuse to transmit on stale device STATS: a mode change or reboot within the
+# last second would otherwise let the preflight approve an unsafe send.
+TX_STATS_MAX_AGE_S = 2.0
+# One probe frame is enough to tell "no ACK" from "PCAN already wedged".
+TX_PROBE_ECHO_S = 0.35
 
 
 def stamp(ts):
@@ -141,7 +154,9 @@ class App:
         self._daemon_online = False
         self._device_online = False
         self._live_online = False
-        self._last_tx = {}
+        self._latest_stats = {}
+        self._stats_at = 0.0
+        self._tx_wedged = False
         self._id_counts = Counter()
         self._view_skipped = 0
         self._row_parity = 0
@@ -572,7 +587,7 @@ class App:
 
     def _start_daemon(self):
         build = os.environ.get("LINSIGHT_DAEMON_DIR",
-                               "$HOME/linsight-host-build/linsightd")
+                               "$HOME/linsight/host/build/linsightd")
         logs = os.environ.get("LINSIGHT_LOG_DIR", "$HOME/can-logs")
         cmd = (
             'if pgrep -x linsightd >/dev/null; then echo already-running; '
@@ -610,8 +625,8 @@ class App:
             raise ValueError("python-can 未安装；请用装有 python-can 的 Python 运行")
         rate = int(float(self.rate_var.get()))
         duration = float(self.duration_var.get())
-        if rate < 1 or rate > 20000:
-            raise ValueError("帧率范围 1..20000")
+        if rate < 1 or rate > TX_RATE_MAX:
+            raise ValueError(f"帧率范围 1..{TX_RATE_MAX}")
         if duration < 0:
             raise ValueError("时长不能为负")
         try:
@@ -657,8 +672,42 @@ class App:
         if cfg["iface"] == "pcan":
             # PCAN_BUSOFF_AUTORESET: the adapter re-initializes itself after
             # a bus-off instead of wedging every later Write() until unplug.
+            # Echo frames give a direct "the frame was ACKed" liveness signal.
             kwargs["auto_reset"] = True
+            kwargs["receive_own_messages"] = True
         return can.interface.Bus(**kwargs)
+
+    def _tx_preflight(self, cfg):
+        """Refuse to transmit into a bus whose LinSight peer cannot ACK.
+
+        Flooding a LISTEN_ONLY or offline device drives the PCAN's error
+        counter to bus-off, and a PCAN-USB in that state accepts CAN_Write
+        but never transmits again until the USB cable is re-plugged.
+        """
+        if cfg["iface"] != "pcan":
+            return None
+        ds = self._latest_stats
+        if not ds:
+            return ("设备状态未知（守护进程未连接）。发送前需确认 LinSight "
+                    "在线且处于 NORMAL 模式，否则 PCAN 会被拖入 bus-off。")
+        if not self._device_online:
+            return ("设备未连接（守护进程在线，但 LinSight 不在线）。"
+                    "发送前需确认设备已连上且处于 NORMAL 模式。")
+        if time.monotonic() - self._stats_at > TX_STATS_MAX_AGE_S:
+            return (f"设备状态已过期（{TX_STATS_MAX_AGE_S:.0f} s 没收到 STATS）。"
+                    "等守护进程/设备恢复后再发送。")
+        mode = str(ds.get("mode", "?"))
+        state = str(ds.get("state", "?"))
+        if mode != "NORMAL":
+            return (f"设备当前是 {mode} 模式，不会 ACK。请先在设备 Settings "
+                    "切到 NORMAL（台架、总线上恰好两个节点），再发送。")
+        if state != "RUNNING":
+            return f"设备状态 {state}，暂时无法 ACK；等它恢复 RUNNING 后再发送。"
+        dev_baud = int(ds.get("bitrate", 0))
+        if dev_baud != int(cfg["bitrate"]):
+            return (f"比特率不一致：设备 {dev_baud // 1000}k，发送端 "
+                    f"{cfg['bitrate'] // 1000}k。")
+        return None
 
     def _bus_state(self, bus):
         try:
@@ -672,12 +721,71 @@ class App:
         names = [name for bit, name in PCAN_STATUS_BITS if status & bit]
         return f"0x{status:X}" + (f" {'|'.join(names)}" if names else "")
 
-    def _bus_reset(self, bus):
-        """Best-effort controller reset (PCAN: leaves bus-off cleanly)."""
+    def _rate_advisory(self, cfg):
+        """Warn before a rate that only overflows the PCAN TX queue."""
+        if cfg["iface"] != "pcan":
+            return None
+        limit = max(1, cfg["bitrate"] // TX_RATE_ADVISORY_DIV)
+        if cfg["rate"] > limit:
+            return (f"{cfg['bitrate'] // 1000}k 下 {cfg['rate']:.0f} fps 超过建议上限 "
+                    f"{limit} fps；PCAN 发送队列可能溢出，更容易触发 bus-off。")
+        return None
+
+    def _tx_context(self, bus):
+        """Device/adapter state for failure messages."""
+        ds = self._latest_stats or {}
+        state = self._bus_state(bus)
+        if self._tx_wedged:
+            state += "(已锁存)"
+        return (f"适配器 {state} · 设备 mode={ds.get('mode', '?')} "
+                f"state={ds.get('state', '?')} total={ds.get('total', '?')} "
+                f"bus_err={ds.get('bus_err', '?')} tec={ds.get('tec', '?')}")
+
+    def _probe_bus(self, bus, cfg):
+        """Send one frame and classify why a PCAN echo is missing.
+
+        Returns (ok, detail). On failure the device's rx total delta separates
+        "the peer received it but the adapter cannot echo/receive" from "the
+        frame never reached the bus / the peer did not receive it".
+        """
+        if cfg["iface"] != "pcan":
+            return True, ""
+
+        before = (self._latest_stats or {}).get("total")
         try:
-            return bool(bus.reset())
-        except Exception:
-            return False
+            bus.send(self._make_msg(cfg, 0))
+        except Exception as exc:
+            self._tx_wedged = True
+            return False, f"单帧探测发送失败: {exc}（{self._tx_context(bus)}）"
+
+        end = time.perf_counter() + TX_PROBE_ECHO_S
+        while time.perf_counter() < end:
+            try:
+                msg = bus.recv(0.05)
+            except Exception:
+                msg = None
+            if msg is not None and not msg.is_rx:
+                self._tx_wedged = False
+                return True, "单帧探测：回显正常"
+
+        # No echo. Wait for one fresh STATS sample (1 Hz) and compare totals.
+        seen_at = self._stats_at
+        deadline = time.monotonic() + 1.4
+        while (time.monotonic() < deadline and self._stats_at == seen_at
+               and not self._tx_stop.is_set()):
+            time.sleep(0.05)
+        after = (self._latest_stats or {}).get("total")
+        delta = after - before if isinstance(before, int) and isinstance(after, int) else None
+        self._tx_wedged = True
+        if delta is None:
+            detail = "单帧探测无回显，设备状态不可用"
+        elif delta > 0:
+            detail = (f"单帧探测无回显，但设备收到 +{delta} 帧：ACK/回显路径异常，"
+                      "适配器可能假活")
+        else:
+            detail = ("单帧探测无回显，设备也没收到：检查设备 NORMAL/比特率/接线，"
+                      "或适配器已假活")
+        return False, f"{detail}（{self._tx_context(bus)}）"
 
     def _tx_start(self):
         if self._tx_running:
@@ -687,6 +795,13 @@ class App:
         except ValueError as exc:
             self._log(str(exc), "err")
             return
+        pre = self._tx_preflight(cfg)
+        if pre:
+            self._log(pre, "err")
+            return
+        warn = self._rate_advisory(cfg)
+        if warn:
+            self._log(warn, "warn")
         self._tx_stop.clear()
         self._tx_running = True
         self.start_btn.config(state="disabled")
@@ -705,20 +820,29 @@ class App:
         bus = None
         sent = 0
         errors = 0
+        echoes = 0
         consec_errors = 0
         busoff_resets = 0
         try:
             bus = self._open_bus(cfg)
+            ok, probe = self._probe_bus(bus, cfg)
+            if not ok:
+                raise RuntimeError(probe)
+            if probe:
+                self.q.put(("log", probe, "ok"))
             rate = cfg["rate"]
             tick = 0.02 if rate >= 50 else 1.0 / rate
             per_tick = max(1, int(round(rate * tick)))
+            echo_check = cfg["iface"] == "pcan"
+            echo_timeout = max(TX_ECHO_STALL_S, 3.0 / rate)
             start = time.perf_counter()
             next_t = start
             next_report = start
+            last_echo = start
             last_sent, last_t = 0, start
             if cfg["iface"] == "pcan":
                 self.q.put(("log", f"PCAN 已打开: {cfg['channel']} "
-                            f"{cfg['bitrate'] // 1000}k（bus-off 自动复位已启用）", "ok"))
+                            f"{cfg['bitrate'] // 1000}k（bus-off 自动复位 + 回显看门狗）", "ok"))
             else:
                 self.q.put(("log", f"总线已打开: {cfg['channel']}", "ok"))
             while not self._tx_stop.is_set():
@@ -733,32 +857,64 @@ class App:
                         consec_errors += 1
                         if consec_errors == 1:
                             self.q.put(("log", f"发送错误: {exc}", "warn"))
-                        # Bus-off: reset the controller, back off (its recovery
-                        # needs ~128*11 recessive bits of silence), then retry.
+                        # Bus-off: a full uninitialize/initialize is the only
+                        # PCAN-Basic path that resets the CAN controller.
                         status = self._bus_status(bus)
                         if status is not None and status & PCAN_STATUS_BUSOFF:
                             busoff_resets += 1
                             self.q.put(("log",
-                                        f"PCAN bus-off，自动复位 #{busoff_resets}，"
+                                        f"PCAN bus-off，重新初始化 #{busoff_resets}，"
                                         f"退避 {TX_BUSOFF_BACKOFF_S:.1f}s", "warn"))
-                            self._bus_reset(bus)
+                            try:
+                                bus.shutdown()
+                            except Exception:
+                                pass
                             self._tx_stop.wait(TX_BUSOFF_BACKOFF_S)
                             if self._tx_stop.is_set():
                                 break
+                            bus = self._open_bus(cfg)
+                            ok, probe = self._probe_bus(bus, cfg)
+                            if not ok:
+                                raise RuntimeError(probe)
+                            last_echo = time.perf_counter()
                         if sent == 0 and errors >= 20:
                             raise RuntimeError(str(exc))
                         if consec_errors >= TX_MAX_CONSEC_ERRORS:
                             raise RuntimeError(
                                 f"连续 {consec_errors} 次发送失败（总线无 ACK 或已 bus-off）；"
-                                "已停止。请检查对端节点/接线/比特率")
+                                "已停止。PCAN 若已卡死只能拔插 USB-CAN。")
                         break  # skip the rest of this tick's batch
+                if echo_check:
+                    # Only echo frames (is_rx=False) prove the frame completed
+                    # on the bus; a frame from another node must not mask it.
+                    while True:
+                        msg = bus.recv(0)
+                        if msg is None:
+                            break
+                        if not msg.is_rx:
+                            echoes += 1
+                            last_echo = time.perf_counter()
                 now = time.perf_counter()
+                if echo_check and sent > 0 and now - last_echo > echo_timeout:
+                    ds = self._latest_stats or {}
+                    raise RuntimeError(
+                        f"发送端 {echo_timeout:.1f}s 收不到自己的帧"
+                        f"（已发 {sent}，最后回显在 {last_echo - start:.1f}s）。"
+                        f"设备侧 total={ds.get('total', '?')} "
+                        f"bus_err={ds.get('bus_err', '?')} "
+                        f"rxq_full={ds.get('rxq_full', '?')} "
+                        f"missed={ds.get('missed', '?')} "
+                        f"tec={ds.get('tec', '?')} "
+                        f"state={ds.get('state', '?')}。"
+                        "设备计数干净而 PCAN 无回显 = 适配器/USB 侧停发，"
+                        "不是 ESP32 丢帧或总线错误。已停发；换 USB 口/线后仍复现"
+                        "则适配器故障，PCAN-Basic 无法软复位，只能拔插或更换。")
                 if now - next_report >= 0.4:
                     fps = (sent - last_sent) / max(now - last_t, 1e-6)
                     self.q.put(("tx", {
                         "running": True, "sent": sent, "errors": errors,
-                        "fps": fps, "state": self._bus_state(bus),
-                        "started": start,
+                        "echoes": echoes, "fps": fps,
+                        "state": self._bus_state(bus), "started": start,
                     }))
                     last_sent, last_t, next_report = sent, now, now
                 if cfg["duration"] > 0 and now - start >= cfg["duration"]:
@@ -771,12 +927,14 @@ class App:
                     next_t = time.perf_counter()
             self.q.put(("tx", {
                 "running": False, "sent": sent, "errors": errors,
-                "state": self._bus_state(bus), "msg": "已停止",
+                "echoes": echoes, "state": self._bus_state(bus),
+                "msg": f"已停止（回显 {echoes}/{sent}）",
             }))
         except Exception as exc:
             self.q.put(("tx", {
                 "running": False, "sent": sent, "errors": errors,
-                "state": "", "msg": f"PCAN 错误: {exc}",
+                "echoes": echoes, "state": "", "error": True,
+                "msg": f"PCAN 错误: {exc}",
             }))
             self.q.put(("log", f"PCAN 错误: {exc}", "err"))
         finally:
@@ -803,6 +961,13 @@ class App:
         except ValueError as exc:
             self._log(str(exc), "err")
             return
+        pre = self._tx_preflight(cfg)
+        if pre:
+            self._log(pre, "err")
+            return
+        warn = self._rate_advisory(cfg)
+        if warn:
+            self._log(warn, "warn")
         self._tx_running = True
         self.start_btn.config(state="disabled")
         self.tx_badge.config(text="突发中", fg=ORANGE)
@@ -811,16 +976,44 @@ class App:
             bus = None
             try:
                 bus = self._open_bus(cfg)
+                ok, probe = self._probe_bus(bus, cfg)
+                if not ok:
+                    raise RuntimeError(probe)
+                if probe:
+                    self.q.put(("log", probe, "ok"))
                 for i in range(20):
                     bus.send(self._make_msg(cfg, i))
                     time.sleep(0.01)
-                time.sleep(0.2)  # let the controller report ACK/error state
+                echoes = 0
+                end = time.perf_counter() + 0.3
+                while time.perf_counter() < end:
+                    msg = bus.recv(0.05)
+                    if msg is not None and not msg.is_rx:
+                        echoes += 1
+                bad = cfg["iface"] == "pcan" and echoes == 0
+                if bad:
+                    self._tx_wedged = True
+                    self.q.put(("log",
+                                "突发 20 帧 0 回显：探测时正常，发送中失去回显。"
+                                "先确认设备仍是 NORMAL、接线/120Ω/共地正常；"
+                                "若适配器状态为 OK 仍无回显，拔插 USB-CAN 后重试。"
+                                f"（{self._tx_context(bus)}）", "err"))
+                else:
+                    self._tx_wedged = False
                 self.q.put(("tx", {"running": False, "sent": 20, "errors": 0,
-                                   "state": self._bus_state(bus), "msg": "突发完成"}))
+                                   "state": self._bus_state(bus), "error": bad,
+                                   "msg": f"突发完成（回显 {echoes}/20）"}))
             except Exception as exc:
+                state = self._bus_state(bus) if bus is not None else ""
+                msg = str(exc)
+                if bus is not None:
+                    ctx = f"（{self._tx_context(bus)}）"
+                    if ctx not in msg:
+                        msg += ctx
                 self.q.put(("tx", {"running": False, "sent": 0, "errors": 0,
-                                   "state": "", "msg": f"PCAN 错误: {exc}"}))
-                self.q.put(("log", f"突发失败: {exc}", "err"))
+                                   "state": state, "error": True,
+                                   "msg": f"PCAN 错误: {msg}"}))
+                self.q.put(("log", f"突发失败: {msg}", "err"))
             finally:
                 if bus is not None:
                     try:
@@ -908,12 +1101,16 @@ class App:
 
     def _apply_stats(self, st):
         if not st:
+            self._latest_stats = {}
+            self._stats_at = 0.0
             self._set_daemon(False)
             self._set_device(False)
             return
         self._set_daemon(True)
         self._set_device(bool(st.get("device")))
         ds = st.get("stats") or {}
+        self._latest_stats = dict(ds)
+        self._stats_at = time.monotonic() if ds else 0.0
         self.v_fps.config(text=str(ds.get("fps", "—")))
         self.v_total.config(text=f"{ds.get('total', 0):,}")
         state = ds.get("state", "—")
@@ -973,19 +1170,23 @@ class App:
 
     def _apply_tx(self, tx):
         if tx.get("msg"):
+            bad = bool(tx.get("error"))
             self.tx_detail.config(
                 text=f"{tx['msg']} · 共 {tx.get('sent', 0):,} 帧"
                      f" · 错误 {tx.get('errors', 0)} · PCAN {tx.get('state', '?')}"
             )
             self.tx_badge.config(
-                text="空闲" if tx.get("sent", 0) == 0 else "完成",
-                fg=FAINT if tx.get("sent", 0) == 0 else GREEN,
+                text="错误" if bad else (
+                    "空闲" if tx.get("sent", 0) == 0 else "完成"),
+                fg=RED if bad else (
+                    FAINT if tx.get("sent", 0) == 0 else GREEN),
             )
             return
         fps = tx.get("fps", 0)
         self.tx_badge.config(text="发送中", fg=GREEN)
         self.tx_detail.config(
             text=f"已发送 {tx.get('sent', 0):,} · {fps:.0f} fps"
+                 f" · 回显 {tx.get('echoes', 0):,}"
                  f" · 错误 {tx.get('errors', 0)} · PCAN {tx.get('state', '?')}"
         )
 
