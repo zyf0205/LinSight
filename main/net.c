@@ -191,6 +191,27 @@ static bool handle_control(int fd, const uint8_t *payload, uint16_t len)
     }
 
     cJSON_Delete(root);
+    if (err == ESP_OK) {
+        /* Host control was applied: mirror it on screen (settings nav badge). */
+        can_stats_t st;
+        twai_stats_snapshot(&st);
+        uint16_t kbps;
+        switch (twai_current_bitrate()) {
+        case CAN_BITRATE_125K:
+            kbps = 125;
+            break;
+        case CAN_BITRATE_250K:
+            kbps = 250;
+            break;
+        case CAN_BITRATE_1M:
+            kbps = 1000;
+            break;
+        default:
+            kbps = 500;
+            break;
+        }
+        linsight_ui_sync_control(st.paused ? 1 : 0, kbps, 0xFFFFFFFFu);
+    }
     send_ack(fd, ctrl_id, err == ESP_OK     ? LINSIGHT_ACK_OK
                           : err == ESP_ERR_NOT_SUPPORTED ? LINSIGHT_ACK_BAD_ARG
                                                          : LINSIGHT_ACK_FAILED);
@@ -470,7 +491,10 @@ static int tcp_connect(const char *host, uint16_t port, int timeout_ms)
     fcntl(fd, F_SETFL, flags);
     const int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-    struct timeval rcv = {.tv_sec = 0, .tv_usec = 500000};
+    /* recv() also paces streaming: batches are only flushed after it returns.
+     * 50 ms keeps end-to-end latency low (max 1.3 MB/s through 4x16 KB sends)
+     * while still yielding to CONTROL/PING handling. */
+    struct timeval rcv = {.tv_sec = 0, .tv_usec = 50000};
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rcv, sizeof(rcv));
     struct timeval snd = {.tv_sec = 3, .tv_usec = 0};
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &snd, sizeof(snd));

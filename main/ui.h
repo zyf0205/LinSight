@@ -14,13 +14,20 @@ typedef enum {
     UI_CONN_RECONNECT,
 } linsight_conn_t;
 
-/* Call with the LVGL port locked. UI data (trace, stats) is pulled from the
- * capture core by a 20 Hz LVGL timer; the setters below only push events. */
+/* Call with the LVGL port locked. Trace and stats are pulled by a 20 Hz LVGL
+ * timer; the setters below only push external events. */
 void linsight_ui_init(void);
 
-/* All setters lock internally; safe from any task. */
+/* All setters only publish into a lock-free mailbox that the 20 Hz LVGL timer
+ * drains; they are non-blocking and safe from any task (net_task, GPIO). */
 void linsight_ui_set_conn(linsight_conn_t state, uint32_t rtt_ms);
-void linsight_ui_toggle_settings(void); /* user key long press */
+
+/* GPIO0 user key: short press toggles display pause, long press switches page. */
+void linsight_ui_handle_key(bool long_press);
+
+/* Host CONTROL (0x07) was applied: show REMOTE SYNC and sync the filter target
+ * (filter_id == 0xFFFFFFFF means "all IDs"). */
+void linsight_ui_sync_control(uint8_t paused, uint16_t bitrate_kbps, uint32_t filter_id);
 
 #ifdef __cplusplus
 }

@@ -1,16 +1,33 @@
 # LinSight 项目计划：无线 CAN 总线分析仪
 
 > ESP32-S3 手持 CAN 分析仪 + Linux 分析服务。设备独立工作：采集/显示/触发；
-> 主机负责长时记录、解码、回放与对照。硬件见 [hardware.md](hardware.md)。
+> 主机负责长时记录、解码、回放与对照。接线见 [hardware.md](hardware.md)，UI 见
+> [ui_design.md](ui_design.md)，线格式以 `protocol/frame.h` 为准。
 
 ## 1. 定位
 
 - 用户：汽车/工业现场调试人员；不接电脑也能看总线，接电脑可长时记录和分析。
 - 卖点：实时采集 + 本地触摸 UI + Wi-Fi 流式 + Linux 主机工具链，不是“桌面副屏”。
-- 复用：LVGL/PSRAM/SPI DMA、共享协议解析器、host 线程/队列/测试。
-- 不做：CAN FD（S3 不支持）、多通道、多设备集群、内核驱动、云端、GUI 上位机。
+- 不做：CAN FD（S3 不支持）、多通道、多设备集群、内核驱动、云端。
+- `host/gui` 只是台架测试台；产品级主机 UI 在 M5 重做。
 
-## 2. 验收（P0）
+## 2. 现状与本次修复（2026-11-05）
+
+M0–M2 已完成：采集、LVGL UI、Wi-Fi 流式、daemon/CLI/`.lsc`、CONTROL/ACK 均跑通。
+
+台架“持续发送就卡死、必须重插 USB-CAN”的根因链：任一次 ≥100 ms 的 ACK 中断
+（设备重启/掉电/毛刺）→ PCAN 无 ACK 重发 → 硬件 bus-off；python-can 默认不自动复位、
+GUI 不读 status 也不 reset → `send()` 永远抛错但 `sent > 0` 使循环不退出；设备端
+恢复需 128×11 隐性位静默，PCAN 持续重发与其互锁。
+
+已落地：
+- GUI：`auto_reset=True`、status 解码、检测 BUSOFF 后 `reset()` + 0.5 s 退避、
+  连续 200 次失败熔断；不再无限自旋。
+- 固件：net_task 的 UI 调用改为无锁邮箱（消除 `lvgl_port_lock(0)` 永久等待）；
+  `SO_RCVTIMEO` 500→50 ms；`tools/gui_tx_smoke.py` 覆盖恢复路径。
+- 待实机定案：`idf.py monitor` + Flash coredump（已开启）确认设备是否重启。
+
+## 3. 验收（P0）
 
 | 项 | 标准 |
 |---|---|
@@ -24,7 +41,7 @@
 
 P1：1 Mbps 短时、触发/过滤、DBC、双路对照、systemd。P2：发送、BLE 配网、签名 OTA、SQLite、TF 卡。
 
-## 3. 架构
+## 4. 架构
 
 ```text
 CAN 总线 ── SN65HVD230 ── ESP32-S3
@@ -35,14 +52,14 @@ USB-CAN ── SocketCAN(can0) ── linsightd（对照/回放）
 linsightd ─→ .lsc 日志 / ASC 导出 / linsight-cli（Unix socket）
 ```
 
-- 固件任务：twai_task（核 0，优先级 10，收帧/时间戳/告警）；net_task（核 0，5，批量/控制/重连）；ui_task（核 1，4，20 Hz 快照）；stats（1 Hz）。
-- UI：Monitor（顶部链路/bitrate/bus 状态，中间 8 行 trace：ID/DLC/data/count，底部 fps/负载/错误/丢帧）；Settings（125/250/500/1000 kbps、ID 过滤、暂停、清统计）；用户键短按暂停、长按设置。
-- 内存：ring 1 MB PSRAM（约 5 万条）；批量 16 KB；draw buffer 沿用内部 DMA。
-- 主机线程：main/epoll（listener、设备/Unix socket、signalfd/timerfd）；writer（有界 ring → `.lsc`，慢盘丢旧记录并计数）；reference（可选 SocketCAN 对照）。
+- 固件任务：twai_task（核 0，10，收帧/时间戳/告警）；net_task（核 0，5，批量/控制/重连）；
+  LVGL 任务（核 1，20 Hz 拉取快照）；STATS 1 Hz。跨任务 UI 更新只写无锁邮箱。
+- 内存：ring ≈1 MB PSRAM（52428 条）；批量 4×16 KB；draw buffer 内部 DMA。
 
-## 4. 协议 v2.0
+## 5. 协议 v2.0（详见 `protocol/frame.h`）
 
-5 字节帧头 `AA 55 type len_lo len_hi`，复用 `protocol/frame.c`。
+5 字节帧头 `AA 55 type len_lo len_hi`；记录 20 B：
+`seq u16 | ts_ms u32 | id u32 | flags u8 | dlc u8 | data[8]`，flags：EXT/RTR/ERR。
 
 | type | 方向 | 负载 |
 |---|---|---|
@@ -52,48 +69,66 @@ linsightd ─→ .lsc 日志 / ASC 导出 / linsight-cli（Unix socket）
 | 04 EVENT | 设备→主机 | bus-off / error-passive / overflow |
 | 05 PING / 06 PONG | 双向 | 4 B 回显，测 RTT/保活 |
 | 07 CONTROL | 主机→设备 | 过滤、暂停/恢复、清统计、发送（P2） |
-| 08 ACK | 设备→主机 | id、code（应答 CONTROL） |
+| 08 ACK | 设备→主机 | id、code |
 | 09 FLOW | 主机→设备 | 最大批速率/暂停 |
 
-记录 20 B：`seq u16 | ts_ms u32 | id u32 | flags u8 | dlc u8 | data[8]`；flags：bit0 EXT、bit1 RTR、bit2 ERR。批次 ≤16 KB（约 800 条）。断网继续采集，重连只发新帧；丢帧在 STATS/UI 显示。
+断网继续采集，重连只发新帧；丢帧在 STATS/UI 显示。
 
-## 5. 主机软件
+## 6. 主机软件与 UI 路线
 
-- `linsightd`：epoll + 非阻塞 TCP；协议解析；ring + writer 线程；Unix socket 控制；SIGTERM 优雅退出。用法 `linsightd [--port N] [--ctl PATH] [--log-dir DIR]`。
-- `linsight-cli`：`stats`、`live`、`pause`/`resume`/`clear`（转发设备 CONTROL）、`export asc|candump FILE.lsc [-o OUT]`。回放/对照在 M4。
-- `.lsc`：32 B 文件头（magic "LSC1"/version/bitrate/起始时间）+ 20 B 记录；尾部截断可恢复读取。
-- DBC/绘图用 Python + cantools/matplotlib；`--reference can0` 双路对照报告缺失/重复/延迟分位（P1）。
-- 设备可独立工作；主机是增强，不是依赖。
+- `linsightd`：epoll + 非阻塞 TCP；协议解析；writer 线程 + 有界 ring；Unix socket /
+  `--ctl-port` 控制口；SIGTERM 优雅退出。
+- `linsight-cli`：`stats`、`live`、`pause`/`resume`/`clear`、`export asc|candump`。
+- 主机 UI 路线（M3 后定稿；本次先修问题，暂缓决策）：
+  - **Web（推荐）**：FastAPI + WebSocket + Canvas；跨平台、图表与远程查看容易。
+  - PySide6：原生桌面、离线好；依赖与打包更重。
+  - Tkinter：零依赖但图表/交互上限低，仅保留为台架测试台。
 
-## 6. 代码结构（目标）
+## 7. 分步计划
 
-| 位置 | 模块 |
-|---|---|
-| `main/twai.c` / `can_ring.c` | 初始化、收帧、ring、序号、统计快照 |
-| `main/net.c` / `ui.c` | 批量/控制/重连；trace、统计条、设置页 |
-| `host/src/main.c` / `canlog.c` / `cli/cli.c` | epoll daemon、`.lsc`/ASC/candump、CLI 与 Unix socket |
-| `protocol/frame.c` / `can.c` | 帧解析、CAN 记录编解码（两端共用，无分配） |
+### M3 台架健壮性（1 周，优先）
 
-## 7. 里程碑
+1. 对照验证：PCAN 发 500 kbps/80% ×10 min，设备 `.lsc` 与发送端逐帧/序号对比。
+2. bus-off 注入：运行中摘 CAN_H、停设备 ACK，确认 PCAN 自动复位、GUI 不断流、EVENT 可见。
+3. 断线重连：拔网线/关 daemon 5 s 内恢复；设备继续采集，重连只补新帧。
+4. 1 Mbps 短时（≤60 s）：记录 fps/负载/丢帧，写入本文档。
+5. 稳定性：10 min 后检查空闲堆/PSRAM；若设备重启，抓 coredump 并修复。
 
-| 阶段 | 工时 | 交付 | 验收 |
-|---|---|---|---|
-| M0 台架 ✅ | 2d | USB-CAN + 3.3V 收发器（GPIO10=TX，GPIO11=RX）；TWAI listen-only 500k | 139/139 帧逐字节比对通过，中位间隔 10.1 ms |
-| M1 设备 UI ✅ | 1w | ring、trace、统计、设置、Wi-Fi 流式 | 自测突发 30000 帧 @4330 fps（96% 负载）零丢失；ring 52428 条无溢出 |
-| M2 主机 MVP ✅ | 1w | epoll daemon、`.lsc`、CLI stats/live/export、CONTROL/ACK | ctest 3/3 绿；真实设备端到端验证（HELLO/STATS/PING→PONG/CONTROL→ACK/SIGTERM 优雅退出） |
-| M3 健壮性 | 1w | 过滤、触发、bus-off 恢复验证、双路对照 | 注入故障可恢复 |
-| M4 工具链 | 1w | 回放、DBC、systemd、fuzz/CI | ASC 可读，fuzz 全绿 |
-| M5 soak/演示 | 3–5d | 24h soak、文档、演示视频 | P0 指标 |
+验收：P0 采集/故障两行全绿；全程无需重插 USB-CAN。
 
-M0–M2 已完成（2026-11）。bus-off 自动恢复与 overflow 计数已在 M1 实现；M3 待做真实总线对照。
+### M4 工具链（1 周）
 
-## 8. 复杂度与风险
+1. 回放：`linsight-cli replay FILE.lsc` → SocketCAN/vcan，时间误差 <5%。
+2. DBC：Python + cantools 解码，导出 CSV/绘图。
+3. 双路对照：`--reference can0` 报告缺失/重复/延迟分位。
+4. 部署：systemd unit + 日志轮转；README 命令。
+5. 测试：协议 parser fuzz（host harness）+ CI（build + ctest）。
 
-- 单设备/单通道/单主机；UI 两屏；主机只做 CLI；DBC/绘图放 Python。
-- 删除旧业务：JPEG/投屏、`/proc` 仪表盘、宏键盘。
-- 核心 C 目标：固件 ≤1000 行、host ≤1500 行、CLI ≤700 行；先 listen-only 闭环。
-- 关键决策：批量+ring；丢旧保新、统计不丢；UI 快照不阻塞采集；发送默认关闭。
-- 风险：收发器/终端/共地接错（3.3V、120Ω、先 listen-only）；高负载丢帧（高优先级任务+ring+对照）；Wi-Fi 抖动（本地缓冲+重连）；写盘阻塞（writer 线程+有界 ring）；范围膨胀（P0/P1/P2 裁剪）。
+验收：ASC/candump 可被 can-utils 读取；fuzz/CI 全绿。
+
+### M5 主机 UI 重做（1–2 周，路线见 §6）
+
+1. 定稿路线与信息架构（实时 trace、统计、过滤、回放、导出）。
+2. 后端：复用 daemon 控制口，加 WebSocket 推送与历史查询。
+3. 前端：虚拟化 trace 列表 + 负载/错误图 + 控制面板；断线自动重连。
+4. 联调：CONTROL/FLOW、REMOTE SYNC、暂停/恢复/清统计。
+
+验收：浏览器 1 h 不卡；3000 帧/s 渲染不丢（抽样校验）；Windows/WSL 均可访问。
+
+### M6 soak 与交付（3–5 天）
+
+1. 24 h soak（设备 + daemon + UI），监控 RSS/句柄/磁盘。
+2. 演示：接线图、脚本、3 min 视频；简历数字按实测回填。
+3. 发布 tag + changelog，docs 与代码对齐。
+
+验收：P0 全部达标。
+
+## 8. 风险与约束
+
+- 台架物理层：3.3 V 收发器、120 Ω 终端、共地；默认 LISTEN_ONLY，NORMAL 仅两节点。
+- 高负载：ring + 批量 + 对照；1 Mbps 只做短时验证。
+- Wi-Fi 抖动：本地缓冲 + 重连 + 状态可见；写盘阻塞：writer 线程 + 有界 ring + 丢弃计数。
+- 范围膨胀：M3 验收前不做 UI 重写、不加新功能。
 
 ## 9. 简历写法
 

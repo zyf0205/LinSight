@@ -16,32 +16,14 @@
 
 static const char *TAG = "linsight";
 
-static int s_saved_brightness = 80;
-
 static void user_button_cb(bsp_button_event_t event)
 {
-    const int level = bsp_backlight_get();
-
-    if (event == BSP_BUTTON_SHORT) {
-        if (level == 0) {
-            /* Wake the screen only. */
-            bsp_backlight_set(s_saved_brightness > 0 ? s_saved_brightness : 80);
-            return;
-        }
-        can_stats_t st;
-        twai_stats_snapshot(&st);
-        twai_capture_set_paused(!st.paused);
+    if (bsp_backlight_get() == 0) {
+        /* Dark screen: any key press only wakes it (design §4). */
+        bsp_backlight_set(80);
         return;
     }
-
-    /* Long press: settings page (or toggle the backlight from there). */
-    if (level > 0) {
-        s_saved_brightness = level;
-        bsp_backlight_set(0);
-    } else {
-        bsp_backlight_set(s_saved_brightness > 0 ? s_saved_brightness : 80);
-        linsight_ui_toggle_settings();
-    }
+    linsight_ui_handle_key(event == BSP_BUTTON_LONG);
 }
 
 void app_main(void)
@@ -69,8 +51,8 @@ void app_main(void)
     linsight_ui_init();
     lvgl_port_unlock();
 
-    /* Let the first splash frame replace the panel's old GRAM content before
-       the backlight comes on; otherwise the previous UI flashes for a moment. */
+    /* Let the first UI frame replace the panel's old GRAM content before the
+       backlight comes on; otherwise the previous image flashes for a moment. */
     vTaskDelay(pdMS_TO_TICKS(120));
     ESP_ERROR_CHECK(bsp_backlight_set(80));
     ESP_ERROR_CHECK(bsp_user_button_init(user_button_cb));

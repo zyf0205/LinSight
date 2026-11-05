@@ -99,6 +99,7 @@ USB-CAN            CAN_H ── 收发器 CANH
 
 - 3.3V 收发器（SN65HVD230 类）；总线两端 120Ω 终端电阻；PCAN 与板共地（USB 已共地）。
 - 固件 `TWAI_MODE_LISTEN_ONLY` 为默认（不 ACK，安全）；台架单对节点测试需切 `NORMAL`，否则发送方收不到 ACK 会重发。
+- 持续发送时任一 ACK 中断都会让 PCAN 进入 bus-off；GUI 已启用自动复位，设备端自恢复需总线静默约 3 ms（对端停发）。
 - 帧格式仅 CAN 2.0A/B（S3 TWAI 不支持 CAN FD）；比特率两端一致（默认 500k）。
 
 ## 6. sdkconfig 必改

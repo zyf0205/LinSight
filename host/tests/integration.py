@@ -47,9 +47,11 @@ def main():
     ctl = os.path.join(tmp, "ctl.sock")
     log_dir = os.path.join(tmp, "logs")
     port = _free_port()
+    ctl_port = _free_port()
 
     proc = subprocess.Popen(
-        [daemon, "--port", str(port), "--ctl", ctl, "--log-dir", log_dir],
+        [daemon, "--port", str(port), "--ctl", ctl, "--ctl-port", str(ctl_port),
+         "--log-dir", log_dir],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
     )
@@ -63,7 +65,7 @@ def main():
                 proc.kill()
 
     try:
-        _run_test(port, ctl, cli, log_dir, proc)
+        _run_test(port, ctl_port, ctl, cli, log_dir, proc)
     except BaseException:
         _stop_daemon()
         err = proc.stderr.read().decode(errors="replace")
@@ -75,9 +77,16 @@ def main():
     print("integration: all passed")
 
 
-def _run_test(port, ctl, cli, log_dir, proc):
+def _run_test(port, ctl_port, ctl, cli, log_dir, proc):
     dev = _wait_port(port, proc)
     dev.settimeout(5)
+
+    # Subscribe a live consumer over the new loopback TCP control port before
+    # the records arrive. `live` must be a newline-framed candump stream.
+    live = socket.create_connection(("127.0.0.1", ctl_port), timeout=5)
+    live.settimeout(5)
+    live.sendall(b"live\n")
+    time.sleep(0.2)
 
     # HELLO, then 10 records in two batches, then STATS.
     dev.sendall(frame(1, b'{"proto":32,"fw":"2.0.0","device":"fake"}'))
@@ -91,6 +100,22 @@ def _run_test(port, ctl, cli, log_dir, proc):
     dev.sendall(frame(3, b'{"fps":4330,"total":10}'))
     time.sleep(0.3)
 
+    live_data = b""
+    deadline = time.time() + 3
+    while live_data.count(b"\n") < 10 and time.time() < deadline:
+        chunk = live.recv(4096)
+        if not chunk:
+            break
+        live_data += chunk
+    live.close()
+    if live_data.count(b"\n") != 10:
+        fail(f"live stream lines: {live_data!r}")
+    if not live_data.endswith(b"\n"):
+        fail(f"live stream not newline-terminated: {live_data[-40:]!r}")
+    live_text = live_data.decode(errors="replace")
+    if "can0" not in live_text or "01ABCDEF" not in live_text or "00000123" not in live_text:
+        fail(f"live stream content: {live_text!r}")
+
     # stats over the control socket.
     out = _ctl_roundtrip(ctl, b"stats\n")
     st = json.loads(out.strip())
@@ -103,6 +128,11 @@ def _run_test(port, ctl, cli, log_dir, proc):
     log_path = st["log"]
     if not os.path.exists(log_path):
         fail(f"log file missing: {log_path}")
+
+    # The loopback TCP control endpoint must expose the same command set.
+    tcp_st = json.loads(_tcp_roundtrip(ctl_port, b"stats\n").strip())
+    if tcp_st.get("records") != 10:
+        fail(f"tcp stats records: {tcp_st}")
 
     def _control_roundtrip(cmd, needle):
         """CLI sends cmd; device sees CONTROL, answers ACK; CLI gets the echo."""
@@ -152,6 +182,37 @@ def _run_test(port, ctl, cli, log_dir, proc):
     dev.close()
     time.sleep(0.3)
 
+    # Session replacement: reconnect while a large old-session backlog may
+    # still be queued. The new .lsc must contain only the new session's
+    # records and must keep logging (a stale close request used to kill it).
+    dev2 = socket.create_connection(("127.0.0.1", port), timeout=5)
+    dev2.settimeout(5)
+    dev2.sendall(frame(1, b'{"proto":32,"fw":"2.0.0","device":"fake2"}'))
+    for k in range(20):  # 16380 records: fills the writer ring
+        dev2.sendall(batch_frame([(i, i, 0x321, 0, [i & 0xFF]) for i in range(819)]))
+    dev2.close()
+
+    dev3 = socket.create_connection(("127.0.0.1", port), timeout=5)
+    dev3.settimeout(5)
+    dev3.sendall(frame(1, b'{"proto":32,"fw":"2.0.0","device":"fake3"}'))
+    time.sleep(0.2)
+    fresh = [(i, i, 0x456, 0, [0xAA] * 8) for i in range(100)]
+    dev3.sendall(batch_frame(fresh))
+    time.sleep(0.5)
+
+    st = json.loads(_ctl_roundtrip(ctl, b"stats\n").strip())
+    if st.get("records") != len(fresh):
+        fail(f"replacement session records: {st}")
+    fresh_log = st.get("log")
+    with open(fresh_log, "rb") as f:
+        blob = f.read()
+    if blob[:4] != b"LSC1":
+        fail(f"replacement .lsc magic: {blob[:4]!r}")
+    if len(blob) != 32 + len(fresh) * REC.size:
+        fail(f"replacement .lsc size {len(blob)} != {32 + len(fresh) * REC.size}")
+    dev3.close()
+    time.sleep(0.3)
+
 
 def _wait_port(port, proc, timeout=5.0):
     """Connect once the daemon's listener is up (avoids a bind race)."""
@@ -196,6 +257,27 @@ def _ctl_roundtrip(ctl_path, msg):
             break
         data += chunk
         if b"code" in data:
+            break
+    s.close()
+    return data.decode(errors="replace")
+
+
+def _tcp_roundtrip(port, msg):
+    """Same line protocol as the Unix socket, over loopback TCP."""
+    s = socket.create_connection(("127.0.0.1", port), timeout=5)
+    s.settimeout(5)
+    s.sendall(msg)
+    data = b""
+    deadline = time.time() + 3
+    while time.time() < deadline:
+        try:
+            chunk = s.recv(4096)
+        except socket.timeout:
+            break
+        if not chunk:
+            break
+        data += chunk
+        if b"code" in data or data.endswith(b"\n"):
             break
     s.close()
     return data.decode(errors="replace")

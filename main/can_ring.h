@@ -12,9 +12,9 @@ extern "C" {
 
 /*
  * PSRAM ring buffer of CAN records (one line of the plan's "twai_task -> PSRAM
- * ring" pipeline). Single producer (twai task), multiple readers:
- *  - net_task pops records to send over TCP;
- *  - the LVGL task snapshots the tail for the trace view.
+ * ring" pipeline). Single producer (twai task), one consumer: net_task pops
+ * records to send over TCP. The local trace does not read this ring; it uses
+ * twai's capture-side UI history so streaming cannot blank the display.
  * All entry points take an internal mutex; hold times are memcpy-sized.
  *
  * Overflow policy is "drop old, keep new" (plan §8): pushing into a full ring
@@ -43,6 +43,9 @@ uint32_t can_ring_pop(linsight_can_record_t *out, uint32_t max);
 uint32_t can_ring_tail(linsight_can_record_t *out, uint32_t n);
 
 void can_ring_get_info(can_ring_info_t *out);
+
+/* Clear the overflow counter shown as OVF (Clear Stats); records are untouched. */
+void can_ring_reset_dropped(void);
 
 #ifdef __cplusplus
 }

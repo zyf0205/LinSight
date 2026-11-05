@@ -2,7 +2,8 @@
  * linsightd — LinSight CAN host daemon (M2).
  *
  * epoll main loop: TCP listener (the device), Unix-socket listener (the CLI),
- * signalfd (SIGTERM/SIGINT graceful exit) and a 1 Hz timerfd (stats).
+ * an optional loopback TCP listener (Windows GUI / remote CLI), signalfd
+ * (SIGTERM/SIGINT graceful exit) and a 1 Hz timerfd (stats).
  * One device session at a time; CAN_BATCH records flow into a bounded ring
  * drained by a writer thread that appends to per-session .lsc files.
  *
@@ -47,20 +48,41 @@
 
 static const char *g_port = "8888";
 static const char *g_ctl_path = "/tmp/linsight.sock";
+static const char *g_ctl_port = NULL; /* optional loopback TCP control port */
 static const char *g_log_dir = ".";
 
 /* ------------------------------------------------------------ write ring */
 
+/* Every queued record carries the session generation it belongs to, so the
+ * writer can order file close/open strictly against the record stream. A
+ * device reconnect can otherwise queue old records behind a new OPEN request
+ * and have them (or the first records of the new session) land in the wrong
+ * .lsc file, which the old single-slot open/close flags could not prevent. */
 typedef struct {
-    linsight_can_record_t rec[WRING_CAP];
+    linsight_can_record_t rec;
+    uint32_t gen;
+} wring_entry_t;
+
+typedef struct {
+    wring_entry_t entry[WRING_CAP];
     uint32_t head; /* next write index */
     uint32_t count;
     uint64_t dropped;
     uint64_t written;
 
+    uint32_t gen; /* current device session generation */
+    uint32_t bitrate; /* from the device HELLO, for the .lsc header */
     bool open_req;
+    uint32_t open_gen;
     char open_path[512];
     bool close_req;
+    uint32_t close_gen;
+
+    /* Wall-clock origin for the session (device ts_ms is uptime), captured
+     * when its first record arrives rather than when the writer drains it:
+     * a backlogged writer must not shift recorded timestamps. */
+    uint64_t anchor_wall;
+    uint32_t anchor_gen;
 
     bool done;
     pthread_mutex_t lock;
@@ -68,6 +90,7 @@ typedef struct {
 } wring_t;
 
 static wring_t g_ring = {
+    .bitrate = 500000,
     .lock = PTHREAD_MUTEX_INITIALIZER,
     .cond = PTHREAD_COND_INITIALIZER,
 };
@@ -81,10 +104,89 @@ static void wring_push(const linsight_can_record_t *recs, uint32_t n)
             g_ring.count--;
             g_ring.dropped++;
         }
-        g_ring.rec[(g_ring.head + g_ring.count) % WRING_CAP] = recs[i];
+        wring_entry_t *slot = &g_ring.entry[(g_ring.head + g_ring.count) % WRING_CAP];
+        slot->rec = recs[i];
+        slot->gen = g_ring.gen;
         g_ring.count++;
     }
     pthread_cond_signal(&g_ring.cond);
+    pthread_mutex_unlock(&g_ring.lock);
+}
+
+/* Consume the pending open request only if it still belongs to `gen`: a newer
+ * reconnect may have replaced it while the writer was busy. */
+static bool wring_take_open(uint32_t gen, char *path, size_t cap, uint64_t *anchor)
+{
+    bool taken = false;
+    pthread_mutex_lock(&g_ring.lock);
+    if (g_ring.open_req && g_ring.open_gen == gen) {
+        snprintf(path, cap, "%s", g_ring.open_path);
+        *anchor = g_ring.anchor_gen == gen ? g_ring.anchor_wall : 0;
+        g_ring.open_req = false;
+        taken = true;
+    }
+    pthread_mutex_unlock(&g_ring.lock);
+    return taken;
+}
+
+static void wring_set_anchor(uint64_t wall)
+{
+    pthread_mutex_lock(&g_ring.lock);
+    g_ring.anchor_wall = wall;
+    g_ring.anchor_gen = g_ring.gen;
+    pthread_mutex_unlock(&g_ring.lock);
+}
+
+/* Close the log of `gen` if the device session is over. A close request for a
+ * newer generation also ends `gen`: sessions only move forward, and the newer
+ * close (e.g. a connect/disconnect that sent no records) must not leave the
+ * old file open with a request the writer can never match, which would make it
+ * spin on the condition variable. */
+static bool wring_take_close(uint32_t gen)
+{
+    bool taken = false;
+    pthread_mutex_lock(&g_ring.lock);
+    if (g_ring.close_req && g_ring.close_gen >= gen) {
+        g_ring.close_req = false;
+        taken = true;
+    }
+    pthread_mutex_unlock(&g_ring.lock);
+    return taken;
+}
+
+/* A close request older than the log we just opened refers to a session whose
+ * open was superseded before it could create a file; there is nothing to
+ * close, and leaving the flag set would make the writer spin forever. */
+static void wring_clear_close_before(uint32_t gen)
+{
+    pthread_mutex_lock(&g_ring.lock);
+    if (g_ring.close_req && g_ring.close_gen < gen) {
+        g_ring.close_req = false;
+    }
+    pthread_mutex_unlock(&g_ring.lock);
+}
+
+/* With no log open there is nothing to close: any pending close belongs to a
+ * generation that never produced a file (idle / immediate-reconnect session). */
+static void wring_clear_close(void)
+{
+    pthread_mutex_lock(&g_ring.lock);
+    g_ring.close_req = false;
+    pthread_mutex_unlock(&g_ring.lock);
+}
+
+static uint32_t wring_bitrate(void)
+{
+    pthread_mutex_lock(&g_ring.lock);
+    const uint32_t bitrate = g_ring.bitrate;
+    pthread_mutex_unlock(&g_ring.lock);
+    return bitrate;
+}
+
+static void wring_set_bitrate(uint32_t bitrate)
+{
+    pthread_mutex_lock(&g_ring.lock);
+    g_ring.bitrate = bitrate;
     pthread_mutex_unlock(&g_ring.lock);
 }
 
@@ -93,73 +195,99 @@ static void *writer_thread(void *arg)
     (void)arg;
     lsc_writer_t w = {0};
     bool log_open = false;
+    uint32_t log_gen = 0;
 
     for (;;) {
         pthread_mutex_lock(&g_ring.lock);
-        while (g_ring.count == 0 && !g_ring.open_req && !g_ring.close_req && !g_ring.done) {
+        /* A pending open alone has no work: the file is created lazily from
+         * the first record, so only records/close/shutdown wake the writer. */
+        while (g_ring.count == 0 && !g_ring.close_req && !g_ring.done) {
             pthread_cond_wait(&g_ring.cond, &g_ring.lock);
         }
         const bool finish = g_ring.done;
-        const bool open_now = g_ring.open_req;
-        /* A close must not clobber a just-issued open (session replacement), so
-         * close is ordered first, and deferred while records are still queued. */
-        const bool close_now = g_ring.close_req && g_ring.count == 0;
-        char path[512] = {0};
-        if (open_now) {
-            memcpy(path, g_ring.open_path, sizeof(path));
-            g_ring.open_req = false;
-        }
-        if (close_now) {
-            g_ring.close_req = false;
-        }
 
-        static linsight_can_record_t batch[LOG_BATCH];
+        static wring_entry_t batch[LOG_BATCH];
         uint32_t n = g_ring.count;
         if (n > LOG_BATCH) {
             n = LOG_BATCH;
         }
         for (uint32_t i = 0; i < n; i++) {
-            batch[i] = g_ring.rec[g_ring.head];
+            batch[i] = g_ring.entry[g_ring.head];
             g_ring.head = (g_ring.head + 1) % WRING_CAP;
         }
         g_ring.count -= n;
         pthread_mutex_unlock(&g_ring.lock);
 
-        if (close_now && log_open) {
-            lsc_writer_close(&w);
-            log_open = false;
-        }
-        if (open_now) {
-            if (log_open) {
-                lsc_writer_close(&w);
-            }
-            const uint32_t bitrate = 500000;
-            log_open = lsc_writer_open(&w, path, bitrate, (uint64_t)time(NULL)) == 0;
-            if (!log_open) {
-                fprintf(stderr, TAG ": cannot open %s: %s\n", path, strerror(errno));
-            }
-        }
-
         uint32_t ok = 0;
         for (uint32_t i = 0; i < n; i++) {
-            if (lsc_writer_write(&w, &batch[i]) != 0) {
+            const wring_entry_t *e = &batch[i];
+
+            if (log_open && e->gen != log_gen) {
+                /* Generation boundary: every record of the old session has
+                 * been written, so it is safe to close its file now. */
+                lsc_writer_close(&w);
+                log_open = false;
+                wring_take_close(log_gen);
+            }
+            if (!log_open) {
+                char path[512];
+                uint64_t start_wall = 0;
+                if (wring_take_open(e->gen, path, sizeof(path), &start_wall)) {
+                    if (!start_wall) {
+                        /* No anchor recorded (should not happen): fall back to
+                         * mapping this record's uptime onto the current time. */
+                        const uint64_t now_s = (uint64_t)time(NULL);
+                        const uint64_t ts_s = e->rec.ts_ms / 1000u;
+                        start_wall = now_s > ts_s ? now_s - ts_s : now_s;
+                    }
+                    log_open = lsc_writer_open(&w, path, wring_bitrate(), start_wall) == 0;
+                    log_gen = e->gen;
+                    wring_clear_close_before(log_gen);
+                    if (!log_open) {
+                        fprintf(stderr, TAG ": cannot open %s: %s\n", path, strerror(errno));
+                    }
+                }
+                if (!log_open) {
+                    /* The open request was superseded (quick reconnect) or the
+                     * file could not be created: drop this stale generation. */
+                    continue;
+                }
+            }
+
+            if (lsc_writer_write(&w, &e->rec) != 0) {
                 fprintf(stderr, TAG ": log write failed: %s\n", strerror(errno));
                 break;
             }
             ok++;
         }
+
         if (ok > 0) {
             pthread_mutex_lock(&g_ring.lock);
             g_ring.written += ok;
             pthread_mutex_unlock(&g_ring.lock);
         }
+
+        /* The queue is drained (n < LOG_BATCH means it was fully popped).
+         * Close a dead session; a close with no open log belongs to a session
+         * that never produced a record, so there is no file to close. */
+        if (n < LOG_BATCH) {
+            if (log_open && wring_take_close(log_gen)) {
+                lsc_writer_close(&w);
+                log_open = false;
+            }
+            if (!log_open) {
+                wring_clear_close();
+            }
+        }
+
         if (n > 0 && log_open) {
             lsc_writer_flush(&w);
         }
 
         if (finish) {
             pthread_mutex_lock(&g_ring.lock);
-            const bool empty = g_ring.count == 0 && !g_ring.open_req && !g_ring.close_req;
+            /* A pending open without records has no file and needs no work. */
+            const bool empty = g_ring.count == 0 && !g_ring.close_req;
             pthread_mutex_unlock(&g_ring.lock);
             if (empty) {
                 if (log_open) {
@@ -181,6 +309,7 @@ typedef struct {
     uint64_t recs;
     char stats[512]; /* latest STATS JSON from the device */
     time_t last_rx;
+    bool anchored; /* g_session_start mapped from the first record's uptime */
 } device_t;
 
 typedef struct {
@@ -262,14 +391,34 @@ static void deliver_live(const linsight_can_record_t *recs, uint32_t n)
 {
     char line[128];
     for (uint32_t i = 0; i < n; i++) {
+        int len = 0;
+        bool formatted = false;
         for (int c = 0; c < CLI_MAX; c++) {
-            if (g_cli[c].fd >= 0 && g_cli[c].live) {
-                const int len = canlog_format_candump(&recs[i], g_session_start, line,
-                                                      sizeof(line));
-                if (len > 0 && !send_all(g_cli[c].fd, line, (size_t)len)) {
-                    cli_close(&g_cli[c]);
-                }
+            if (g_cli[c].fd < 0 || !g_cli[c].live) {
+                continue;
             }
+            if (!formatted) {
+                /* Newline-terminated: `live` is a line-oriented stream for the
+                 * CLI and the bench GUI. */
+                len = canlog_format_candump(&recs[i], g_session_start, line,
+                                            sizeof(line) - 1);
+                formatted = true;
+                if (len <= 0) {
+                    break;
+                }
+                line[len++] = '\n';
+            }
+            /* Best-effort: a slow `live` consumer must never stall the device
+             * RX / writer path. EAGAIN drops one line; a hard error or a
+             * partial line (would corrupt the stream) closes the client. */
+            const ssize_t sent = send(g_cli[c].fd, line, (size_t)len, MSG_NOSIGNAL);
+            if (sent == len) {
+                continue;
+            }
+            if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                continue;
+            }
+            cli_close(&g_cli[c]);
         }
     }
 }
@@ -304,18 +453,64 @@ static void handle_batch(const uint8_t *payload, uint16_t len)
 
     g_dev.recs += valid;
     if (valid) {
+        if (!g_dev.anchored) {
+            /* Device ts_ms is uptime; anchor it to wall time once per session
+             * so `live` lines and exports show real dates. */
+            const uint64_t now_s = (uint64_t)time(NULL);
+            const uint64_t ts_s = recs[0].ts_ms / 1000u;
+            g_session_start = now_s > ts_s ? now_s - ts_s : now_s;
+            wring_set_anchor(g_session_start);
+            g_dev.anchored = true;
+        }
         wring_push(recs, valid);
         deliver_live(recs, valid);
     }
+}
+
+/* HELLO is e.g. {"...","bitrate":"500k","mode":"LISTEN"}; the host has no
+ * JSON dependency and this is the only field it needs from that object. */
+static uint32_t parse_hello_bitrate(const uint8_t *payload, uint16_t len)
+{
+    char json[LINSIGHT_MAX_HELLO + 1];
+
+    if (len > LINSIGHT_MAX_HELLO) {
+        return 0;
+    }
+    memcpy(json, payload, len);
+    json[len] = '\0';
+
+    const char *key = strstr(json, "\"bitrate\":\"");
+    if (!key) {
+        return 0;
+    }
+    key += strlen("\"bitrate\":\"");
+    if (strncmp(key, "125k", 4) == 0) {
+        return 125000;
+    }
+    if (strncmp(key, "250k", 4) == 0) {
+        return 250000;
+    }
+    if (strncmp(key, "500k", 4) == 0) {
+        return 500000;
+    }
+    if (strncmp(key, "1M", 2) == 0) {
+        return 1000000;
+    }
+    return 0;
 }
 
 static void handle_frame(void *ctx, uint8_t type, const uint8_t *payload, uint16_t len)
 {
     (void)ctx;
     switch (type) {
-    case LINSIGHT_FRAME_HELLO:
+    case LINSIGHT_FRAME_HELLO: {
         fprintf(stderr, TAG ": device hello: %.*s\n", (int)len, (const char *)payload);
+        const uint32_t bitrate = parse_hello_bitrate(payload, len);
+        if (bitrate) {
+            wring_set_bitrate(bitrate);
+        }
         break;
+    }
     case LINSIGHT_FRAME_CAN_BATCH:
         handle_batch(payload, len);
         break;
@@ -368,6 +563,7 @@ static void device_close(void)
             (unsigned long long)g_dev.recs);
     pthread_mutex_lock(&g_ring.lock);
     g_ring.close_req = true;
+    g_ring.close_gen = g_ring.gen;
     pthread_cond_signal(&g_ring.cond);
     pthread_mutex_unlock(&g_ring.lock);
     g_current_log[0] = '\0';
@@ -392,6 +588,7 @@ static void device_accept(int listen_fd)
     g_dev.recs = 0;
     g_dev.last_rx = time(NULL);
     g_dev.stats[0] = '\0';
+    g_dev.anchored = false;
     linsight_parser_reset(&g_dev.parser);
     g_session_start = (uint64_t)time(NULL);
 
@@ -406,6 +603,8 @@ static void device_accept(int listen_fd)
      * each other's log. */
     static uint32_t session_seq;
     session_seq++;
+    g_ring.gen++;
+    g_ring.open_gen = g_ring.gen;
     snprintf(g_ring.open_path, sizeof(g_ring.open_path),
              "%s/can-%04d%02d%02d-%02d%02d%02d-%03u.lsc", g_log_dir, tm.tm_year + 1900,
              tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec, session_seq);
@@ -539,6 +738,29 @@ static int make_listener(const char *port, bool unix_socket)
     return fd;
 }
 
+/* Optional TCP control endpoint, bound to loopback only. It speaks the exact
+ * same line protocol as the Unix socket, so a GUI running on Windows can drive
+ * the daemon in WSL without a second protocol implementation. */
+static int make_loopback_listener(const char *port)
+{
+    const int fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (fd < 0) {
+        return -1;
+    }
+    static int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    struct sockaddr_in addr = {.sin_family = AF_INET};
+    addr.sin_port = htons((uint16_t)atoi(port));
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0 ||
+        listen(fd, 4) < 0) {
+        close(fd);
+        return -1;
+    }
+    set_nonblock(fd);
+    return fd;
+}
+
 int main(int argc, char **argv)
 {
     for (int i = 1; i < argc; i++) {
@@ -551,11 +773,19 @@ int main(int argc, char **argv)
             g_port = argv[i];
         } else if (strcmp(argv[i], "--ctl") == 0 && i + 1 < argc) {
             g_ctl_path = argv[++i];
+        } else if (strcmp(argv[i], "--ctl-port") == 0 && i + 1 < argc) {
+            const int p = atoi(argv[++i]);
+            if (p <= 0 || p > 65535) {
+                fprintf(stderr, "linsightd: bad ctl port '%s'\n", argv[i]);
+                return 1;
+            }
+            g_ctl_port = argv[i];
         } else if (strcmp(argv[i], "--log-dir") == 0 && i + 1 < argc) {
             g_log_dir = argv[++i];
         } else {
             fprintf(stderr,
-                    "usage: linsightd [--port N] [--ctl PATH] [--log-dir DIR]\n");
+                    "usage: linsightd [--port N] [--ctl PATH] [--ctl-port N] "
+                    "[--log-dir DIR]\n");
             return 1;
         }
     }
@@ -572,7 +802,8 @@ int main(int argc, char **argv)
 
     const int tcp_fd = make_listener(g_port, false);
     const int unix_fd = make_listener(g_ctl_path, true);
-    if (tcp_fd < 0 || unix_fd < 0 || sigfd < 0) {
+    const int ctl_tcp_fd = g_ctl_port ? make_loopback_listener(g_ctl_port) : -1;
+    if (tcp_fd < 0 || unix_fd < 0 || (g_ctl_port && ctl_tcp_fd < 0) || sigfd < 0) {
         fprintf(stderr, TAG ": listener setup failed: %s\n", strerror(errno));
         return 1;
     }
@@ -593,6 +824,10 @@ int main(int argc, char **argv)
     epoll_ctl(g_epoll, EPOLL_CTL_ADD, tcp_fd, &ev);
     ev.data.u64 = 2; /* unix listener */
     epoll_ctl(g_epoll, EPOLL_CTL_ADD, unix_fd, &ev);
+    if (ctl_tcp_fd >= 0) {
+        ev.data.u64 = 5; /* loopback TCP control listener */
+        epoll_ctl(g_epoll, EPOLL_CTL_ADD, ctl_tcp_fd, &ev);
+    }
     ev.data.u64 = 3; /* signalfd */
     epoll_ctl(g_epoll, EPOLL_CTL_ADD, sigfd, &ev);
 
@@ -617,6 +852,9 @@ int main(int argc, char **argv)
 
     fprintf(stderr, TAG ": listening on :%s, ctl %s, logs %s\n", g_port, g_ctl_path,
             g_log_dir);
+    if (ctl_tcp_fd >= 0) {
+        fprintf(stderr, TAG ": tcp control on 127.0.0.1:%s\n", g_ctl_port);
+    }
 
     uint64_t last_recs = 0;
     while (!g_stop) {
@@ -659,6 +897,8 @@ int main(int argc, char **argv)
                 device_accept(tcp_fd);
             } else if (tag == 2) {
                 cli_accept(unix_fd);
+            } else if (tag == 5) {
+                cli_accept(ctl_tcp_fd);
             } else if (tag == 0) { /* device socket */
                 uint8_t rx[RX_BUF_SIZE];
                 const ssize_t got = recv(g_dev.fd, rx, sizeof(rx), 0);
@@ -703,6 +943,9 @@ int main(int argc, char **argv)
     pthread_join(writer, NULL);
     close(tcp_fd);
     close(unix_fd);
+    if (ctl_tcp_fd >= 0) {
+        close(ctl_tcp_fd);
+    }
     unlink(g_ctl_path);
     fprintf(stderr, TAG ": exited cleanly\n");
     return 0;

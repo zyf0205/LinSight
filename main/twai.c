@@ -21,6 +21,7 @@
 #define TWAI_CORE 0
 #define TWAI_RX_QUEUE_LEN 200
 #define EVENT_QUEUE_LEN 8
+#define UI_HISTORY 512 /* records retained for the 20 Hz trace view (~10 KB) */
 
 /* Wire bits per frame, ignoring stuffing: standard ~47+8*dlc, extended ~67+8*dlc. */
 #define STD_FRAME_OVERHEAD_BITS 47u
@@ -44,6 +45,12 @@ typedef struct {
 static can_state_t s_can = {
     .state = "STOPPED",
 };
+
+/* Capture-side UI history: unlike the network ring, these records are never
+ * popped by net_task, so the display always has a complete recent window. */
+static linsight_can_record_t s_ui_hist[UI_HISTORY];
+static uint32_t s_ui_head;
+static uint32_t s_ui_count;
 
 static uint32_t bitrate_hz(can_bitrate_t br)
 {
@@ -155,13 +162,21 @@ static void record_frame(const twai_message_t *msg)
         .dlc = msg->data_length_code,
     };
     memcpy(rec.data, msg->data, LINSIGHT_DLC_MAX);
-    can_ring_push(&rec);
+    can_ring_push(&rec); /* assigns rec.seq */
 
-    /* Single-writer counters; readers copy them under the lock. */
+    stats_lock();
+    s_ui_hist[s_ui_head] = rec;
+    s_ui_head = (s_ui_head + 1) % UI_HISTORY;
+    if (s_ui_count < UI_HISTORY) {
+        s_ui_count++;
+    }
+
+    /* Single-writer counters; readers copy them under the same lock. */
     s_can.frames_window++;
     s_can.stats.rx_total++;
     s_can.bits_window += (msg->extd ? EXT_FRAME_OVERHEAD_BITS : STD_FRAME_OVERHEAD_BITS) +
                          8u * msg->data_length_code;
+    stats_unlock();
 }
 
 static void handle_alerts(void)
@@ -240,21 +255,27 @@ static void twai_task(void *arg)
             continue;
         }
 
-        /* 1 Hz window: fps, bus load and driver-maintained counters. */
-        const uint32_t seconds = (uint32_t)((now - window_start) / 1000000u);
-        twai_status_info_t status;
-        twai_get_status_info(&status);
+        /* 1 Hz window: fps, bus load and driver-maintained counters. Use the
+         * real elapsed time instead of an integer second count: a window that
+         * fires 100 ms late would otherwise over-report by 10% at low rates. */
+        const uint64_t elapsed_us = now - window_start;
+        twai_status_info_t status = {0};
+        const bool status_ok = twai_get_status_info(&status) == ESP_OK;
 
         stats_lock();
-        s_can.stats.fps = s_can.frames_window / seconds;
-        s_can.stats.load_permille =
-            (uint32_t)((uint64_t)s_can.bits_window * 1000u / bitrate_hz(s_can.bitrate) / seconds);
-        s_can.stats.rx_missed = status.rx_missed_count;
-        s_can.stats.tec = status.tx_error_counter;
-        s_can.stats.rec = status.rx_error_counter;
+        s_can.stats.fps =
+            (uint32_t)((uint64_t)s_can.frames_window * 1000000u / elapsed_us);
+        uint32_t permille = (uint32_t)((uint64_t)s_can.bits_window * 1000000000ull /
+                                       ((uint64_t)bitrate_hz(s_can.bitrate) * elapsed_us));
+        s_can.stats.load_permille = permille > 1000u ? 1000u : permille;
         s_can.stats.paused = s_can.paused;
-        if (!s_can.paused) {
-            s_can.state = driver_state_name(status.state);
+        if (status_ok) {
+            s_can.stats.rx_missed = status.rx_missed_count;
+            s_can.stats.tec = status.tx_error_counter;
+            s_can.stats.rec = status.rx_error_counter;
+            if (!s_can.paused) {
+                s_can.state = driver_state_name(status.state);
+            }
         }
         stats_unlock();
 
@@ -328,7 +349,12 @@ esp_err_t twai_capture_start(can_bitrate_t bitrate, can_mode_t mode)
 
     ESP_RETURN_ON_ERROR(twai_driver_install(&general, timing_for(bitrate), &FILTER_ACCEPT_ALL),
                         TAG, "twai install");
-    ESP_RETURN_ON_ERROR(twai_start(), TAG, "twai start");
+    const esp_err_t start_err = twai_start();
+    if (start_err != ESP_OK) {
+        twai_driver_uninstall();
+        ESP_LOGE(TAG, "twai start: %s", esp_err_to_name(start_err));
+        return start_err;
+    }
 
     s_can.running = true;
     const BaseType_t ok = xTaskCreatePinnedToCore(twai_task, "twai", TWAI_TASK_STACK, NULL,
@@ -347,6 +373,8 @@ esp_err_t twai_capture_start(can_bitrate_t bitrate, can_mode_t mode)
 
 esp_err_t twai_capture_restart(can_bitrate_t bitrate, can_mode_t mode)
 {
+    const bool was_paused = s_can.paused;
+
     if (!s_can.task) {
         return twai_capture_start(bitrate, mode);
     }
@@ -358,13 +386,49 @@ esp_err_t twai_capture_restart(can_bitrate_t bitrate, can_mode_t mode)
     if (s_can.task) {
         return ESP_ERR_INVALID_STATE;
     }
-    return twai_capture_start(bitrate, mode);
+
+    const esp_err_t err = twai_capture_start(bitrate, mode);
+    if (err == ESP_OK && was_paused) {
+        /* A bitrate/mode change is not a resume; keep the capture state. */
+        s_can.paused = true;
+    }
+    return err;
 }
 
 void twai_capture_set_paused(bool paused)
 {
     s_can.paused = paused;
     ESP_LOGI(TAG, "capture %s", paused ? "PAUSED" : "RESUMED");
+}
+
+esp_err_t twai_capture_recover(void)
+{
+    if (!s_can.task) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    twai_status_info_t status = {0};
+    const esp_err_t info_err = twai_get_status_info(&status);
+    if (info_err != ESP_OK) {
+        return info_err;
+    }
+
+    if (status.state == TWAI_STATE_BUS_OFF) {
+        const esp_err_t err = twai_initiate_recovery();
+        if (err == ESP_OK) {
+            set_state("RECOVERING");
+            ESP_LOGW(TAG, "manual bus-off recovery");
+        }
+        return err;
+    }
+    if (status.state == TWAI_STATE_STOPPED) {
+        const esp_err_t err = twai_start();
+        if (err == ESP_OK) {
+            set_state("RUNNING");
+        }
+        return err;
+    }
+    return ESP_OK; /* running or already recovering */
 }
 
 void twai_stats_snapshot(can_stats_t *out)
@@ -385,10 +449,31 @@ bool twai_event_pop(can_event_t *out)
     return xQueueReceive(s_can.events, out, 0) == pdTRUE;
 }
 
+uint32_t twai_ui_tail(linsight_can_record_t *out, uint32_t n)
+{
+    if (!out || n == 0 || !s_can.lock) {
+        return 0;
+    }
+    if (n > UI_HISTORY) {
+        n = UI_HISTORY;
+    }
+
+    stats_lock();
+    const uint32_t avail = s_ui_count < n ? s_ui_count : n;
+    uint32_t idx = (s_ui_head + UI_HISTORY - avail) % UI_HISTORY;
+    for (uint32_t i = 0; i < avail; i++) {
+        out[i] = s_ui_hist[idx];
+        idx = (idx + 1) % UI_HISTORY;
+    }
+    stats_unlock();
+    return avail;
+}
+
 void twai_stats_clear(void)
 {
     stats_lock();
     memset(&s_can.stats, 0, sizeof(s_can.stats));
     stats_unlock();
+    can_ring_reset_dropped(); /* Clear Stats also clears the OVF indicator */
     ESP_LOGI(TAG, "stats cleared");
 }

@@ -111,3 +111,13 @@ void can_ring_get_info(can_ring_info_t *out)
     out->stored = s_stored;
     xSemaphoreGive(s_lock);
 }
+
+void can_ring_reset_dropped(void)
+{
+    if (!s_lock) {
+        return;
+    }
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    s_dropped = 0;
+    xSemaphoreGive(s_lock);
+}

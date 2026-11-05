@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 #include "esp_err.h"
+#include "frame.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -56,9 +57,17 @@ esp_err_t twai_capture_restart(can_bitrate_t bitrate, can_mode_t mode);
 
 void twai_capture_set_paused(bool paused);
 
+/* Manual bus-off recovery (Settings "Bus Recover"). No-op while running. */
+esp_err_t twai_capture_recover(void);
+
 /* Copy the counters and drain at most one pending event. Thread-safe. */
 void twai_stats_snapshot(can_stats_t *out);
 bool twai_event_pop(can_event_t *out);
+
+/* Copy the newest n captured records for the local UI (oldest first).
+ * This is capture-side history, independent of the network ring: net_task
+ * popping records for streaming must not blank or bias the trace. */
+uint32_t twai_ui_tail(linsight_can_record_t *out, uint32_t n);
 
 /* Reset the software counters (CONTROL.clear_stats); TWAI TEC/REC untouched. */
 void twai_stats_clear(void);
