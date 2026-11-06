@@ -5,7 +5,9 @@
 #include "can_ring.h"
 #include "driver/twai.h"
 #include "esp_check.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -268,9 +270,14 @@ static void twai_task(void *arg)
         const bool status_ok = twai_get_status_info(&status) == ESP_OK;
 
         stats_lock();
-        s_can.stats.fps =
-            (uint32_t)((uint64_t)s_can.frames_window * 1000000u / elapsed_us);
-        uint32_t permille = (uint32_t)((uint64_t)s_can.bits_window * 1000000000ull /
+        /* Snapshot and reset the window counters under the same lock so the
+         * derived fps/load and the reset are one atomic update for readers. */
+        const uint32_t frames = s_can.frames_window;
+        const uint32_t bits = s_can.bits_window;
+        s_can.frames_window = 0;
+        s_can.bits_window = 0;
+        s_can.stats.fps = (uint32_t)((uint64_t)frames * 1000000u / elapsed_us);
+        uint32_t permille = (uint32_t)((uint64_t)bits * 1000000000ull /
                                        ((uint64_t)bitrate_hz(s_can.bitrate) * elapsed_us));
         s_can.stats.load_permille = permille > 1000u ? 1000u : permille;
         s_can.stats.paused = s_can.paused;
@@ -287,7 +294,7 @@ static void twai_task(void *arg)
         can_ring_info_t ring;
         can_ring_get_info(&ring);
         ESP_LOGI(TAG, "%s %s%s fps=%u load=%u.%u%% total=%u drop=%u missed=%u rxq_full=%u "
-                      "bus_err=%u ring=%u/%u msgs_to_rx=%u state=%s",
+                      "bus_err=%u ring=%u/%u msgs_to_rx=%u state=%s heap=%u psram=%u",
                  can_bitrate_name(s_can.bitrate), can_mode_name(s_can.mode),
                  s_can.paused ? " PAUSED" : "",
                  (unsigned)s_can.stats.fps, (unsigned)(s_can.stats.load_permille / 10),
@@ -295,10 +302,10 @@ static void twai_task(void *arg)
                  (unsigned)s_can.stats.rx_total, (unsigned)ring.dropped,
                  (unsigned)s_can.stats.rx_missed, (unsigned)s_can.stats.rx_queue_full,
                  (unsigned)s_can.stats.bus_errors, (unsigned)ring.used, (unsigned)ring.cap,
-                 (unsigned)status.msgs_to_rx, s_can.state);
+                 (unsigned)status.msgs_to_rx, s_can.state,
+                 (unsigned)esp_get_free_heap_size(),
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
-        s_can.frames_window = 0;
-        s_can.bits_window = 0;
         window_start = now;
     }
 
