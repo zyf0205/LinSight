@@ -103,7 +103,7 @@ P1：systemd/journald/logrotate、DBC（cantools）；物理 PCAN 的 SocketCAN 
 - 本仓库只提交固件；上位机在 `~/linsight` 单独提交；`protocol/`、`docs/` 改动两边同步。
 - 台架用 WSL `can0`（见 [hardware.md](hardware.md) §5）；Python 台架工具留在上位机仓。
 - 文档只放 `docs/`；协议以 `protocol/frame.h` 为准，不复制表格。
-- Wi-Fi 密码与主机 IP 只存在于忽略的 `sdkconfig`。
+- 台架 Wi-Fi/主机地址集中在 `main/net.c` 的 `BENCH_*` 宏（只重编一个文件，已提交）；生产部署改回 menuconfig/私密配置。Wi-Fi 使用 CN 1–13 信道。
 - 不提交 `build/`、`sdkconfig`、`managed_components/`；提交信息用中文。
 
 ## 9. 风险与简历

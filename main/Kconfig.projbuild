@@ -5,7 +5,7 @@ menu "LinSight"
         default ""
         help
             SSID of the 2.4 GHz access point shared with the Linux host.
-            Leave empty until provisioning; the UI will stay in WiFi....
+            The current bench build overrides this with BENCH_* in main/net.c.
 
     config LINSIGHT_WIFI_PASSWORD
         string "Wi-Fi password"
@@ -16,7 +16,7 @@ menu "LinSight"
         default ""
         help
             Address of the machine running the LinSight host daemon.
-            Set this in menuconfig; do not commit a real address.
+            The current bench build overrides this with BENCH_* in main/net.c.
 
     config LINSIGHT_PORT
         int "Host TCP port"

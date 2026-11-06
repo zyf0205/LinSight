@@ -36,10 +36,10 @@ Wi-Fi credentials and the host IP live only in the ignored `sdkconfig`.
 idf.py set-target esp32s3          # once
 idf.py build
 idf.py -p COMx flash monitor
-idf.py menuconfig                  # LinSight → Wi-Fi SSID/password, host IP:port, CAN mode
+idf.py menuconfig                  # LinSight → CAN mode only; Wi-Fi/host is BENCH_* in main/net.c
 ```
 
-- Wi-Fi credentials and the host IP live in the ignored `sdkconfig` (set once with `idf.py menuconfig`); never put them in `sdkconfig.defaults` or docs.
+- Bench Wi-Fi/TCP endpoint is hardcoded in `main/net.c` (`BENCH_*`) so changing it only rebuilds one file; it is committed for the bench workflow. Production builds should move it back to menuconfig/ignored config. The device sets the CN 1–13 regulatory domain for 2.4 GHz bench channels.
 - Bench: the device joins the PC hotspot and connects to `linsightd` in WSL; PCAN traffic is generated on WSL `can0` (usbipd + `peak_usb`), not from Windows. Default `TWAI_MODE_LISTEN_ONLY` never ACKs — switch Settings/`menuconfig` to Normal only on a two-node bench.
 
 ## Architecture
