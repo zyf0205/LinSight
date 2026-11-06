@@ -106,6 +106,11 @@ static lv_obj_t *s_row_id[ROW_N];
 static lv_obj_t *s_row_dlc[ROW_N];
 static lv_obj_t *s_row_data[ROW_N];
 static lv_obj_t *s_row_cnt[ROW_N];
+static lv_obj_t *s_empty; /* "waiting for traffic" hint over the blank grid */
+
+/* Transient action feedback (bitrate change, clear, recover, lock). */
+static lv_obj_t *s_toast;
+static uint32_t s_toast_tick;
 
 /* Monitor: bottom telemetry */
 static lv_obj_t *s_bot[4];
@@ -134,6 +139,7 @@ static char s_txt_lock[14];
 static char s_txt_mode[12];
 static char s_txt_pause[32];
 static char s_txt_info[20];
+static char s_txt_toast[40];
 
 /* UI state */
 static linsight_conn_t s_conn;
@@ -231,6 +237,38 @@ static void label_setf(lv_obj_t *label, char *buf, size_t cap, const char *fmt, 
     vsnprintf(tmp, sizeof(tmp), fmt, ap);
     va_end(ap);
     label_set_str(label, buf, cap, tmp);
+}
+
+static void object_show(lv_obj_t *obj, bool show)
+{
+    const bool hidden = lv_obj_has_flag(obj, LV_OBJ_FLAG_HIDDEN);
+    if (show == !hidden) {
+        return; /* already in the requested state */
+    }
+    if (show) {
+        lv_obj_clear_flag(obj, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(obj, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+/* Short-lived feedback over the telemetry bar ("BITRATE 500K", "CLEARED"...). */
+static void toast_showf(const char *fmt, ...)
+{
+    char tmp[sizeof(s_txt_toast)];
+    va_list ap;
+
+    if (!s_toast) {
+        return;
+    }
+    va_start(ap, fmt);
+    vsnprintf(tmp, sizeof(tmp), fmt, ap);
+    va_end(ap);
+
+    label_set_str((lv_obj_t *)lv_obj_get_child(s_toast, 0), s_txt_toast,
+                  sizeof(s_txt_toast), tmp);
+    s_toast_tick = lv_tick_get();
+    object_show(s_toast, true);
 }
 
 static lv_obj_t *obj_new(lv_obj_t *parent, lv_coord_t x, lv_coord_t y, lv_coord_t w,
@@ -381,15 +419,24 @@ static void bitrate_click_cb(lv_event_t *e)
     if (BITRATES[idx] == twai_current_bitrate()) {
         return; /* no need to stop/start the driver for the active bitrate */
     }
-    twai_capture_restart(BITRATES[idx], twai_current_mode());
+    if (twai_capture_restart(BITRATES[idx], twai_current_mode()) == ESP_OK) {
+        toast_showf("BITRATE %s", BITRATE_LABELS[idx]);
+    } else {
+        toast_showf("BITRATE FAILED");
+    }
 }
 
 static void mode_click_cb(lv_event_t *e)
 {
     (void)e;
     const can_mode_t mode = twai_current_mode();
-    twai_capture_restart(twai_current_bitrate(),
-                         mode == CAN_MODE_NORMAL ? CAN_MODE_LISTEN_ONLY : CAN_MODE_NORMAL);
+    const can_mode_t next =
+        mode == CAN_MODE_NORMAL ? CAN_MODE_LISTEN_ONLY : CAN_MODE_NORMAL;
+    if (twai_capture_restart(twai_current_bitrate(), next) == ESP_OK) {
+        toast_showf("MODE %s", next == CAN_MODE_NORMAL ? "NORMAL" : "LISTEN");
+    } else {
+        toast_showf("MODE CHANGE FAILED");
+    }
 }
 
 static void toggle_pause(void)
@@ -457,12 +504,13 @@ static void clear_click_cb(lv_event_t *e)
     (void)e;
     twai_stats_clear();
     view_reset();
+    toast_showf("VIEW CLEARED");
 }
 
 static void recover_click_cb(lv_event_t *e)
 {
     (void)e;
-    twai_capture_recover();
+    toast_showf(twai_capture_recover() == ESP_OK ? "BUS RECOVER" : "RECOVER FAILED");
 }
 
 static void filter_click_cb(lv_event_t *e)
@@ -499,10 +547,12 @@ static void row_click_cb(lv_event_t *e)
         if (s_filter == FILTER_LOCK) {
             s_filter = FILTER_ALL;
         }
+        toast_showf("ID UNLOCKED");
     } else {
         s_lock_valid = true;
         s_lock_id = s_view_id[row];
         s_lock_ext = s_view_ext[row];
+        toast_showf("ID 0x%X LOCKED", (unsigned)s_lock_id);
     }
 
     refresh_filter_pills();
@@ -607,6 +657,14 @@ static void row_bg(int row, bool active)
     const lv_color_t color = active ? COL_ACTIVE : ((row & 1) ? COL_ROW_ODD : COL_ROW_EVEN);
     if (!color_same(lv_obj_get_style_bg_color(s_row[row], 0), color)) {
         lv_obj_set_style_bg_color(s_row[row], color, 0);
+    }
+    /* Blue accent on the left edge makes the locked ID obvious at a glance. */
+    const lv_coord_t border = active ? 3 : 0;
+    if (lv_obj_get_style_border_width(s_row[row], 0) != border) {
+        lv_obj_set_style_border_width(s_row[row], border, 0);
+    }
+    if (active) {
+        lv_obj_set_style_border_color(s_row[row], COL_BLUE, 0);
     }
 }
 
@@ -728,6 +786,7 @@ static void render_trace(bool use_limit, uint16_t limit)
     for (int row = rows; row < ROW_N; row++) {
         row_clear(row);
     }
+    object_show(s_empty, rows == 0);
 }
 
 static void scan_records(bool capture_paused)
@@ -798,7 +857,24 @@ static void fmt_bitrate(char *buf, size_t cap)
 static void refresh_host(void)
 {
     const bool online = s_conn == UI_CONN_ONLINE;
-    const lv_color_t dot = online ? COL_GREEN : COL_DIM;
+    lv_color_t dot = COL_DIM;
+    const char *text = "WIFI";
+
+    switch (s_conn) {
+    case UI_CONN_ONLINE:
+        dot = COL_GREEN;
+        break;
+    case UI_CONN_HOST:
+        dot = COL_ORANGE;
+        text = "LINK";
+        break;
+    case UI_CONN_RECONNECT:
+        dot = COL_ORANGE;
+        text = "RETRY";
+        break;
+    default:
+        break; /* Wi-Fi not associated yet */
+    }
 
     if (!color_same(lv_obj_get_style_bg_color(s_host_dot, 0), dot)) {
         lv_obj_set_style_bg_color(s_host_dot, dot, 0);
@@ -808,7 +884,7 @@ static void refresh_host(void)
                    (unsigned)s_rtt_ms);
     } else {
         label_setf(s_host_label, s_txt_host, sizeof(s_txt_host), "%s",
-                   online ? "HOST" : "LOCAL");
+                   online ? "HOST" : text);
     }
     label_color(s_host_label, online ? COL_TEXT : COL_DIM);
 }
@@ -1032,6 +1108,11 @@ static void tick_cb(lv_timer_t *timer)
     } else {
         refresh_settings(&st);
     }
+
+    if (s_toast && !lv_obj_has_flag(s_toast, LV_OBJ_FLAG_HIDDEN) &&
+        lv_tick_elaps(s_toast_tick) >= 1400u) {
+        object_show(s_toast, false);
+    }
 }
 
 /* -------------------------------------------------------------- builders */
@@ -1093,6 +1174,8 @@ static void monitor_create(void)
         lv_obj_set_style_bg_color(row, (i & 1) ? COL_ROW_ODD : COL_ROW_EVEN, 0);
         lv_obj_set_style_bg_color(row, COL_ACTIVE, LV_STATE_PRESSED);
         lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_side(row, LV_BORDER_SIDE_LEFT, 0);
+        lv_obj_set_style_border_width(row, 0, 0);
         lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_flag(row, LV_OBJ_FLAG_GESTURE_BUBBLE);
         lv_obj_add_event_cb(row, row_click_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
@@ -1109,6 +1192,17 @@ static void monitor_create(void)
         lv_obj_set_width(s_row_cnt[i], 48);
         lv_obj_set_style_text_align(s_row_cnt[i], LV_TEXT_ALIGN_RIGHT, 0);
     }
+
+    /* Shown only while the grid has no matching frames (topmost, but not
+     * clickable, so taps still reach the zebra rows underneath). */
+    s_empty = obj_new(page, 0, ROW_Y, UI_W, ROW_N * ROW_H);
+    lv_obj_t *empty_hint =
+        label_new(s_empty, "Waiting for CAN frames\ncheck wiring / bitrate",
+                  &lv_font_montserrat_14, COL_DIM);
+    lv_obj_set_width(empty_hint, UI_W - 24);
+    lv_obj_set_style_text_align(empty_hint, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_line_space(empty_hint, 4, 0);
+    lv_obj_center(empty_hint);
 
     lv_obj_t *bottom = obj_new(page, 0, 210, UI_W, 30);
     lv_obj_set_style_bg_color(bottom, COL_BAR, 0);
@@ -1232,6 +1326,17 @@ void linsight_ui_init(void)
     refresh_filter_pills();
     refresh_trigger_pills();
     refresh_host();
+
+    /* Screen-level toast, above both pages, over the telemetry bar. */
+    s_toast = obj_new(s_screen, 40, 212, 240, 24);
+    lv_obj_set_style_bg_color(s_toast, COL_TILE, 0);
+    lv_obj_set_style_bg_opa(s_toast, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(s_toast, 8, 0);
+    lv_obj_t *toast_label = label_new(s_toast, "", &lv_font_montserrat_12, COL_TEXT);
+    lv_obj_set_width(toast_label, 232);
+    lv_obj_set_style_text_align(toast_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_center(toast_label);
+    object_show(s_toast, false);
 
     s_page = PAGE_MONITOR;
     lv_timer_create(tick_cb, 50, NULL); /* 20 Hz */
