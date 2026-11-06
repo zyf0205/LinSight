@@ -311,11 +311,13 @@ static bool send_stats(int fd)
     char json[LINSIGHT_MAX_STATS];
     const int n = snprintf(
         json, sizeof(json),
-        "{\"fps\":%u,\"total\":%u,\"dropped\":%u,\"missed\":%u,\"rxq_full\":%u,"
+        "{\"fps\":%u,\"load_permille\":%u,\"total\":%u,\"dropped\":%u,\"missed\":%u,"
+        "\"rxq_full\":%u,"
         "\"bus_err\":%u,\"bus_off\":%u,\"err_pass\":%u,\"tec\":%u,\"rec\":%u,"
         "\"state\":\"%s\",\"bitrate\":%s,\"mode\":\"%s\",\"paused\":%d,"
         "\"ring_used\":%u,\"ring_cap\":%u,\"uptime_ms\":%u}",
-        (unsigned)st.fps, (unsigned)st.rx_total, (unsigned)st.dropped,
+        (unsigned)st.fps, (unsigned)st.load_permille, (unsigned)st.rx_total,
+        (unsigned)st.dropped,
         (unsigned)st.rx_missed, (unsigned)st.rx_queue_full, (unsigned)st.bus_errors,
         (unsigned)st.bus_off, (unsigned)st.err_passive, (unsigned)st.tec, (unsigned)st.rec,
         st.state, bitrate_json[twai_current_bitrate()], can_mode_name(twai_current_mode()),

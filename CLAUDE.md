@@ -5,9 +5,10 @@ This file provides guidance to Claude Code when working in the Windows firmware 
 ## Repository state
 
 LinSight ESP32-S3 firmware: TWAI capture, PSRAM ring, LVGL UI, Wi-Fi streaming.
-The Linux host (epoll daemon, CLI, `.lsc` logging, tests) lives in the separate WSL
-repository `~/linsight`; do not keep, build, or run host code in this checkout.
-Wi-Fi credentials and the host IP live only in the ignored `sdkconfig`.
+The Linux host (epoll daemon, CLI, `.lsc` logging, tests, HTTP/SSE dashboard) lives in
+the separate WSL repository `~/linsight`; do not keep, build, or run host code in this checkout.
+Bench Wi-Fi credentials and the host IP are committed in `BENCH_*` (`main/net.c`);
+production builds should move them back to menuconfig/ignored config.
 
 ## Source of truth
 
