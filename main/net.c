@@ -11,11 +11,13 @@
 
 #include "cJSON.h"
 #include "can_ring.h"
+#include "device_info.h"
 #include "esp_check.h"
 #include "esp_event.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_netif.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "frame.h"
@@ -24,7 +26,8 @@
 #include "freertos/task.h"
 #include "lwip/inet.h"
 #include "lwip/sockets.h"
-#include "nvs_flash.h"
+#include "sd_store.h"
+#include "settings.h"
 #include "twai.h"
 #include "ui.h"
 
@@ -45,10 +48,12 @@
 #define RX_BUF_SIZE 1024
 #define PARSER_BUF_SIZE 256u
 #define PING_INTERVAL_MS 5000u
+#define DEVICE_INFO_INTERVAL_MS 5000u
 #define HOST_TIMEOUT_MS 15000u
-#define RECONNECT_DELAY_MS 1000u
+#define RECONNECT_DELAY_MIN_MS 1000u
+#define RECONNECT_DELAY_MAX_MS 5000u
 /* Batches (max 819 records each) sent per session-loop iteration. */
-#define MAX_BATCHES_PER_TICK 4
+#define MAX_BATCHES_PER_TICK 2
 
 static int tcp_connect(const char *host, uint16_t port, int timeout_ms);
 
@@ -58,6 +63,7 @@ static linsight_parser_t s_parser;
 static uint8_t *s_parser_buf;                     /* internal, 256 B scratch */
 static uint8_t *s_tx_buf;                         /* PSRAM, one CAN_BATCH frame */
 static linsight_can_record_t s_pop[LINSIGHT_BATCH_MAX_RECORDS]; /* internal, 16 KB */
+static uint16_t s_pending_count; /* popped but not yet fully sent; survives reconnect */
 
 static uint32_t s_ping_value;
 static uint64_t s_ping_sent_us;
@@ -104,7 +110,10 @@ static bool send_frame(int fd, uint8_t type, const uint8_t *payload, uint16_t le
 
 /* ------------------------------------------------------------- batch path */
 
-/* Send up to MAX_BATCHES_PER_TICK batches; returns false on socket error. */
+/* Send up to MAX_BATCHES_PER_TICK batches; returns false on socket error.
+ * A popped batch stays in s_pop until its whole frame is sent, so a failed
+ * send/reconnect does not consume ring records. The host dedupes a possible
+ * partial resend by ts_ms/seq. */
 static bool send_batches(int fd)
 {
     if (s_stream_paused) {
@@ -112,15 +121,18 @@ static bool send_batches(int fd)
     }
 
     for (int i = 0; i < MAX_BATCHES_PER_TICK; i++) {
-        const uint16_t count = (uint16_t)can_ring_pop(s_pop, LINSIGHT_BATCH_MAX_RECORDS);
-        if (count == 0) {
-            return true;
+        if (s_pending_count == 0) {
+            s_pending_count = (uint16_t)can_ring_pop(s_pop, LINSIGHT_BATCH_MAX_RECORDS);
+            if (s_pending_count == 0) {
+                return true;
+            }
         }
 
         const size_t payload = linsight_batch_pack(s_tx_buf, LINSIGHT_MAX_CAN_BATCH, s_pop,
-                                                   count);
+                                                   s_pending_count);
         if (payload == 0) {
-            ESP_LOGE(TAG, "batch pack failed for %u records", (unsigned)count);
+            ESP_LOGE(TAG, "batch pack failed for %u records", (unsigned)s_pending_count);
+            s_pending_count = 0;
             return false;
         }
 
@@ -130,6 +142,7 @@ static bool send_batches(int fd)
             !send_all(fd, s_tx_buf, payload)) {
             return false;
         }
+        s_pending_count = 0;
     }
     return true;
 }
@@ -217,13 +230,26 @@ static bool handle_control(int fd, const uint8_t *payload, uint16_t len)
     esp_err_t err = ESP_ERR_NOT_SUPPORTED;
 
     if (strcmp(act, LINSIGHT_CTRL_PAUSE) == 0) {
-        twai_capture_set_paused(true);
+        uint32_t lease_ms = LINSIGHT_PAUSE_LEASE_DEFAULT_MS;
+        const cJSON *lease = cJSON_GetObjectItemCaseSensitive(root, "lease_ms");
+        if (cJSON_IsNumber(lease) && lease->valuedouble > 0) {
+            const double v = lease->valuedouble;
+            lease_ms = v > (double)UINT32_MAX ? UINT32_MAX : (uint32_t)v;
+        }
+        twai_capture_set_paused_lease(true, lease_ms);
         err = ESP_OK;
     } else if (strcmp(act, LINSIGHT_CTRL_RESUME) == 0) {
         twai_capture_set_paused(false);
         err = ESP_OK;
     } else if (strcmp(act, LINSIGHT_CTRL_CLEAR) == 0) {
         twai_stats_clear();
+        err = ESP_OK;
+    } else if (strcmp(act, LINSIGHT_CTRL_MARK) == 0) {
+        const cJSON *mark_id = cJSON_GetObjectItemCaseSensitive(root, "id");
+        const cJSON *mark_seq = cJSON_GetObjectItemCaseSensitive(root, "seq");
+        sd_store_mark("host",
+                      cJSON_IsNumber(mark_id) ? (uint32_t)mark_id->valuedouble : 0xFFFFFFFFu,
+                      cJSON_IsNumber(mark_seq) ? (uint16_t)mark_seq->valuedouble : 0);
         err = ESP_OK;
     } else if (strcmp(act, LINSIGHT_CTRL_CONFIG) == 0) {
         const cJSON *bitrate = cJSON_GetObjectItemCaseSensitive(root, "bitrate");
@@ -284,14 +310,54 @@ static bool handle_control(int fd, const uint8_t *payload, uint16_t len)
 
 static bool send_hello(int fd)
 {
-    char json[192];
+    char json[LINSIGHT_MAX_HELLO];
     const int n = snprintf(
         json, sizeof(json),
-        "{\"proto\":%u,\"fw\":\"2.0.0\",\"device\":\"linsight-can\","
+        "{\"proto\":%u,\"fw\":\"%s\",\"device_id\":\"%s\",\"boot\":%u,\"uptime_ms\":%u,"
         "\"bitrate\":\"%s\",\"mode\":\"%s\"}",
-        (unsigned)LINSIGHT_PROTO_VERSION, can_bitrate_name(twai_current_bitrate()),
-        can_mode_name(twai_current_mode()));
-    return n > 0 && send_frame(fd, LINSIGHT_FRAME_HELLO, (const uint8_t *)json, (uint16_t)n);
+        (unsigned)LINSIGHT_PROTO_VERSION, LINSIGHT_FW_VERSION, linsight_device_id(),
+        (unsigned)linsight_boot_count(), (unsigned)(esp_timer_get_time() / 1000),
+        can_bitrate_name(twai_current_bitrate()), can_mode_name(twai_current_mode()));
+    if (n <= 0 || n >= (int)sizeof(json)) {
+        ESP_LOGE(TAG, "HELLO too long (%d)", n);
+        return false;
+    }
+    return send_frame(fd, LINSIGHT_FRAME_HELLO, (const uint8_t *)json, (uint16_t)n);
+}
+
+static bool send_device_info(int fd)
+{
+    can_ring_info_t ring;
+    can_ring_get_info(&ring);
+    sd_status_t sd;
+    sd_store_get_status(&sd);
+
+    int rssi = 0;
+    wifi_ap_record_t ap;
+    if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+        rssi = ap.rssi;
+    }
+
+    char json[LINSIGHT_MAX_DEVICE_INFO];
+    const int n = snprintf(
+        json, sizeof(json),
+        "{\"fw\":\"%s\",\"proto\":%u,\"device_id\":\"%s\",\"boot\":%u,\"reset\":\"%s\","
+        "\"uptime_ms\":%u,\"heap_free\":%u,\"heap_min\":%u,\"psram_free\":%u,\"rssi\":%d,"
+        "\"ring_used\":%u,\"ring_cap\":%u,"
+        "\"sd\":%d,\"sd_rec\":%d,\"sd_files\":%u,\"sd_free_kb\":%llu,\"sd_drop\":%u,"
+        "\"caps\":%u}",
+        LINSIGHT_FW_VERSION, (unsigned)LINSIGHT_PROTO_VERSION, linsight_device_id(),
+        (unsigned)linsight_boot_count(), linsight_reset_reason(),
+        (unsigned)(esp_timer_get_time() / 1000), (unsigned)esp_get_free_heap_size(),
+        (unsigned)esp_get_minimum_free_heap_size(),
+        (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM), rssi, (unsigned)ring.used,
+        (unsigned)ring.cap, sd.present ? 1 : 0, sd.recording ? 1 : 0, (unsigned)sd.files,
+        (unsigned long long)sd.free_kb, (unsigned)sd.dropped, (unsigned)linsight_caps());
+    if (n <= 0 || n >= (int)sizeof(json)) {
+        ESP_LOGW(TAG, "DEVICE_INFO too long (%d)", n);
+        return true; /* telemetry is best-effort */
+    }
+    return send_frame(fd, LINSIGHT_FRAME_DEVICE_INFO, (const uint8_t *)json, (uint16_t)n);
 }
 
 static bool send_stats(int fd)
@@ -324,6 +390,7 @@ static bool send_stats(int fd)
         (int)st.paused, (unsigned)ring.used, (unsigned)ring.cap,
         (unsigned)(esp_timer_get_time() / 1000));
     if (n <= 0 || n >= (int)sizeof(json)) {
+        ESP_LOGW(TAG, "STATS JSON overflow (%d)", n);
         return true; /* stats are best-effort, never break the session */
     }
     return send_frame(fd, LINSIGHT_FRAME_STATS, (const uint8_t *)json, (uint16_t)n);
@@ -339,8 +406,11 @@ static bool send_events(int fd)
         char json[96];
         const int n = snprintf(json, sizeof(json), "{\"type\":\"%s\",\"ts_ms\":%u}", ev.type,
                                (unsigned)ev.ts_ms);
-        if (n > 0 &&
-            !send_frame(fd, LINSIGHT_FRAME_EVENT, (const uint8_t *)json, (uint16_t)n)) {
+        if (n <= 0 || n >= (int)sizeof(json)) {
+            ESP_LOGW(TAG, "EVENT JSON overflow");
+            continue;
+        }
+        if (!send_frame(fd, LINSIGHT_FRAME_EVENT, (const uint8_t *)json, (uint16_t)n)) {
             return false;
         }
     }
@@ -402,14 +472,16 @@ static void session_loop(int fd)
     uint64_t last_rx_ms = esp_timer_get_time() / 1000;
     uint64_t last_ping = 0;
     uint64_t last_stats = 0;
+    uint64_t last_info = 0;
 
     linsight_parser_reset(&s_parser);
     s_stream_paused = false;
 
-    if (!send_hello(fd) || !send_ping(fd)) {
+    if (!send_hello(fd) || !send_device_info(fd) || !send_ping(fd)) {
         return;
     }
     last_ping = last_rx_ms;
+    last_info = last_rx_ms;
     linsight_ui_set_conn(UI_CONN_ONLINE, 0);
     ESP_LOGI(TAG, "TCP session started");
 
@@ -446,6 +518,12 @@ static void session_loop(int fd)
             }
             last_stats = now;
         }
+        if (now - last_info >= DEVICE_INFO_INTERVAL_MS) {
+            if (!send_device_info(fd)) {
+                break;
+            }
+            last_info = now;
+        }
         if (now - last_ping >= PING_INTERVAL_MS) {
             if (!send_ping(fd)) {
                 break;
@@ -458,6 +536,10 @@ static void session_loop(int fd)
         }
     }
 
+    /* A host that paused capture and then died must not leave the device
+     * stopped forever. Pending batches stay in s_pop for the next session. */
+    twai_capture_set_paused(false);
+    s_stream_paused = false;
     linsight_ui_set_conn(UI_CONN_RECONNECT, 0);
     ESP_LOGI(TAG, "TCP session ended");
 }
@@ -468,6 +550,8 @@ static void net_task(void *arg)
 
     linsight_ui_set_conn(UI_CONN_WIFI, 0);
     ESP_LOGI(TAG, "connecting Wi-Fi SSID=\"%s\"", BENCH_WIFI_SSID);
+
+    uint32_t backoff_ms = RECONNECT_DELAY_MIN_MS;
 
     for (;;) {
         if (!(xEventGroupGetBits(s_wifi_events) & WIFI_CONNECTED_BIT)) {
@@ -486,14 +570,17 @@ static void net_task(void *arg)
                          (unsigned)BENCH_HOST_PORT, (unsigned)attempts);
             }
             linsight_ui_set_conn(UI_CONN_RECONNECT, 0);
-            vTaskDelay(pdMS_TO_TICKS(RECONNECT_DELAY_MS));
+            vTaskDelay(pdMS_TO_TICKS(backoff_ms));
+            backoff_ms = backoff_ms < RECONNECT_DELAY_MAX_MS ? backoff_ms * 2u
+                                                             : RECONNECT_DELAY_MAX_MS;
             continue;
         }
 
+        backoff_ms = RECONNECT_DELAY_MIN_MS;
         session_loop(fd);
         close(fd);
         linsight_ui_set_conn(UI_CONN_RECONNECT, 0);
-        vTaskDelay(pdMS_TO_TICKS(RECONNECT_DELAY_MS));
+        vTaskDelay(pdMS_TO_TICKS(RECONNECT_DELAY_MIN_MS));
     }
 }
 
@@ -553,12 +640,22 @@ static int tcp_connect(const char *host, uint16_t port, int timeout_ms)
     fcntl(fd, F_SETFL, flags);
     const int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
+#if defined(TCP_KEEPIDLE)
+    const int keep_idle = 10;
+    const int keep_intvl = 5;
+    const int keep_cnt = 3;
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &keep_idle, sizeof(keep_idle));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &keep_intvl, sizeof(keep_intvl));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &keep_cnt, sizeof(keep_cnt));
+#endif
     /* recv() also paces streaming: batches are only flushed after it returns.
-     * 50 ms keeps end-to-end latency low (max 1.3 MB/s through 4x16 KB sends)
-     * while still yielding to CONTROL/PING handling. */
+     * 50 ms keeps end-to-end latency low (max ~1.3 MB/s through 2x16 KB sends)
+     * while still yielding to CONTROL/PING handling. A stuck host costs one
+     * bounded 500 ms send and a reconnect; the ring keeps the backlog. */
     struct timeval rcv = {.tv_sec = 0, .tv_usec = 50000};
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rcv, sizeof(rcv));
-    struct timeval snd = {.tv_sec = 3, .tv_usec = 0};
+    struct timeval snd = {.tv_sec = 0, .tv_usec = 500000};
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &snd, sizeof(snd));
     return fd;
 }
@@ -584,18 +681,9 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
 
 static esp_err_t wifi_init(void)
 {
-    esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        ret = nvs_flash_init();
-    }
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "nvs init failed: %s", esp_err_to_name(ret));
-        return ret;
-    }
-
+    /* NVS is initialized once by settings_init() before net_start(). */
     ESP_RETURN_ON_ERROR(esp_netif_init(), TAG, "netif init");
-    ret = esp_event_loop_create_default();
+    esp_err_t ret = esp_event_loop_create_default();
     if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
         ESP_LOGE(TAG, "event loop: %s", esp_err_to_name(ret));
         return ret;
