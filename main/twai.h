@@ -60,6 +60,14 @@ esp_err_t twai_capture_restart(can_bitrate_t bitrate, can_mode_t mode);
 
 void twai_capture_set_paused(bool paused);
 
+/* Pause capture with an automatic resume lease. A host that crashes while
+ * paused must not stop capture forever; lease_ms is clamped to
+ * LINSIGHT_PAUSE_LEASE_MIN_MS..MAX_MS. Pass paused=false to resume now. */
+void twai_capture_set_paused_lease(bool paused, uint32_t lease_ms);
+
+/* Push an event into the host/UI event queue (SD mount/full/io, lease expiry). */
+void twai_event_push(const char *type);
+
 /* Manual bus-off recovery (Settings "Bus Recover"). No-op while running. */
 esp_err_t twai_capture_recover(void);
 

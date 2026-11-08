@@ -28,6 +28,11 @@ CONFIG_LWIP_TCP_RECVMBOX_SIZE=32
 # Main task stack
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 
+# SD black box: FAT32, 8.3 names, no auto-format (a wrong card must never
+# be erased); allocate FATFS buffers in PSRAM.
+CONFIG_FATFS_LFN_NONE=y
+CONFIG_FATFS_ALLOC_PREFER_EXTRAM=y
+
 # LVGL (managed components)
 CONFIG_LV_COLOR_16_SWAP=y
 CONFIG_LV_MEM_CUSTOM=y

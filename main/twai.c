@@ -4,6 +4,7 @@
 
 #include "can_ring.h"
 #include "driver/twai.h"
+#include "sd_store.h"
 #include "esp_check.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -33,6 +34,7 @@ typedef struct {
     can_bitrate_t bitrate;
     can_mode_t mode;
     volatile bool paused;
+    volatile uint32_t pause_until_ms; /* 0 = no lease */
     volatile bool running;
     TaskHandle_t volatile task;
     SemaphoreHandle_t lock;
@@ -159,6 +161,11 @@ static void push_event(const char *type)
     }
 }
 
+void twai_event_push(const char *type)
+{
+    push_event(type);
+}
+
 static void record_frame(const twai_message_t *msg)
 {
     linsight_can_record_t rec = {
@@ -170,6 +177,7 @@ static void record_frame(const twai_message_t *msg)
     };
     memcpy(rec.data, msg->data, LINSIGHT_DLC_MAX);
     can_ring_push(&rec); /* assigns rec.seq */
+    sd_store_push(&rec); /* independent SD fan-out; never blocks */
 
     stats_lock();
     s_ui_hist[s_ui_head] = rec;
@@ -246,6 +254,16 @@ static void twai_task(void *arg)
     uint64_t window_start = esp_timer_get_time();
 
     while (s_can.running) {
+        if (s_can.paused && s_can.pause_until_ms != 0) {
+            const uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+            if ((int32_t)(now_ms - s_can.pause_until_ms) >= 0) {
+                s_can.paused = false;
+                s_can.pause_until_ms = 0;
+                push_event("lease_expired");
+                ESP_LOGW(TAG, "pause lease expired, capture resumed");
+            }
+        }
+
         twai_message_t msg;
         const esp_err_t err = twai_receive(&msg, pdMS_TO_TICKS(100));
 
@@ -434,8 +452,24 @@ out:
 
 void twai_capture_set_paused(bool paused)
 {
+    twai_capture_set_paused_lease(paused, LINSIGHT_PAUSE_LEASE_DEFAULT_MS);
+}
+
+void twai_capture_set_paused_lease(bool paused, uint32_t lease_ms)
+{
+    if (paused) {
+        if (lease_ms < LINSIGHT_PAUSE_LEASE_MIN_MS) {
+            lease_ms = LINSIGHT_PAUSE_LEASE_MIN_MS;
+        } else if (lease_ms > LINSIGHT_PAUSE_LEASE_MAX_MS) {
+            lease_ms = LINSIGHT_PAUSE_LEASE_MAX_MS;
+        }
+        s_can.pause_until_ms = (uint32_t)(esp_timer_get_time() / 1000) + lease_ms;
+    } else {
+        s_can.pause_until_ms = 0;
+    }
     s_can.paused = paused;
-    ESP_LOGI(TAG, "capture %s", paused ? "PAUSED" : "RESUMED");
+    ESP_LOGI(TAG, "capture %s%s", paused ? "PAUSED" : "RESUMED",
+             paused ? " (lease)" : "");
 }
 
 esp_err_t twai_capture_recover(void)
