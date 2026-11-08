@@ -31,6 +31,7 @@
 #include "esp_lvgl_port.h"
 #include "frame.h"
 #include "lvgl.h"
+#include "sd_store.h"
 #include "twai.h"
 
 #define UI_W 320
@@ -953,10 +954,29 @@ static void refresh_bottom(const can_stats_t *st)
                             : (st->tec || st->rec)                   ? COL_ORANGE
                                                                      : COL_DIM);
 
+    sd_status_t sd;
+    sd_store_get_status(&sd);
+
+    /* The fourth tile doubles as SD/REC state while there is no overflow. */
     char ovf[10];
-    fmt_count(ovf, sizeof(ovf), st->dropped); /* keep long counts inside 80 px */
-    label_setf(s_bot[3], s_txt_bot[3], sizeof(s_txt_bot[3]), "OVF %s", ovf);
-    label_color(s_bot[3], st->dropped ? COL_RED : COL_DIM);
+    if (st->dropped) {
+        fmt_count(ovf, sizeof(ovf), st->dropped); /* keep long counts inside 80 px */
+        label_setf(s_bot[3], s_txt_bot[3], sizeof(s_txt_bot[3]), "OVF %s", ovf);
+        label_color(s_bot[3], COL_RED);
+    } else if (sd.recording) {
+        label_setf(s_bot[3], s_txt_bot[3], sizeof(s_txt_bot[3]), "REC %uF",
+                   (unsigned)sd.files);
+        label_color(s_bot[3], COL_GREEN);
+    } else if (sd.mounted) {
+        label_setf(s_bot[3], s_txt_bot[3], sizeof(s_txt_bot[3]), "SD READY");
+        label_color(s_bot[3], COL_GREEN);
+    } else if (sd.present) {
+        label_setf(s_bot[3], s_txt_bot[3], sizeof(s_txt_bot[3]), "SD ERROR");
+        label_color(s_bot[3], COL_ORANGE);
+    } else {
+        label_setf(s_bot[3], s_txt_bot[3], sizeof(s_txt_bot[3]), "NO SD");
+        label_color(s_bot[3], COL_DIM);
+    }
 }
 
 static void refresh_monitor(const can_stats_t *st)
@@ -1041,9 +1061,25 @@ static void refresh_settings(const can_stats_t *st)
                                            : COL_TEXT);
 
     const bool remote = s_remote_on && lv_tick_elaps(s_remote_tick) < 1500u;
-    label_setf(s_info_label, s_txt_info, sizeof(s_txt_info), "%s",
-               remote ? "REMOTE SYNC" : "LS-CAN v2.0.0");
-    label_color(s_info_label, remote ? COL_GREEN : COL_DIM);
+    sd_status_t sd;
+    sd_store_get_status(&sd);
+    if (remote) {
+        label_set_str(s_info_label, s_txt_info, sizeof(s_txt_info), "REMOTE SYNC");
+        label_color(s_info_label, COL_GREEN);
+    } else if (sd.recording) {
+        label_setf(s_info_label, s_txt_info, sizeof(s_txt_info), "REC %uF",
+                   (unsigned)sd.files);
+        label_color(s_info_label, COL_GREEN);
+    } else if (sd.mounted) {
+        label_set_str(s_info_label, s_txt_info, sizeof(s_txt_info), "SD READY");
+        label_color(s_info_label, COL_DIM);
+    } else if (sd.present) {
+        label_set_str(s_info_label, s_txt_info, sizeof(s_txt_info), "SD ERROR");
+        label_color(s_info_label, COL_ORANGE);
+    } else {
+        label_set_str(s_info_label, s_txt_info, sizeof(s_txt_info), "NO SD");
+        label_color(s_info_label, COL_DIM);
+    }
 }
 
 /* ---------------------------------------------------------------- timer */
