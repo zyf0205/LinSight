@@ -1,5 +1,6 @@
 #include "bsp.h"
 #include "can_ring.h"
+#include "device_info.h"
 #include "driver/twai.h"
 #include "esp_chip_info.h"
 #include "esp_log.h"
@@ -10,40 +11,14 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "net.h"
+#include "sd_store.h"
+#include "settings.h"
 #include "twai.h"
 #include "ui.h"
 
 #include "sdkconfig.h"
 
 static const char *TAG = "linsight";
-
-static const char *reset_reason_name(esp_reset_reason_t reason)
-{
-    switch (reason) {
-    case ESP_RST_POWERON:
-        return "POWERON";
-    case ESP_RST_EXT:
-        return "EXT";
-    case ESP_RST_SW:
-        return "SW";
-    case ESP_RST_PANIC:
-        return "PANIC";
-    case ESP_RST_INT_WDT:
-        return "INT_WDT";
-    case ESP_RST_TASK_WDT:
-        return "TASK_WDT";
-    case ESP_RST_WDT:
-        return "WDT";
-    case ESP_RST_DEEPSLEEP:
-        return "DEEPSLEEP";
-    case ESP_RST_BROWNOUT:
-        return "BROWNOUT";
-    case ESP_RST_SDIO:
-        return "SDIO";
-    default:
-        return "UNKNOWN";
-    }
-}
 
 static void user_button_cb(bsp_button_event_t event)
 {
@@ -61,12 +36,28 @@ void app_main(void)
     esp_chip_info(&chip);
     ESP_LOGI(TAG, "chip model=%d cores=%d revision=%d", chip.model, chip.cores, chip.revision);
     ESP_LOGI(TAG, "PSRAM size: %u bytes", (unsigned)esp_psram_get_size());
-    ESP_LOGI(TAG, "reset reason: %s", reset_reason_name(esp_reset_reason()));
+    ESP_LOGI(TAG, "reset reason: %s", linsight_reset_reason());
+    ESP_LOGI(TAG, "device id: %s", linsight_device_id());
 
     ESP_ERROR_CHECK(bsp_init());
+    ESP_ERROR_CHECK(settings_init());
+    ESP_ERROR_CHECK(sd_store_init());
 
-    /* 1 MB PSRAM ring at 20 B/record: ~52k frames of offline buffering. */
-    ESP_ERROR_CHECK(can_ring_init(1048576u / sizeof(linsight_can_record_t)));
+    /* Prefer a 4 MiB PSRAM ring (~209k records); fall back gracefully when the
+     * network/LVGL allocations leave less headroom than expected. */
+    static const uint32_t ring_bytes[] = {4u * 1024u * 1024u, 2u * 1024u * 1024u,
+                                          1u * 1024u * 1024u};
+    esp_err_t ring_err = ESP_ERR_NO_MEM;
+    for (size_t i = 0; i < sizeof(ring_bytes) / sizeof(ring_bytes[0]); i++) {
+        ring_err = can_ring_init(ring_bytes[i] / sizeof(linsight_can_record_t));
+        if (ring_err == ESP_OK) {
+            ESP_LOGI(TAG, "ring %u records (%u bytes)", (unsigned)(ring_bytes[i] /
+                                                                   sizeof(linsight_can_record_t)),
+                     (unsigned)ring_bytes[i]);
+            break;
+        }
+    }
+    ESP_ERROR_CHECK(ring_err);
     ESP_ERROR_CHECK(twai_capture_init());
 
 #if CONFIG_LINSIGHT_BENCH_SELFTEST
