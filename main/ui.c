@@ -2,12 +2,15 @@
  * LinSight CAN analyzer UI (320x240, LVGL 8.3) — implements docs/ui_design.md
  * v2.0 (Dark Instrument HIG).
  *
- * Two full-screen pages:
- *   Monitor  — 26 px status bar, fixed 4-column trace (8 x 21 px zebra rows),
- *              30 px telemetry bar. Tap a row to lock its CAN ID.
+ * Two physical pages with three views:
+ *   Monitor  — bus-health overview: 26 px status bar, 24 px health strip,
+ *              6 x 24 px top-ID rows, 30 px telemetry bar. Tap a row to lock.
+ *   Raw      — secondary 8 x 21 px frame trace in the same monitor container,
+ *              sharing the status and telemetry bars. Tap a row to lock.
  *   Settings — 28 px nav bar, bitrate/mode card, filter & trigger card,
  *              quick actions (pause, clear, bus recover).
- * Page switching: left/right swipe, the gear/back buttons, or GPIO0 long press.
+ * Page switching: left/right swipe, the gear/back buttons, or GPIO0 long press
+ * (Overview -> Raw -> Settings -> Overview).
  *
  * Data path: a 50 ms LVGL timer (core 1, the LVGL task) pulls the capture-side
  * UI history and the stats snapshot; only labels whose text/color actually
@@ -39,9 +42,25 @@
 
 #define ROW_N 8
 #define ROW_H 21
-#define ROW_Y 42
 #define SCAN_N 512      /* records examined per 50 ms tick (covers ~10 kfps) */
 #define CNT_SLOTS 128   /* per-ID counter table */
+
+#define TOP_N 6
+#define RATE_WINDOW_MS 1000u
+#define PAGE_CONTAINERS 2
+
+/* Monitor overview: 26 px status bar + 24 health + 16 header + 6 x 24 rows. */
+#define OV_Y 26
+#define OV_H 184
+#define OV_HEALTH_H 24
+#define OV_HDR_H 16
+#define OV_ROW_H 24
+#define OV_HDR_Y OV_HEALTH_H
+#define OV_ROWS_Y (OV_HEALTH_H + OV_HDR_H)
+
+/* Raw trace in the same monitor container: 16 px header + 8 x 21 px rows. */
+#define RAW_HDR_Y 0
+#define RAW_ROWS_Y 16
 
 /* ------------------------------------------------------ palette (design 2) */
 
@@ -60,7 +79,8 @@
 #define COL_RED lv_color_hex(0xFF453A)
 
 typedef enum {
-    PAGE_MONITOR = 0,
+    PAGE_MONITOR = 0, /* bus-health overview, monitor container */
+    PAGE_RAW,         /* raw trace, same monitor container */
     PAGE_SETTINGS,
     PAGE_COUNT,
 } page_id_t;
@@ -82,7 +102,9 @@ typedef enum {
 
 typedef struct {
     uint32_t id;
-    uint32_t count;
+    uint32_t count; /* cumulative since Clear (CNT column) */
+    uint32_t win;   /* non-error frames in the current 1 s window */
+    uint16_t rate;  /* frames/s from the last completed window */
     uint8_t ext;
     uint8_t used;
 } id_count_t;
@@ -90,8 +112,9 @@ typedef struct {
 /* -------------------------------------------------------------- statics */
 
 static lv_obj_t *s_screen;
-static lv_obj_t *s_pages[PAGE_COUNT];
+static lv_obj_t *s_pages[PAGE_CONTAINERS];
 static page_id_t s_page = PAGE_MONITOR;
+static page_id_t s_back_page = PAGE_MONITOR;
 
 /* Monitor: status bar */
 static lv_obj_t *s_bus_pill;
@@ -101,7 +124,21 @@ static lv_obj_t *s_run_label;
 static lv_obj_t *s_host_dot;
 static lv_obj_t *s_host_label;
 
-/* Monitor: trace */
+/* Monitor: view groups inside the same container (overview / raw). */
+static lv_obj_t *s_ov_group;
+static lv_obj_t *s_raw_group;
+
+/* Monitor overview: 4 health counters and 6 top-ID rows. */
+static lv_obj_t *s_health[4];
+static lv_obj_t *s_ov_row[TOP_N];
+static lv_obj_t *s_ov_id[TOP_N];
+static lv_obj_t *s_ov_rate[TOP_N];
+static lv_obj_t *s_ov_per[TOP_N];
+static lv_obj_t *s_ov_cnt[TOP_N];
+static lv_obj_t *s_ov_bar[TOP_N];
+static lv_obj_t *s_ov_empty;
+
+/* Monitor raw: trace rows */
 static lv_obj_t *s_row[ROW_N];
 static lv_obj_t *s_row_id[ROW_N];
 static lv_obj_t *s_row_dlc[ROW_N];
@@ -131,6 +168,12 @@ static char s_txt_bus[10];
 static char s_txt_br[12];
 static char s_txt_run[10];
 static char s_txt_host[16];
+static char s_txt_health[4][20];
+static char s_txt_ov_id[TOP_N][12];
+static char s_txt_ov_rate[TOP_N][10];
+static char s_txt_ov_per[TOP_N][6];
+static char s_txt_ov_cnt[TOP_N][10];
+static char s_txt_ov_empty[48];
 static char s_txt_row_id[ROW_N][12];
 static char s_txt_row_dlc[ROW_N][4];
 static char s_txt_row_data[ROW_N][28];
@@ -181,10 +224,22 @@ static uint16_t s_scan_seq;
 static bool s_scan_valid;
 static id_count_t s_counts[CNT_SLOTS];
 
+/* 1 s tumbling per-ID rate window and top-ID ranking (no heap). */
+static const id_count_t *s_top[TOP_N];
+static int s_top_n;
+static bool s_top_any;
+static uint32_t s_rate_tick;
+static bool s_rate_valid;
+
 /* Rendered row identity (row click locks this ID). */
 static bool s_view_valid[ROW_N];
 static uint32_t s_view_id[ROW_N];
 static bool s_view_ext[ROW_N];
+
+/* Rendered overview identity (row click locks this ID). */
+static bool s_ov_valid[TOP_N];
+static uint32_t s_ov_id_val[TOP_N];
+static bool s_ov_ext_val[TOP_N];
 
 static const can_bitrate_t BITRATES[4] = {CAN_BITRATE_125K, CAN_BITRATE_250K,
                                           CAN_BITRATE_500K, CAN_BITRATE_1M};
@@ -194,7 +249,11 @@ static void refresh_filter_pills(void);
 static void refresh_trigger_pills(void);
 static void refresh_row_highlight(void);
 static void refresh_settings(const can_stats_t *st);
+static void refresh_health(const can_stats_t *st);
 static void row_clear(int row);
+static void ov_row_clear(int row);
+static void ov_row_bg(int row, bool active);
+static void render_overview(void);
 static void page_show(page_id_t page);
 static void toggle_pause(void);
 
@@ -238,6 +297,16 @@ static void label_setf(lv_obj_t *label, char *buf, size_t cap, const char *fmt, 
     vsnprintf(tmp, sizeof(tmp), fmt, ap);
     va_end(ap);
     label_set_str(label, buf, cap, tmp);
+}
+
+/* Standard frames are 3 hex digits, extended frames 8 (docs/ui_design.md). */
+static void fmt_id(char *buf, size_t cap, uint32_t id, bool ext)
+{
+    if (ext) {
+        snprintf(buf, cap, "%08X", (unsigned)id);
+    } else {
+        snprintf(buf, cap, "%03X", (unsigned)id);
+    }
 }
 
 static void object_show(lv_obj_t *obj, bool show)
@@ -367,16 +436,44 @@ static lv_obj_t *action_btn_new(lv_obj_t *parent, lv_coord_t x, const char *text
 
 /* ------------------------------------------------------------ navigation */
 
+static int page_container(page_id_t page)
+{
+    return page == PAGE_SETTINGS ? 1 : 0;
+}
+
+static page_id_t page_next(page_id_t page)
+{
+    switch (page) {
+    case PAGE_MONITOR:
+        return PAGE_RAW;
+    case PAGE_RAW:
+        return PAGE_SETTINGS;
+    default:
+        return PAGE_MONITOR;
+    }
+}
+
 static void page_show(page_id_t page)
 {
+    if (page < PAGE_MONITOR || page >= PAGE_COUNT) {
+        page = PAGE_MONITOR;
+    }
+    if (page == PAGE_SETTINGS && s_page != PAGE_SETTINGS) {
+        s_back_page = s_page;
+    }
     s_page = page;
-    for (int i = 0; i < PAGE_COUNT; i++) {
-        if (i == (int)page) {
+
+    const int active = page_container(page);
+    for (int i = 0; i < PAGE_CONTAINERS; i++) {
+        if (i == active) {
             lv_obj_clear_flag(s_pages[i], LV_OBJ_FLAG_HIDDEN);
         } else {
             lv_obj_add_flag(s_pages[i], LV_OBJ_FLAG_HIDDEN);
         }
     }
+
+    object_show(s_ov_group, page == PAGE_MONITOR);
+    object_show(s_raw_group, page == PAGE_RAW);
 
     if (page == PAGE_SETTINGS) {
         can_stats_t st;
@@ -393,10 +490,18 @@ static void gesture_cb(lv_event_t *e)
         return;
     }
     const lv_dir_t dir = lv_indev_get_gesture_dir(indev);
-    if (dir == LV_DIR_LEFT && s_page == PAGE_MONITOR) {
-        page_show(PAGE_SETTINGS);
-    } else if (dir == LV_DIR_RIGHT && s_page == PAGE_SETTINGS) {
-        page_show(PAGE_MONITOR);
+    if (dir == LV_DIR_LEFT) {
+        if (s_page == PAGE_MONITOR) {
+            page_show(PAGE_RAW);
+        } else if (s_page == PAGE_RAW) {
+            page_show(PAGE_SETTINGS);
+        }
+    } else if (dir == LV_DIR_RIGHT) {
+        if (s_page == PAGE_RAW) {
+            page_show(PAGE_MONITOR);
+        } else if (s_page == PAGE_SETTINGS) {
+            page_show(s_back_page);
+        }
     }
 }
 
@@ -409,7 +514,7 @@ static void settings_click_cb(lv_event_t *e)
 static void back_click_cb(lv_event_t *e)
 {
     (void)e;
-    page_show(PAGE_MONITOR);
+    page_show(s_back_page);
 }
 
 /* --------------------------------------------------------------- actions */
@@ -471,6 +576,10 @@ static void pause_click_cb(lv_event_t *e)
 static void counts_clear(void)
 {
     memset(s_counts, 0, sizeof(s_counts));
+    s_rate_valid = false;
+    s_rate_tick = lv_tick_get();
+    s_top_n = 0;
+    s_top_any = false;
 }
 
 /* Drop the visible trace and counts without touching the capture path. */
@@ -497,6 +606,11 @@ static void view_reset(void)
     for (int i = 0; i < ROW_N; i++) {
         row_clear(i);
     }
+    for (int i = 0; i < TOP_N; i++) {
+        ov_row_clear(i);
+    }
+    object_show(s_empty, true);
+    object_show(s_ov_empty, true);
     s_total_valid = false; /* re-baseline rx_total on the next tick */
 }
 
@@ -536,14 +650,9 @@ static void trig_click_cb(lv_event_t *e)
     refresh_trigger_pills();
 }
 
-static void row_click_cb(lv_event_t *e)
+static void toggle_lock_id(uint32_t id, bool ext)
 {
-    const int row = (int)(intptr_t)lv_event_get_user_data(e);
-    if (!s_view_valid[row]) {
-        return;
-    }
-
-    if (s_lock_valid && s_view_id[row] == s_lock_id && s_view_ext[row] == s_lock_ext) {
+    if (s_lock_valid && id == s_lock_id && ext == s_lock_ext) {
         s_lock_valid = false;
         if (s_filter == FILTER_LOCK) {
             s_filter = FILTER_ALL;
@@ -551,14 +660,32 @@ static void row_click_cb(lv_event_t *e)
         toast_showf("ID UNLOCKED");
     } else {
         s_lock_valid = true;
-        s_lock_id = s_view_id[row];
-        s_lock_ext = s_view_ext[row];
+        s_lock_id = id;
+        s_lock_ext = ext;
         toast_showf("ID 0x%X LOCKED", (unsigned)s_lock_id);
     }
 
     refresh_filter_pills();
     refresh_trigger_pills();
     refresh_row_highlight();
+}
+
+static void row_click_cb(lv_event_t *e)
+{
+    const int row = (int)(intptr_t)lv_event_get_user_data(e);
+    if (!s_view_valid[row]) {
+        return;
+    }
+    toggle_lock_id(s_view_id[row], s_view_ext[row]);
+}
+
+static void ov_row_click_cb(lv_event_t *e)
+{
+    const int row = (int)(intptr_t)lv_event_get_user_data(e);
+    if (!s_ov_valid[row]) {
+        return;
+    }
+    toggle_lock_id(s_ov_id_val[row], s_ov_ext_val[row]);
 }
 
 /* -------------------------------------------------------- trace counters */
@@ -574,6 +701,8 @@ static id_count_t *count_slot(uint32_t id, bool ext)
             slot->id = id;
             slot->ext = ext ? 1 : 0;
             slot->count = 0;
+            slot->win = 0;
+            slot->rate = 0;
             return slot;
         }
         if (slot->id == id && slot->ext == (ext ? 1 : 0)) {
@@ -586,6 +715,8 @@ static id_count_t *count_slot(uint32_t id, bool ext)
     slot->id = id;
     slot->ext = ext ? 1 : 0;
     slot->count = 0;
+    slot->win = 0;
+    slot->rate = 0;
     return slot;
 }
 
@@ -699,8 +830,9 @@ static void row_set(int row, const linsight_can_record_t *r)
                       "ERR-FRM");
         label_color(s_row_id[row], COL_RED);
     } else {
-        label_setf(s_row_id[row], s_txt_row_id[row], sizeof(s_txt_row_id[row]), "%8X",
-                   (unsigned)r->id);
+        char idbuf[12];
+        fmt_id(idbuf, sizeof(idbuf), r->id, ext);
+        label_set_str(s_row_id[row], s_txt_row_id[row], sizeof(s_txt_row_id[row]), idbuf);
         label_color(s_row_id[row], ext ? COL_PURPLE : COL_BLUE);
     }
 
@@ -753,6 +885,198 @@ static void refresh_row_highlight(void)
             s_view_valid[i] && s_lock_valid && s_view_id[i] == s_lock_id &&
             s_view_ext[i] == s_lock_ext;
         row_bg(i, active);
+    }
+    for (int i = 0; i < TOP_N; i++) {
+        const bool active =
+            s_ov_valid[i] && s_lock_valid && s_ov_id_val[i] == s_lock_id &&
+            s_ov_ext_val[i] == s_lock_ext;
+        ov_row_bg(i, active);
+    }
+}
+
+/* ------------------------------------------------------ overview ranking */
+
+/* Tumbling 1 s window: publish win*1000/elapsed once per window, then restart.
+ * The first second after boot/Clear has no rate yet (columns show "---"). */
+static void rate_sample(void)
+{
+    const uint32_t elapsed = lv_tick_elaps(s_rate_tick);
+    if (elapsed < RATE_WINDOW_MS) {
+        return;
+    }
+
+    for (int i = 0; i < CNT_SLOTS; i++) {
+        id_count_t *slot = &s_counts[i];
+        if (!slot->used) {
+            continue;
+        }
+        const uint32_t rate = slot->win * 1000u / elapsed;
+        slot->rate = rate > 0xFFFFu ? 0xFFFFu : (uint16_t)rate;
+        slot->win = 0;
+    }
+    s_rate_valid = true;
+    s_rate_tick = lv_tick_get();
+}
+
+/* Live rows sort by rate; before the first window rate is unknown, so the
+ * cumulative count decides. Ties: lower ID, standard before extended. */
+static bool rank_before(const id_count_t *a, const id_count_t *b)
+{
+    if (a->rate != b->rate) {
+        return a->rate > b->rate;
+    }
+    if (a->count != b->count) {
+        return a->count > b->count;
+    }
+    if (a->id != b->id) {
+        return a->id < b->id;
+    }
+    return a->ext < b->ext;
+}
+
+static void rank_put(const id_count_t *slot)
+{
+    if (s_top_n < TOP_N) {
+        int pos = s_top_n++;
+        while (pos > 0 && rank_before(slot, s_top[pos - 1])) {
+            s_top[pos] = s_top[pos - 1];
+            pos--;
+        }
+        s_top[pos] = slot;
+    } else if (rank_before(slot, s_top[TOP_N - 1])) {
+        int pos = TOP_N - 1;
+        while (pos > 0 && rank_before(slot, s_top[pos - 1])) {
+            s_top[pos] = s_top[pos - 1];
+            pos--;
+        }
+        s_top[pos] = slot;
+    }
+}
+
+static void top_build(void)
+{
+    s_top_n = 0;
+    s_top_any = false;
+
+    for (int i = 0; i < CNT_SLOTS; i++) {
+        const id_count_t *slot = &s_counts[i];
+        if (!slot->used) {
+            continue;
+        }
+        s_top_any = true;
+        if (s_rate_valid && slot->rate == 0) {
+            continue; /* after the first window only live IDs are listed */
+        }
+        rank_put(slot);
+    }
+}
+
+/* ----------------------------------------------------- overview render */
+
+static void ov_row_bg(int row, bool active)
+{
+    const lv_color_t color = active ? COL_ACTIVE : ((row & 1) ? COL_ROW_ODD : COL_ROW_EVEN);
+    if (!color_same(lv_obj_get_style_bg_color(s_ov_row[row], 0), color)) {
+        lv_obj_set_style_bg_color(s_ov_row[row], color, 0);
+    }
+    /* Blue accent on the left edge makes the locked ID obvious at a glance. */
+    const lv_coord_t border = active ? 3 : 0;
+    if (lv_obj_get_style_border_width(s_ov_row[row], 0) != border) {
+        lv_obj_set_style_border_width(s_ov_row[row], border, 0);
+    }
+    if (active) {
+        lv_obj_set_style_border_color(s_ov_row[row], COL_BLUE, 0);
+    }
+}
+
+static void ov_bar_set(int row, uint32_t rate, uint32_t ref, bool ext)
+{
+    uint32_t h = 2;
+    if (ref > 0 && rate > 0) {
+        h = 2u + rate * 18u / ref;
+        if (h > 20u) {
+            h = 20u;
+        }
+    }
+    lv_obj_set_height(s_ov_bar[row], (lv_coord_t)h);
+    lv_obj_set_y(s_ov_bar[row], OV_ROW_H - 2 - (lv_coord_t)h);
+    lv_obj_set_style_bg_color(s_ov_bar[row], ext ? COL_PURPLE : COL_BLUE, 0);
+}
+
+static void ov_row_set(int row, const id_count_t *slot)
+{
+    char idbuf[12];
+    char rate[10];
+    fmt_id(idbuf, sizeof(idbuf), slot->id, slot->ext != 0);
+    label_set_str(s_ov_id[row], s_txt_ov_id[row], sizeof(s_txt_ov_id[row]), idbuf);
+    label_color(s_ov_id[row], slot->ext ? COL_PURPLE : COL_BLUE);
+
+    if (!s_rate_valid) {
+        snprintf(rate, sizeof(rate), "---");
+    } else if (slot->rate >= 10000u) {
+        snprintf(rate, sizeof(rate), "%uk", (unsigned)(slot->rate / 1000u));
+    } else {
+        snprintf(rate, sizeof(rate), "%u", (unsigned)slot->rate);
+    }
+    label_set_str(s_ov_rate[row], s_txt_ov_rate[row], sizeof(s_txt_ov_rate[row]), rate);
+
+    char per[6];
+    if (!s_rate_valid || slot->rate == 0) {
+        snprintf(per, sizeof(per), "---");
+    } else if (slot->rate > 1000u) {
+        snprintf(per, sizeof(per), "<1");
+    } else {
+        snprintf(per, sizeof(per), "%u", (unsigned)(1000u / slot->rate));
+    }
+    label_set_str(s_ov_per[row], s_txt_ov_per[row], sizeof(s_txt_ov_per[row]), per);
+
+    char cnt[10];
+    fmt_count(cnt, sizeof(cnt), slot->count);
+    label_set_str(s_ov_cnt[row], s_txt_ov_cnt[row], sizeof(s_txt_ov_cnt[row]), cnt);
+
+    ov_bar_set(row, slot->rate, s_top_n > 0 ? s_top[0]->rate : 0, slot->ext != 0);
+    object_show(s_ov_bar[row], true);
+
+    s_ov_valid[row] = true;
+    s_ov_id_val[row] = slot->id;
+    s_ov_ext_val[row] = slot->ext != 0;
+    ov_row_bg(row, s_lock_valid && slot->id == s_lock_id &&
+                       (slot->ext != 0) == s_lock_ext);
+}
+
+static void ov_row_clear(int row)
+{
+    label_set_str(s_ov_id[row], s_txt_ov_id[row], sizeof(s_txt_ov_id[row]), "");
+    label_set_str(s_ov_rate[row], s_txt_ov_rate[row], sizeof(s_txt_ov_rate[row]), "");
+    label_set_str(s_ov_per[row], s_txt_ov_per[row], sizeof(s_txt_ov_per[row]), "");
+    label_set_str(s_ov_cnt[row], s_txt_ov_cnt[row], sizeof(s_txt_ov_cnt[row]), "");
+    s_ov_valid[row] = false;
+    object_show(s_ov_bar[row], false);
+    ov_row_bg(row, false);
+}
+
+static void render_overview(void)
+{
+    top_build();
+
+    for (int i = 0; i < s_top_n; i++) {
+        ov_row_set(i, s_top[i]);
+    }
+    for (int i = s_top_n; i < TOP_N; i++) {
+        ov_row_clear(i);
+    }
+
+    lv_obj_t *hint = (lv_obj_t *)lv_obj_get_child(s_ov_empty, 0);
+    if (!s_top_any) {
+        label_set_str(hint, s_txt_ov_empty, sizeof(s_txt_ov_empty),
+                      "Waiting for CAN frames\ncheck wiring / bitrate");
+        object_show(s_ov_empty, true);
+    } else if (s_top_n == 0) {
+        label_set_str(hint, s_txt_ov_empty, sizeof(s_txt_ov_empty),
+                      "No traffic in the last 1 s");
+        object_show(s_ov_empty, true);
+    } else {
+        object_show(s_ov_empty, false);
     }
 }
 
@@ -809,7 +1133,10 @@ static void scan_records(bool capture_paused)
         s_scan_valid = true;
 
         if (!(r->flags & LINSIGHT_REC_FLAG_ERR)) {
-            count_slot(r->id, (r->flags & LINSIGHT_REC_FLAG_EXT) != 0)->count++;
+            id_count_t *slot =
+                count_slot(r->id, (r->flags & LINSIGHT_REC_FLAG_EXT) != 0);
+            slot->count++;
+            slot->win++;
         }
 
         if (!s_triggered && !s_frozen && !capture_paused && s_trig_mode == TRIG_LOCK &&
@@ -979,6 +1306,23 @@ static void refresh_bottom(const can_stats_t *st)
     }
 }
 
+static void refresh_health(const can_stats_t *st)
+{
+    static const char *const names[4] = {"MISS", "QFULL", "BERR", "BOFF"};
+    const uint32_t values[4] = {st->rx_missed, st->rx_queue_full, st->bus_errors,
+                                st->bus_off};
+
+    for (int i = 0; i < 4; i++) {
+        char cnt[10];
+        fmt_count(cnt, sizeof(cnt), values[i]);
+        label_setf(s_health[i], s_txt_health[i], sizeof(s_txt_health[i]), "%s %s",
+                   names[i], cnt);
+        label_color(s_health[i], values[i] == 0 ? COL_DIM
+                                    : i >= 2      ? COL_RED
+                                                  : COL_ORANGE);
+    }
+}
+
 static void refresh_monitor(const can_stats_t *st)
 {
     char bitrate[12];
@@ -1126,23 +1470,47 @@ static void tick_cb(lv_timer_t *timer)
     s_total_valid = true;
 
     scan_records(st.paused);
-    check_error_trigger(&st);
 
-    /* A trigger is a scene to look at: jump to Monitor to show it. */
-    if (s_trig_pending && s_page != PAGE_MONITOR) {
-        page_show(PAGE_MONITOR);
+    /* Host pause freezes the rows but not the counters: restart the rate
+     * window on resume so the pause duration never dilutes the first rate. */
+    if (st.paused) {
+        for (int i = 0; i < CNT_SLOTS; i++) {
+            s_counts[i].win = 0;
+        }
+        s_rate_tick = lv_tick_get();
+    } else {
+        rate_sample();
     }
 
-    if (s_page == PAGE_MONITOR) {
-        refresh_monitor(&st);
-        if (s_trig_pending) {
-            render_trace(s_limit_on, s_trig_limit);
-            s_trig_pending = false;
-        } else if (!s_triggered && !s_frozen && !st.paused) {
-            render_trace(false, 0);
-        }
-    } else {
+    check_error_trigger(&st);
+
+    /* A trigger is a scene to look at: the locked-ID trigger belongs to the
+     * raw trace, an error/BOff trigger to the health overview. Snapshot the
+     * overview before leaving so the scene is what stays frozen. */
+    if (s_trig_pending) {
+        render_overview();
+        page_show(s_trig_mode == TRIG_LOCK ? PAGE_RAW : PAGE_MONITOR);
+    }
+
+    if (s_page == PAGE_SETTINGS) {
         refresh_settings(&st);
+    } else {
+        refresh_monitor(&st);
+        if (s_page == PAGE_RAW) {
+            if (s_trig_pending) {
+                render_trace(s_limit_on, s_trig_limit);
+                s_trig_pending = false;
+            } else if (!s_triggered && !s_frozen && !st.paused) {
+                render_trace(false, 0);
+            }
+        } else {
+            refresh_health(&st);
+            if (s_trig_pending) {
+                s_trig_pending = false; /* rendered as the pre-jump snapshot */
+            } else if (!s_triggered && !s_frozen && !st.paused) {
+                render_overview();
+            }
+        }
     }
 
     if (s_toast && !lv_obj_has_flag(s_toast, LV_OBJ_FLAG_HIDDEN) &&
@@ -1193,20 +1561,101 @@ static void monitor_create(void)
                                      COL_TEXT);
     lv_obj_center(gear_label);
 
-    /* Header row (screen coordinates 26..41). */
+    /* Overview group: health strip, header and 6 large top-ID rows. */
+    s_ov_group = obj_new(page, 0, OV_Y, UI_W, OV_H);
+    lv_obj_add_flag(s_ov_group, LV_OBJ_FLAG_GESTURE_BUBBLE);
+
+    lv_obj_t *health = obj_new(s_ov_group, 0, 0, UI_W, OV_HEALTH_H);
+    lv_obj_set_style_bg_color(health, COL_BAR, 0);
+    lv_obj_set_style_bg_opa(health, LV_OPA_COVER, 0);
+    for (int i = 0; i < 4; i++) {
+        s_health[i] = label_new(health, "", &lv_font_montserrat_12, COL_DIM);
+        lv_obj_set_pos(s_health[i], i * 80, 4);
+        lv_obj_set_width(s_health[i], 80);
+        lv_obj_set_style_text_align(s_health[i], LV_TEXT_ALIGN_CENTER, 0);
+    }
+
+    lv_obj_t *hdr = label_new(s_ov_group, "ID", &lv_font_montserrat_12, COL_DIM);
+    lv_obj_set_pos(hdr, 4, OV_HDR_Y);
+    hdr = label_new(s_ov_group, "RATE/s", &lv_font_montserrat_12, COL_DIM);
+    lv_obj_set_pos(hdr, 140, OV_HDR_Y);
+    lv_obj_set_width(hdr, 62);
+    lv_obj_set_style_text_align(hdr, LV_TEXT_ALIGN_RIGHT, 0);
+    hdr = label_new(s_ov_group, "PER", &lv_font_montserrat_12, COL_DIM);
+    lv_obj_set_pos(hdr, 206, OV_HDR_Y);
+    lv_obj_set_width(hdr, 40);
+    lv_obj_set_style_text_align(hdr, LV_TEXT_ALIGN_RIGHT, 0);
+    hdr = label_new(s_ov_group, "CNT", &lv_font_montserrat_12, COL_DIM);
+    lv_obj_set_pos(hdr, 248, OV_HDR_Y);
+    lv_obj_set_width(hdr, 60);
+    lv_obj_set_style_text_align(hdr, LV_TEXT_ALIGN_RIGHT, 0);
+
+    for (int i = 0; i < TOP_N; i++) {
+        lv_obj_t *row = obj_new(s_ov_group, 0, OV_ROWS_Y + i * OV_ROW_H, UI_W, OV_ROW_H);
+        lv_obj_set_style_bg_color(row, (i & 1) ? COL_ROW_ODD : COL_ROW_EVEN, 0);
+        lv_obj_set_style_bg_color(row, COL_ACTIVE, LV_STATE_PRESSED);
+        lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_side(row, LV_BORDER_SIDE_LEFT, 0);
+        lv_obj_set_style_border_width(row, 0, 0);
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_flag(row, LV_OBJ_FLAG_GESTURE_BUBBLE);
+        lv_obj_add_event_cb(row, ov_row_click_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+        s_ov_row[i] = row;
+
+        s_ov_id[i] = label_new(row, "", &lv_font_montserrat_20, COL_BLUE);
+        lv_obj_set_pos(s_ov_id[i], 4, 1);
+        lv_obj_set_width(s_ov_id[i], 132);
+
+        s_ov_rate[i] = label_new(row, "", &lv_font_montserrat_20, COL_TEXT);
+        lv_obj_set_pos(s_ov_rate[i], 140, 1);
+        lv_obj_set_width(s_ov_rate[i], 62);
+        lv_obj_set_style_text_align(s_ov_rate[i], LV_TEXT_ALIGN_RIGHT, 0);
+
+        s_ov_per[i] = label_new(row, "", &lv_font_montserrat_12, COL_DIM);
+        lv_obj_set_pos(s_ov_per[i], 206, 5);
+        lv_obj_set_width(s_ov_per[i], 40);
+        lv_obj_set_style_text_align(s_ov_per[i], LV_TEXT_ALIGN_RIGHT, 0);
+
+        s_ov_cnt[i] = label_new(row, "", &lv_font_montserrat_12, COL_DIM);
+        lv_obj_set_pos(s_ov_cnt[i], 248, 5);
+        lv_obj_set_width(s_ov_cnt[i], 60);
+        lv_obj_set_style_text_align(s_ov_cnt[i], LV_TEXT_ALIGN_RIGHT, 0);
+
+        s_ov_bar[i] = obj_new(row, 311, 20, 6, 2);
+        lv_obj_set_style_bg_color(s_ov_bar[i], COL_BLUE, 0);
+        lv_obj_set_style_bg_opa(s_ov_bar[i], LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(s_ov_bar[i], 3, 0);
+        object_show(s_ov_bar[i], false);
+    }
+
+    /* Shown while the ranking has no live IDs (topmost, but not clickable). */
+    s_ov_empty = obj_new(s_ov_group, 0, OV_ROWS_Y, UI_W, TOP_N * OV_ROW_H);
+    lv_obj_t *ov_hint =
+        label_new(s_ov_empty, "Waiting for CAN frames\ncheck wiring / bitrate",
+                  &lv_font_montserrat_14, COL_DIM);
+    lv_obj_set_width(ov_hint, UI_W - 24);
+    lv_obj_set_style_text_align(ov_hint, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_line_space(ov_hint, 4, 0);
+    lv_obj_center(ov_hint);
+
+    /* Raw group: the original 8 x 21 px frame trace, same container. */
+    s_raw_group = obj_new(page, 0, OV_Y, UI_W, OV_H);
+    lv_obj_add_flag(s_raw_group, LV_OBJ_FLAG_GESTURE_BUBBLE);
+
     static const char *headers[3] = {"ID", "L", "DATA (HEX)"};
     static const lv_coord_t hx[3] = {4, 70, 88};
     for (int i = 0; i < 3; i++) {
-        lv_obj_t *label = label_new(page, headers[i], &lv_font_montserrat_12, COL_DIM);
-        lv_obj_set_pos(label, hx[i], 26);
+        lv_obj_t *label = label_new(s_raw_group, headers[i], &lv_font_montserrat_12,
+                                    COL_DIM);
+        lv_obj_set_pos(label, hx[i], RAW_HDR_Y);
     }
-    lv_obj_t *cnt_header = label_new(page, "CNT", &lv_font_montserrat_12, COL_DIM);
-    lv_obj_set_pos(cnt_header, 268, 26);
+    lv_obj_t *cnt_header = label_new(s_raw_group, "CNT", &lv_font_montserrat_12, COL_DIM);
+    lv_obj_set_pos(cnt_header, 268, RAW_HDR_Y);
     lv_obj_set_width(cnt_header, 48);
     lv_obj_set_style_text_align(cnt_header, LV_TEXT_ALIGN_RIGHT, 0);
 
     for (int i = 0; i < ROW_N; i++) {
-        lv_obj_t *row = obj_new(page, 0, ROW_Y + i * ROW_H, UI_W, ROW_H);
+        lv_obj_t *row = obj_new(s_raw_group, 0, RAW_ROWS_Y + i * ROW_H, UI_W, ROW_H);
         lv_obj_set_style_bg_color(row, (i & 1) ? COL_ROW_ODD : COL_ROW_EVEN, 0);
         lv_obj_set_style_bg_color(row, COL_ACTIVE, LV_STATE_PRESSED);
         lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
@@ -1231,7 +1680,7 @@ static void monitor_create(void)
 
     /* Shown only while the grid has no matching frames (topmost, but not
      * clickable, so taps still reach the zebra rows underneath). */
-    s_empty = obj_new(page, 0, ROW_Y, UI_W, ROW_N * ROW_H);
+    s_empty = obj_new(s_raw_group, 0, RAW_ROWS_Y, UI_W, ROW_N * ROW_H);
     lv_obj_t *empty_hint =
         label_new(s_empty, "Waiting for CAN frames\ncheck wiring / bitrate",
                   &lv_font_montserrat_14, COL_DIM);
@@ -1254,7 +1703,7 @@ static void monitor_create(void)
 
 static void settings_create(void)
 {
-    lv_obj_t *page = s_pages[PAGE_SETTINGS];
+    lv_obj_t *page = s_pages[page_container(PAGE_SETTINGS)];
 
     lv_obj_t *bar = obj_new(page, 0, 0, UI_W, 28);
     lv_obj_set_style_bg_color(bar, COL_BAR, 0);
@@ -1266,7 +1715,7 @@ static void settings_create(void)
     lv_obj_add_flag(back, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_flag(back, LV_OBJ_FLAG_GESTURE_BUBBLE);
     lv_obj_add_event_cb(back, back_click_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *back_label = label_new(back, LV_SYMBOL_LEFT " Monitor",
+    lv_obj_t *back_label = label_new(back, LV_SYMBOL_LEFT " Back",
                                      &lv_font_montserrat_12, COL_TEXT);
     lv_obj_set_pos(back_label, 8, 6);
 
@@ -1343,7 +1792,7 @@ void linsight_ui_init(void)
     lv_obj_set_style_pad_all(s_screen, 0, 0);
     lv_obj_clear_flag(s_screen, LV_OBJ_FLAG_SCROLLABLE);
 
-    for (int i = 0; i < PAGE_COUNT; i++) {
+    for (int i = 0; i < PAGE_CONTAINERS; i++) {
         lv_obj_t *page = obj_new(s_screen, 0, 0, UI_W, UI_H);
         lv_obj_set_style_bg_color(page, COL_BG, 0);
         lv_obj_set_style_bg_opa(page, LV_OPA_COVER, 0);
@@ -1359,6 +1808,7 @@ void linsight_ui_init(void)
     settings_create();
     page_show(PAGE_MONITOR);
 
+    s_rate_tick = lv_tick_get();
     refresh_filter_pills();
     refresh_trigger_pills();
     refresh_host();
@@ -1374,7 +1824,6 @@ void linsight_ui_init(void)
     lv_obj_center(toast_label);
     object_show(s_toast, false);
 
-    s_page = PAGE_MONITOR;
     lv_timer_create(tick_cb, 50, NULL); /* 20 Hz */
 }
 
@@ -1388,7 +1837,7 @@ void linsight_ui_handle_key(bool long_press)
 {
     lvgl_port_lock(0);
     if (long_press) {
-        page_show(s_page == PAGE_MONITOR ? PAGE_SETTINGS : PAGE_MONITOR);
+        page_show(page_next(s_page));
     } else {
         toggle_pause();
     }

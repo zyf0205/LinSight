@@ -14,7 +14,7 @@ production builds should move them back to menuconfig/ignored config.
 
 - `docs/project_plan.md` — scope, protocol v2.1, milestones, design decisions
 - `docs/hardware.md` — verified pinout, CAN wiring, LCD/touch init, sdkconfig gotchas
-- `docs/ui_design.md` — UI tokens, Monitor/Settings layout, input/refresh contract (API in `main/ui.h`)
+- `docs/ui_design.md` — UI tokens, Overview/Raw/Settings layout, input/refresh contract (API in `main/ui.h`)
 - `protocol/frame.h` — wire format, limits, parser contract (shared with the host repo; keep both copies identical)
 - `tools/can_probe/` — standalone TWAI bench probe used for M0 wiring validation
 
@@ -49,7 +49,7 @@ idf.py menuconfig                  # LinSight → CAN mode only; Wi-Fi/host is B
 - **Ring** (`can_ring.c`): mutex-protected SPSC-style; overwrite-oldest on overflow with a visible drop counter; sequence numbers expose gaps.
 - **SD black box** (`sd_store.c`): independent PSRAM queue (16k, 4k internal fallback), never blocks `twai_task`; 1-bit SDMMC CLK/CMD/D0 = 47/48/21; FAT32/8.3 `recNNNNN.lsc` with the shared 32-byte header, 32 MiB or 10 min rotation, keep 8 files, `.met`/`.trg` sidecars. Code compiles; bench validation (mount, power loss, rotation) still pending.
 - **Shared protocol**: `protocol/frame.c` is pure C (no IDF, no malloc); the WSL host repo compiles a mirror of the same parser. 5-byte header `AA 55 type len_lo len_hi`; types 01 HELLO, 02 CAN_BATCH, 03 STATS, 04 EVENT, 05/06 PING/PONG, 07 CONTROL, 08 ACK, 09 FLOW, 10 DEVICE_INFO; record `seq u16 | ts_ms u32 | id u32 | flags u8 | dlc u8 | data[8]`; STATS/CONTROL payloads are small JSON; HELLO carries `device_id`/`boot`/`uptime_ms`; pause accepts a 5 s–30 min `lease_ms`.
-- **UI** (`ui.c`): Monitor (status chips, 8×21 px zebra trace with per-ID CNT, 20 Hz telemetry bar whose fourth tile shows OVF or `REC nF`/`SD READY`/`SD ERROR`/`NO SD`) + Settings (bitrate/mode, Std/Ext/locked-ID filter, one-shot error/locked-ID trigger, pause/clear/bus recover, right-aligned status label); tap a row to lock its ID; GPIO0 short = display pause, long = page switch; host CONTROL mirrors into the settings nav (REMOTE SYNC); net_task setters publish into a lock-free mailbox that the 20 Hz LVGL timer drains, while the GPIO0 handler takes the LVGL lock for its short action.
+- **UI** (`ui.c`): Monitor page has two views — the default Overview (4 health counters + 6 large top-ID rows ranked by the tumbling 1 s rate, activity bars, tap-to-lock) and the secondary Raw view (8×21 px zebra trace with per-ID CNT); both share the status bar and the 20 Hz telemetry bar whose fourth tile shows OVF or `REC nF`/`SD READY`/`SD ERROR`/`NO SD`. Settings holds bitrate/mode, Std/Ext/locked-ID filter, one-shot error/locked-ID trigger, pause/clear/bus recover and a right-aligned status label. Overview ignores the filter; the filter applies to Raw only. GPIO0 short = display pause, long = cycle Overview → Raw → Settings → Overview; tap a row in either view to lock its ID. The filter/lock trigger jumps to Raw, the error trigger to Overview. Host CONTROL mirrors into the settings nav (REMOTE SYNC); net_task setters publish into a lock-free mailbox that the 20 Hz LVGL timer drains, while the GPIO0 handler takes the LVGL lock for its short action.
 
 ## Hard constraints
 
