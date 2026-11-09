@@ -329,11 +329,13 @@ static void io_fail(const char *what)
     close_current(true);
     twai_event_push("sd_io");
 
-    /* The card may have been removed. Drop the stale queue and remount; the
-     * capture path keeps running on the network ring meanwhile. */
+    /* The card may have been removed. Stop new pushes first, then drain any
+     * records queued by a producer that passed the mounted check earlier. */
     s_mounted = false;
     if (s_queue) {
-        xQueueReset(s_queue);
+        linsight_can_record_t dummy;
+        while (xQueueReceive(s_queue, &dummy, 0) == pdTRUE) {
+        }
     }
     if (s_card) {
         esp_vfs_fat_sdcard_unmount(SD_MOUNT_POINT, s_card);

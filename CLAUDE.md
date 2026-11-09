@@ -5,10 +5,10 @@ This file provides guidance to Claude Code when working in the Windows firmware 
 ## Repository state
 
 LinSight ESP32-S3 firmware: TWAI capture, PSRAM ring, SD black-box recording, LVGL UI, Wi-Fi streaming.
-The Linux host (epoll daemon, CLI, `.lsc` logging, tests, HTTP/SSE dashboard) lives in
+The Linux host (epoll daemon, CLI, `.lsc` logging, tests, optional SocketCAN/ROS 2 bridge) lives in
 the separate WSL repository `~/linsight`; do not keep, build, or run host code in this checkout.
-Bench Wi-Fi credentials and the host IP are committed in `BENCH_*` (`main/net.c`);
-production builds should move them back to menuconfig/ignored config.
+Bench Wi-Fi credentials and the host IP are Kconfig defaults (`CONFIG_LINSIGHT_*` in
+`main/Kconfig.projbuild`); production builds should override them via menuconfig.
 
 ## Source of truth
 
@@ -37,15 +37,15 @@ production builds should move them back to menuconfig/ignored config.
 idf.py set-target esp32s3          # once
 idf.py build
 idf.py -p COMx flash monitor
-idf.py menuconfig                  # LinSight → CAN mode only; Wi-Fi/host is BENCH_* in main/net.c
+idf.py menuconfig                  # LinSight → CAN mode, Wi-Fi SSID/password, host IP/port
 ```
 
-- Bench Wi-Fi/TCP endpoint is hardcoded in `main/net.c` (`BENCH_*`) so changing it only rebuilds one file; it is committed for the bench workflow. Production builds should move it back to menuconfig/ignored config. The device sets the CN 1–13 regulatory domain for 2.4 GHz bench channels.
+- Bench Wi-Fi/TCP endpoint is configured in `main/Kconfig.projbuild` (`CONFIG_LINSIGHT_*`, bench values as defaults); production builds override it in menuconfig. The device sets the CN 1–13 regulatory domain for 2.4 GHz bench channels.
 - Bench: the device joins the PC hotspot and connects to `linsightd` in WSL; PCAN traffic is generated on WSL `can0` (usbipd + `peak_usb`), not from Windows. Default `TWAI_MODE_LISTEN_ONLY` never ACKs — switch Settings/`menuconfig` to Normal only on a two-node bench.
 
 ## Architecture
 
-- **Firmware tasks**: `twai_task` (core 0, prio 10) receives frames, timestamps (ms), pushes 20-byte records into the PSRAM ring (4 MiB, ~209k records, drop-oldest), mirrors the newest 512 into a capture-side UI history, fan-outs to the SD queue, and maintains counters; `net_task` (core 0, prio 5) owns Wi-Fi/TCP, streams CAN_BATCH frames, sends STATS at 1 Hz / DEVICE_INFO every 5 s / EVENTS / PING, parses CONTROL/FLOW/PING from the host; `sd_task` (core 1, prio 3) drains the 16k PSRAM queue and writes `recNNNNN.lsc`; the LVGL task pulls `twai_ui_tail` + stats at 20 Hz (the history is independent of the ring that `net_task` drains). Verified: 30000-frame boot burst at 4330 fps / 96% load, zero loss (30k < ~209k capacity, so overflow policy is covered by the host repo's `test_ring`).
+- **Firmware tasks**: `twai_task` (core 1, prio 10) receives frames, timestamps (ms), pushes 20-byte records into the PSRAM ring (4 MiB, ~209k records, drop-oldest), mirrors the newest 512 into a capture-side UI history, fan-outs to the SD queue, and maintains counters; `net_task` (core 0, prio 5) owns Wi-Fi/TCP, streams CAN_BATCH frames, sends STATS at 1 Hz / DEVICE_INFO every 5 s / EVENTS / PING, parses CONTROL/FLOW/PING from the host; `sd_task` (core 1, prio 3) drains the 16k PSRAM queue and writes `recNNNNN.lsc`; the LVGL task pulls `twai_ui_tail` + stats at 20 Hz (the history is independent of the ring that `net_task` drains). Verified: 30000-frame boot burst at 4330 fps / 96% load, zero loss (30k < ~209k capacity, so overflow policy is covered by the host repo's `test_ring`).
 - **Ring** (`can_ring.c`): mutex-protected SPSC-style; overwrite-oldest on overflow with a visible drop counter; sequence numbers expose gaps.
 - **SD black box** (`sd_store.c`): independent PSRAM queue (16k, 4k internal fallback), never blocks `twai_task`; 1-bit SDMMC CLK/CMD/D0 = 47/48/21; FAT32/8.3 `recNNNNN.lsc` with the shared 32-byte header, 32 MiB or 10 min rotation, keep 8 files, `.met`/`.trg` sidecars. Code compiles; bench validation (mount, power loss, rotation) still pending.
 - **Shared protocol**: `protocol/frame.c` is pure C (no IDF, no malloc); the WSL host repo compiles a mirror of the same parser. 5-byte header `AA 55 type len_lo len_hi`; types 01 HELLO, 02 CAN_BATCH, 03 STATS, 04 EVENT, 05/06 PING/PONG, 07 CONTROL, 08 ACK, 09 FLOW, 10 DEVICE_INFO; record `seq u16 | ts_ms u32 | id u32 | flags u8 | dlc u8 | data[8]`; STATS/CONTROL payloads are small JSON; HELLO carries `device_id`/`boot`/`uptime_ms`; pause accepts a 5 s–30 min `lease_ms`.

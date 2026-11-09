@@ -43,7 +43,7 @@
 #define ROW_N 8
 #define ROW_H 21
 #define SCAN_N 512      /* records examined per 50 ms tick (covers ~10 kfps) */
-#define CNT_SLOTS 128   /* per-ID counter table */
+#define CNT_SLOTS 256   /* per-ID counter table */
 
 #define TOP_N 6
 #define RATE_WINDOW_MS 1000u
@@ -691,8 +691,9 @@ static id_count_t *count_slot(uint32_t id, bool ext)
 {
     const uint32_t h = (id * 2654435761u + (ext ? 0x9E3779B9u : 0u)) & (CNT_SLOTS - 1);
 
+    /* Backward linear probe (h, h-1, ...); count_get uses the same order. */
     for (uint32_t i = 0; i < CNT_SLOTS; i++) {
-        id_count_t *slot = &s_counts[(h + i) & (CNT_SLOTS - 1)];
+        id_count_t *slot = &s_counts[(h + CNT_SLOTS - i) & (CNT_SLOTS - 1)];
         if (!slot->used) {
             slot->used = 1;
             slot->id = id;
@@ -707,14 +708,9 @@ static id_count_t *count_slot(uint32_t id, bool ext)
         }
     }
 
-    /* Table full: reuse the home slot (oldest IDs lose their history). */
-    id_count_t *slot = &s_counts[h];
-    slot->id = id;
-    slot->ext = ext ? 1 : 0;
-    slot->count = 0;
-    slot->win = 0;
-    slot->rate = 0;
-    return slot;
+    /* Table full: do not evict an existing ID; this ID gets no count until
+     * the table is cleared or a slot becomes free. */
+    return NULL;
 }
 
 static uint32_t count_get(uint32_t id, bool ext)
@@ -722,7 +718,7 @@ static uint32_t count_get(uint32_t id, bool ext)
     const uint32_t h = (id * 2654435761u + (ext ? 0x9E3779B9u : 0u)) & (CNT_SLOTS - 1);
 
     for (uint32_t i = 0; i < CNT_SLOTS; i++) {
-        const id_count_t *slot = &s_counts[(h + i) & (CNT_SLOTS - 1)];
+        const id_count_t *slot = &s_counts[(h + CNT_SLOTS - i) & (CNT_SLOTS - 1)];
         if (!slot->used) {
             break;
         }
@@ -730,7 +726,7 @@ static uint32_t count_get(uint32_t id, bool ext)
             return slot->count;
         }
     }
-    return 0; /* evicted by a hash collision */
+    return 0; /* not in the table (table full or never seen) */
 }
 
 static void fmt_count(char *buf, size_t cap, uint32_t n)
@@ -1132,8 +1128,10 @@ static void scan_records(bool capture_paused)
         if (!(r->flags & LINSIGHT_REC_FLAG_ERR)) {
             id_count_t *slot =
                 count_slot(r->id, (r->flags & LINSIGHT_REC_FLAG_EXT) != 0);
-            slot->count++;
-            slot->win++;
+            if (slot) {
+                slot->count++;
+                slot->win++;
+            }
         }
 
         if (!s_triggered && !s_frozen && !capture_paused && s_trig_mode == TRIG_LOCK &&

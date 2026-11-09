@@ -16,6 +16,30 @@ menu "LinSight"
 
     endchoice
 
+    config LINSIGHT_WIFI_SSID
+        string "Wi-Fi SSID"
+        default "20pro"
+        help
+            Station SSID. The default is the bench hotspot; override it in
+            menuconfig for production builds.
+
+    config LINSIGHT_WIFI_PASSWORD
+        string "Wi-Fi password"
+        default "88888888"
+        help
+            Leave empty for an open network.
+
+    config LINSIGHT_HOST_IP
+        string "Host IPv4 address"
+        default "10.75.237.181"
+        help
+            Address of the PC running linsightd.
+
+    config LINSIGHT_HOST_PORT
+        int "Host TCP port"
+        range 1 65535
+        default 8888
+
     config LINSIGHT_BENCH_SELFTEST
         bool "Bench self-test load generator (boot-time TX burst)"
         default n

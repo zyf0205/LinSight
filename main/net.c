@@ -26,6 +26,7 @@
 #include "freertos/task.h"
 #include "lwip/inet.h"
 #include "lwip/sockets.h"
+#include "sdkconfig.h"
 #include "sd_store.h"
 #include "settings.h"
 #include "twai.h"
@@ -33,12 +34,8 @@
 
 #define TAG "net"
 
-/* Bench endpoint kept in code so changing it only rebuilds this file
- * instead of the whole project. Rotate the hotspot password when sharing. */
-#define BENCH_WIFI_SSID "20pro"
-#define BENCH_WIFI_PASSWORD "88888888"
-#define BENCH_HOST_IP "10.75.237.181"
-#define BENCH_HOST_PORT 8888
+/* Bench endpoint comes from Kconfig (LinSight menu), so production builds can
+ * override it without editing this file. */
 
 #define WIFI_CONNECTED_BIT BIT0
 #define NET_TASK_STACK 8192
@@ -530,7 +527,7 @@ static void net_task(void *arg)
     (void)arg;
 
     linsight_ui_set_conn(UI_CONN_WIFI, 0);
-    ESP_LOGI(TAG, "connecting Wi-Fi SSID=\"%s\"", BENCH_WIFI_SSID);
+    ESP_LOGI(TAG, "connecting Wi-Fi SSID=\"%s\"", CONFIG_LINSIGHT_WIFI_SSID);
 
     uint32_t backoff_ms = RECONNECT_DELAY_MIN_MS;
 
@@ -543,12 +540,12 @@ static void net_task(void *arg)
         }
 
         linsight_ui_set_conn(UI_CONN_HOST, 0);
-        const int fd = tcp_connect(BENCH_HOST_IP, BENCH_HOST_PORT, 3000);
+        const int fd = tcp_connect(CONFIG_LINSIGHT_HOST_IP, CONFIG_LINSIGHT_HOST_PORT, 3000);
         if (fd < 0) {
             static uint32_t attempts;
             if (++attempts % 10u == 1u) {
-                ESP_LOGI(TAG, "host %s:%u unreachable (attempt %u)", BENCH_HOST_IP,
-                         (unsigned)BENCH_HOST_PORT, (unsigned)attempts);
+                ESP_LOGI(TAG, "host %s:%u unreachable (attempt %u)", CONFIG_LINSIGHT_HOST_IP,
+                         (unsigned)CONFIG_LINSIGHT_HOST_PORT, (unsigned)attempts);
             }
             linsight_ui_set_conn(UI_CONN_RECONNECT, 0);
             vTaskDelay(pdMS_TO_TICKS(backoff_ms));
@@ -690,8 +687,8 @@ static esp_err_t wifi_init(void)
                         TAG, "ip handler");
 
     wifi_config_t cfg = {0};
-    strlcpy((char *)cfg.sta.ssid, BENCH_WIFI_SSID, sizeof(cfg.sta.ssid));
-    strlcpy((char *)cfg.sta.password, BENCH_WIFI_PASSWORD,
+    strlcpy((char *)cfg.sta.ssid, CONFIG_LINSIGHT_WIFI_SSID, sizeof(cfg.sta.ssid));
+    strlcpy((char *)cfg.sta.password, CONFIG_LINSIGHT_WIFI_PASSWORD,
             sizeof(cfg.sta.password));
     cfg.sta.threshold.authmode =
         cfg.sta.password[0] ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
@@ -731,7 +728,7 @@ esp_err_t net_start(void)
                                                   NET_TASK_PRIO, NULL, NET_CORE);
     ESP_RETURN_ON_FALSE(ok == pdPASS, ESP_ERR_NO_MEM, TAG, "net task");
 
-    ESP_LOGI(TAG, "net started, host %s:%u", BENCH_HOST_IP,
-             (unsigned)BENCH_HOST_PORT);
+    ESP_LOGI(TAG, "net started, host %s:%u", CONFIG_LINSIGHT_HOST_IP,
+             (unsigned)CONFIG_LINSIGHT_HOST_PORT);
     return ESP_OK;
 }

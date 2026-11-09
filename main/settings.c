@@ -10,8 +10,14 @@
 #define TAG "settings"
 #define NVS_NS "ls"
 #define NVS_KEY_BOOT "boot"
+#define NVS_KEY_BITRATE "br"
+#define NVS_KEY_MODE "mode"
 
 static uint32_t s_boot_count;
+static bool s_bitrate_valid;
+static bool s_mode_valid;
+static can_bitrate_t s_bitrate = CAN_BITRATE_500K;
+static can_mode_t s_mode = CAN_MODE_LISTEN_ONLY;
 
 esp_err_t settings_init(void)
 {
@@ -40,6 +46,16 @@ esp_err_t settings_init(void)
     }
     boot++;
 
+    uint8_t raw = 0;
+    if (nvs_get_u8(h, NVS_KEY_BITRATE, &raw) == ESP_OK && raw <= CAN_BITRATE_1M) {
+        s_bitrate = (can_bitrate_t)raw;
+        s_bitrate_valid = true;
+    }
+    if (nvs_get_u8(h, NVS_KEY_MODE, &raw) == ESP_OK && raw <= CAN_MODE_SELFTEST) {
+        s_mode = (can_mode_t)raw;
+        s_mode_valid = true;
+    }
+
     err = nvs_set_u32(h, NVS_KEY_BOOT, boot);
     if (err == ESP_OK) {
         err = nvs_commit(h);
@@ -52,10 +68,51 @@ esp_err_t settings_init(void)
     }
     s_boot_count = boot;
     ESP_LOGI(TAG, "boot count %u", (unsigned)s_boot_count);
+    if (s_bitrate_valid && s_mode_valid) {
+        ESP_LOGI(TAG, "CAN config %s %s", can_bitrate_name(s_bitrate),
+                 can_mode_name(s_mode));
+    }
     return ESP_OK;
 }
 
 uint32_t linsight_boot_count(void)
 {
     return s_boot_count;
+}
+
+void settings_load_can(can_bitrate_t *bitrate, can_mode_t *mode)
+{
+    if (!bitrate || !mode) {
+        return;
+    }
+    if (s_bitrate_valid) {
+        *bitrate = s_bitrate;
+    }
+    if (s_mode_valid) {
+        *mode = s_mode;
+    }
+}
+
+esp_err_t settings_save_can(can_bitrate_t bitrate, can_mode_t mode)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = nvs_set_u8(h, NVS_KEY_BITRATE, (uint8_t)bitrate);
+    if (err == ESP_OK) {
+        err = nvs_set_u8(h, NVS_KEY_MODE, (uint8_t)mode);
+    }
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    if (err == ESP_OK) {
+        s_bitrate = bitrate;
+        s_bitrate_valid = true;
+        s_mode = mode;
+        s_mode_valid = true;
+    }
+    return err;
 }

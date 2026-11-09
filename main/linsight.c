@@ -67,6 +67,8 @@ void app_main(void)
 #else
     can_mode_t mode = CAN_MODE_LISTEN_ONLY;
 #endif
+    can_bitrate_t bitrate = CAN_BITRATE_500K;
+    settings_load_can(&bitrate, &mode);
 
     lvgl_port_lock(0);
     linsight_ui_init();
@@ -78,7 +80,7 @@ void app_main(void)
     ESP_ERROR_CHECK(bsp_backlight_set(80));
     ESP_ERROR_CHECK(bsp_user_button_init(user_button_cb));
 
-    ESP_ERROR_CHECK(twai_capture_start(CAN_BITRATE_500K, mode));
+    ESP_ERROR_CHECK(twai_capture_start(bitrate, mode));
     ESP_ERROR_CHECK(net_start());
 
 #if CONFIG_LINSIGHT_BENCH_SELFTEST

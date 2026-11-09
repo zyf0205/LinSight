@@ -5,6 +5,7 @@
 #include "can_ring.h"
 #include "driver/twai.h"
 #include "sd_store.h"
+#include "settings.h"
 #include "esp_check.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -21,7 +22,7 @@
 #define TWAI_RX_GPIO GPIO_NUM_11
 #define TWAI_TASK_PRIO 10
 #define TWAI_TASK_STACK 4096
-#define TWAI_CORE 0
+#define TWAI_CORE 1
 #define TWAI_RX_QUEUE_LEN 200
 #define EVENT_QUEUE_LEN 8
 #define UI_HISTORY 512 /* records retained for the 20 Hz trace view (~10 KB) */
@@ -50,9 +51,9 @@ static can_state_t s_can = {
     .state = "STOPPED",
 };
 
-/* Serializes start/restart/recover: the Settings page (LVGL task) and
- * CONTROL.set_config (net_task) can otherwise stop and reinstall the driver
- * concurrently. Never take this lock from within the TWAI task itself. */
+/* Serializes start/restart/recover and bus-off alert handling. The restart
+ * path releases this lock while waiting for the TWAI task to exit, so the
+ * task's alert handler can take it and observe running == false. */
 static SemaphoreHandle_t s_restart_lock;
 
 /* Capture-side UI history: unlike the network ring, these records are never
@@ -208,12 +209,33 @@ static void handle_alerts(void)
         s_can.state = "RECOVERING";
         stats_unlock();
         push_event("bus_off");
-        twai_initiate_recovery();
     }
     if (alerts & TWAI_ALERT_BUS_RECOVERED) {
         ESP_LOGI(TAG, "bus recovered, restarting");
-        set_state("RUNNING");
-        twai_start();
+    }
+
+    /* The alert handler runs on the TWAI task, which twai_capture_restart()
+     * stops by clearing running and waiting outside this lock. Serialize the
+     * actual driver recovery with manual recover/restart. */
+    if ((alerts & (TWAI_ALERT_BUS_OFF | TWAI_ALERT_BUS_RECOVERED)) && s_restart_lock) {
+        xSemaphoreTake(s_restart_lock, portMAX_DELAY);
+        if (s_can.running) {
+            if (alerts & TWAI_ALERT_BUS_OFF) {
+                const esp_err_t err = twai_initiate_recovery();
+                if (err != ESP_OK) {
+                    ESP_LOGE(TAG, "initiate recovery: %s", esp_err_to_name(err));
+                }
+            }
+            if (alerts & TWAI_ALERT_BUS_RECOVERED) {
+                const esp_err_t err = twai_start();
+                if (err == ESP_OK) {
+                    set_state("RUNNING");
+                } else {
+                    ESP_LOGE(TAG, "bus recovery start: %s", esp_err_to_name(err));
+                }
+            }
+        }
+        xSemaphoreGive(s_restart_lock);
     }
     if (alerts & TWAI_ALERT_ERR_PASS) {
         stats_lock();
@@ -429,23 +451,36 @@ esp_err_t twai_capture_restart(can_bitrate_t bitrate, can_mode_t mode)
     esp_err_t err;
     if (!s_can.task) {
         err = twai_capture_start(bitrate, mode);
-        goto out;
+        xSemaphoreGive(s_restart_lock);
+        goto persist;
     }
 
     s_can.running = false; /* the task stops, uninstalls the driver, clears .task */
+    xSemaphoreGive(s_restart_lock);
+
+    /* Wait outside the lock: the TWAI task's alert handler needs it to see
+     * running == false and leave the driver alone while the task exits. */
     for (int i = 0; i < 20 && s_can.task; i++) {
         vTaskDelay(pdMS_TO_TICKS(50));
     }
+
+    xSemaphoreTake(s_restart_lock, portMAX_DELAY);
     if (s_can.task) {
         err = ESP_ERR_INVALID_STATE;
-        goto out;
+    } else {
+        /* paused is deliberately not touched: a bitrate/mode change is not a
+         * resume, and twai_capture_start() no longer clears it. */
+        err = twai_capture_start(bitrate, mode);
     }
-
-    /* paused is deliberately not touched: a bitrate/mode change is not a
-     * resume, and twai_capture_start() no longer clears it. */
-    err = twai_capture_start(bitrate, mode);
-out:
     xSemaphoreGive(s_restart_lock);
+
+persist:
+    if (err == ESP_OK) {
+        const esp_err_t save = settings_save_can(bitrate, mode);
+        if (save != ESP_OK) {
+            ESP_LOGW(TAG, "persist CAN config: %s", esp_err_to_name(save));
+        }
+    }
     return err;
 }
 
@@ -479,8 +514,8 @@ esp_err_t twai_capture_recover(void)
     xSemaphoreTake(s_restart_lock, portMAX_DELAY);
 
     esp_err_t err;
-    if (!s_can.task) {
-        err = ESP_ERR_INVALID_STATE;
+    if (!s_can.task || !s_can.running) {
+        err = ESP_ERR_INVALID_STATE; /* stopped or a restart is in progress */
         goto out;
     }
 
