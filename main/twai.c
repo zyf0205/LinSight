@@ -298,7 +298,6 @@ static void twai_task(void *arg)
         uint32_t permille = (uint32_t)((uint64_t)bits * 1000000000ull /
                                        ((uint64_t)bitrate_hz(s_can.bitrate) * elapsed_us));
         s_can.stats.load_permille = permille > 1000u ? 1000u : permille;
-        s_can.stats.paused = s_can.paused;
         if (status_ok) {
             s_can.stats.rx_missed = status.rx_missed_count;
             s_can.stats.tec = status.tx_error_counter;
@@ -336,8 +335,8 @@ static void twai_task(void *arg)
 
 esp_err_t twai_capture_init(void)
 {
-    /* Create each object once: a caller may reach here after a partial init
-     * (or another task may have initialized it concurrently). */
+    /* Called once during startup. Preserve any objects already created if a
+     * partial initialization is retried. */
     if (!s_can.lock) {
         s_can.lock = xSemaphoreCreateMutex();
     }

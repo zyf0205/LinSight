@@ -36,7 +36,6 @@
 #define SD_FREE_STOP_KB (16u * 1024u)
 #define SD_FREE_PRUNE_KB (64u * 1024u)
 #define SD_RETRY_MS 5000u
-#define SD_IO_RETRY_MS 10000u
 
 #define LSC_HEADER_SIZE 32u
 #define LSC_FLAG_TS_UPTIME_ONLY 0x1u
@@ -256,7 +255,6 @@ static void close_current(bool write_meta_file)
     s_dirty = false;
     status_lock();
     s_status.recording = false;
-    s_status.current[0] = '\0';
     status_unlock();
 }
 
@@ -319,8 +317,6 @@ static bool open_new(void)
     status_lock();
     s_status.recording = true;
     s_status.files = s_file_count;
-    s_status.current[0] = '\0';
-    snprintf(s_status.current, sizeof(s_status.current), "%s", s_current);
     status_unlock();
     twai_event_push("sd_record");
     ESP_LOGI(TAG, "recording %s", path);
@@ -331,9 +327,6 @@ static void io_fail(const char *what)
 {
     ESP_LOGE(TAG, "%s failed: %s", what, strerror(errno));
     close_current(true);
-    status_lock();
-    s_status.write_errors++;
-    status_unlock();
     twai_event_push("sd_io");
 
     /* The card may have been removed. Drop the stale queue and remount; the

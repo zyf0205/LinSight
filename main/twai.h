@@ -71,8 +71,10 @@ void twai_event_push(const char *type);
 /* Manual bus-off recovery (Settings "Bus Recover"). No-op while running. */
 esp_err_t twai_capture_recover(void);
 
-/* Copy the counters and drain at most one pending event. Thread-safe. */
+/* Copy the counters. Thread-safe. */
 void twai_stats_snapshot(can_stats_t *out);
+
+/* Drain at most one pending event. Thread-safe. */
 bool twai_event_pop(can_event_t *out);
 
 /* Copy the newest n captured records for the local UI (oldest first).

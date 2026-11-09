@@ -16,9 +16,7 @@ typedef struct {
     bool recording; /* writer currently appending */
     uint32_t files; /* .lsc files retained on the card */
     uint32_t dropped;
-    uint32_t write_errors;
     uint64_t free_kb;
-    char current[13]; /* "rec00001.lsc" or empty */
 } sd_status_t;
 
 esp_err_t sd_store_init(void);

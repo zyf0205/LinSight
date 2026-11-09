@@ -16,9 +16,9 @@
  * UI history and the stats snapshot; only labels whose text/color actually
  * changed are touched. The history is independent of net_task's streaming ring,
  * so an attached host draining records can never blank the trace.
- * Cross-task entry points (net_task, the GPIO button task) never touch LVGL
- * objects: they publish into small volatile mailboxes drained by the tick, so
- * they can never block on the LVGL mutex. All dynamic strings live in static
+ * Network setters publish into small volatile mailboxes drained by the tick,
+ * so net_task never blocks on the LVGL mutex. The GPIO button handler takes
+ * that mutex for its short page/pause action. All dynamic strings live in static
  * buffers and use lv_label_set_text_static, so the 20 Hz path performs no heap
  * allocation. Filter, per-ID counters and the one-shot trigger are local
  * display features; capture and streaming keep running while the local
@@ -111,7 +111,6 @@ typedef struct {
 
 /* -------------------------------------------------------------- statics */
 
-static lv_obj_t *s_screen;
 static lv_obj_t *s_pages[PAGE_CONTAINERS];
 static page_id_t s_page = PAGE_MONITOR;
 static page_id_t s_back_page = PAGE_MONITOR;
@@ -155,7 +154,6 @@ static lv_obj_t *s_bot[4];
 
 /* Settings */
 static lv_obj_t *s_br_pill[4];
-static lv_obj_t *s_mode_pill;
 static lv_obj_t *s_mode_label;
 static lv_obj_t *s_filter_pill[FILTER_COUNT];
 static lv_obj_t *s_lock_label;
@@ -215,7 +213,6 @@ static uint32_t s_prev_total;
 static volatile linsight_conn_t s_conn_req = UI_CONN_WIFI;
 static volatile uint32_t s_rtt_req;
 static volatile bool s_remote_req;
-static volatile uint32_t s_filter_req = 0xFFFFFFFFu;
 
 /* Trace scan/count state */
 static linsight_can_record_t s_scan_buf[SCAN_N];
@@ -1446,16 +1443,6 @@ static void tick_cb(lv_timer_t *timer)
         s_remote_req = false;
         s_remote_tick = lv_tick_get();
         s_remote_on = true;
-
-        if (s_filter_req != 0xFFFFFFFFu) {
-            s_lock_valid = true;
-            s_lock_id = s_filter_req;
-            s_lock_ext = s_filter_req > 0x7FFu;
-            s_filter = FILTER_LOCK;
-            refresh_filter_pills();
-            refresh_trigger_pills();
-            refresh_row_highlight();
-        }
     }
 
     can_stats_t st;
@@ -1731,9 +1718,9 @@ static void settings_create(void)
         s_br_pill[i] = pill;
     }
 
-    s_mode_pill = pill_new(card, 208, 10, 84, 32);
-    lv_obj_add_event_cb(s_mode_pill, mode_click_cb, LV_EVENT_CLICKED, NULL);
-    s_mode_label = (lv_obj_t *)lv_obj_get_child(s_mode_pill, 0);
+    lv_obj_t *mode_pill = pill_new(card, 208, 10, 84, 32);
+    lv_obj_add_event_cb(mode_pill, mode_click_cb, LV_EVENT_CLICKED, NULL);
+    s_mode_label = (lv_obj_t *)lv_obj_get_child(mode_pill, 0);
 
     /* Card 2: filter + trigger (design: Y 92..168). */
     card = card_new(page, 8, 92, 304, 76);
@@ -1841,15 +1828,15 @@ static void splash_create(void)
 
 void linsight_ui_init(void)
 {
-    s_screen = lv_scr_act();
-    lv_obj_set_style_bg_color(s_screen, COL_BG, 0);
-    lv_obj_set_style_bg_opa(s_screen, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(s_screen, 0, 0);
-    lv_obj_set_style_pad_all(s_screen, 0, 0);
-    lv_obj_clear_flag(s_screen, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *screen = lv_scr_act();
+    lv_obj_set_style_bg_color(screen, COL_BG, 0);
+    lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(screen, 0, 0);
+    lv_obj_set_style_pad_all(screen, 0, 0);
+    lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
 
     for (int i = 0; i < PAGE_CONTAINERS; i++) {
-        lv_obj_t *page = obj_new(s_screen, 0, 0, UI_W, UI_H);
+        lv_obj_t *page = obj_new(screen, 0, 0, UI_W, UI_H);
         lv_obj_set_style_bg_color(page, COL_BG, 0);
         lv_obj_set_style_bg_opa(page, LV_OPA_COVER, 0);
         /* Must be clickable to become the gesture target on blank areas, and
@@ -1870,7 +1857,7 @@ void linsight_ui_init(void)
     refresh_host();
 
     /* Screen-level toast, above both pages, over the telemetry bar. */
-    s_toast = obj_new(s_screen, 40, 212, 240, 24);
+    s_toast = obj_new(screen, 40, 212, 240, 24);
     lv_obj_set_style_bg_color(s_toast, COL_TILE, 0);
     lv_obj_set_style_bg_opa(s_toast, LV_OPA_COVER, 0);
     lv_obj_set_style_radius(s_toast, 8, 0);
@@ -1882,7 +1869,7 @@ void linsight_ui_init(void)
 
     lv_timer_create(tick_cb, 50, NULL); /* 20 Hz */
 
-    splash_create(); /* boot animation; deletes itself after ~1.45 s */
+    splash_create(); /* boot animation; deletes itself after ~1 s */
 }
 
 void linsight_ui_set_conn(linsight_conn_t state, uint32_t rtt_ms)
@@ -1902,14 +1889,9 @@ void linsight_ui_handle_key(bool long_press)
     lvgl_port_unlock();
 }
 
-void linsight_ui_sync_control(uint8_t paused, uint16_t bitrate_kbps, uint32_t filter_id)
+void linsight_ui_sync_control(void)
 {
-    /* paused / bitrate_kbps are informational here: the 20 Hz tick reads the
-     * authoritative values from twai. The call itself proves the host link is
-     * alive, which is what the REMOTE SYNC badge reports. */
-    (void)paused;
-    (void)bitrate_kbps;
-
+    /* The 20 Hz tick reads authoritative capture state from twai; this
+     * notification only requests the REMOTE SYNC badge. */
     s_remote_req = true;
-    s_filter_req = filter_id;
 }

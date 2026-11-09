@@ -26,9 +26,9 @@ void linsight_ui_set_conn(linsight_conn_t state, uint32_t rtt_ms);
  * views Overview -> Raw -> Settings -> Overview. */
 void linsight_ui_handle_key(bool long_press);
 
-/* Host CONTROL (0x07) was applied: show REMOTE SYNC and sync the filter target
- * (filter_id == 0xFFFFFFFF means "all IDs"). */
-void linsight_ui_sync_control(uint8_t paused, uint16_t bitrate_kbps, uint32_t filter_id);
+/* Host CONTROL (0x07) was applied: show REMOTE SYNC. The refresh timer reads
+ * authoritative capture state directly from twai. */
+void linsight_ui_sync_control(void);
 
 #ifdef __cplusplus
 }

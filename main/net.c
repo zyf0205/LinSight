@@ -60,7 +60,6 @@ static int tcp_connect(const char *host, uint16_t port, int timeout_ms);
 static EventGroupHandle_t s_wifi_events;
 
 static linsight_parser_t s_parser;
-static uint8_t *s_parser_buf;                     /* internal, 256 B scratch */
 static uint8_t *s_tx_buf;                         /* PSRAM, one CAN_BATCH frame */
 static linsight_can_record_t s_pop[LINSIGHT_BATCH_MAX_RECORDS]; /* internal, 16 KB */
 static uint16_t s_pending_count; /* popped but not yet fully sent; survives reconnect */
@@ -206,13 +205,13 @@ static bool parse_mode(const cJSON *item, can_mode_t *out)
     return false;
 }
 
-/* Handles one CONTROL frame. Returns false when the socket is broken. */
-static bool handle_control(int fd, const uint8_t *payload, uint16_t len)
+/* Handles one CONTROL frame and sends its ACK. */
+static void handle_control(int fd, const uint8_t *payload, uint16_t len)
 {
     char json[LINSIGHT_MAX_CONTROL + 1];
 
     if (len == 0 || len > LINSIGHT_MAX_CONTROL) {
-        return true;
+        return;
     }
     memcpy(json, payload, len);
     json[len] = '\0';
@@ -220,7 +219,7 @@ static bool handle_control(int fd, const uint8_t *payload, uint16_t len)
     cJSON *root = cJSON_Parse(json);
     if (!root) {
         ESP_LOGW(TAG, "bad CONTROL JSON");
-        return true;
+        return;
     }
 
     const cJSON *id = cJSON_GetObjectItemCaseSensitive(root, "id");
@@ -274,27 +273,9 @@ static bool handle_control(int fd, const uint8_t *payload, uint16_t len)
         }
     }
 
-    cJSON_Delete(root);
     if (err == ESP_OK) {
-        /* Host control was applied: mirror it on screen (settings nav badge). */
-        can_stats_t st;
-        twai_stats_snapshot(&st);
-        uint16_t kbps;
-        switch (twai_current_bitrate()) {
-        case CAN_BITRATE_125K:
-            kbps = 125;
-            break;
-        case CAN_BITRATE_250K:
-            kbps = 250;
-            break;
-        case CAN_BITRATE_1M:
-            kbps = 1000;
-            break;
-        default:
-            kbps = 500;
-            break;
-        }
-        linsight_ui_sync_control(st.paused ? 1 : 0, kbps, 0xFFFFFFFFu);
+        /* Host control was applied: show the settings nav badge. */
+        linsight_ui_sync_control();
     }
     const uint8_t ack_code =
         err == ESP_OK ? LINSIGHT_ACK_OK
@@ -303,7 +284,7 @@ static bool handle_control(int fd, const uint8_t *payload, uint16_t len)
     send_ack(fd, ctrl_id, ack_code);
     ESP_LOGI(TAG, "CONTROL id=%u action=%s -> %s", (unsigned)ctrl_id, act,
              esp_err_to_name(err));
-    return true;
+    cJSON_Delete(root);
 }
 
 /* --------------------------------------------------------------- session */
@@ -730,8 +711,7 @@ static esp_err_t buffers_init(void)
     /* Parser scratch covers CONTROL (the largest frame we actually read);
      * anything bigger is skipped by the parser by design. */
     static uint8_t parser_scratch[PARSER_BUF_SIZE];
-    s_parser_buf = parser_scratch;
-    linsight_parser_init(&s_parser, s_parser_buf, PARSER_BUF_SIZE);
+    linsight_parser_init(&s_parser, parser_scratch, PARSER_BUF_SIZE);
 
     s_tx_buf = heap_caps_malloc(LINSIGHT_MAX_CAN_BATCH, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!s_tx_buf) {
