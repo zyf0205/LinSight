@@ -1781,6 +1781,62 @@ static void settings_create(void)
     lv_obj_add_event_cb(recover, recover_click_cb, LV_EVENT_CLICKED, NULL);
 }
 
+/* ---------------------------------------------------------------- splash */
+
+static void splash_opa_cb(void *var, int32_t value)
+{
+    lv_obj_set_style_opa((lv_obj_t *)var, (lv_opa_t)value, 0);
+}
+
+static void splash_ready_cb(lv_anim_t *a)
+{
+    lv_obj_del((lv_obj_t *)a->var);
+}
+
+/* Boot splash on the top layer: brand fades in, holds, then fades out and
+ * deletes itself. It is clickable, so stray touches are absorbed until gone. */
+static void splash_create(void)
+{
+    lv_obj_t *splash = obj_new(lv_layer_top(), 0, 0, UI_W, UI_H);
+    lv_obj_set_style_bg_color(splash, COL_BG, 0);
+    lv_obj_set_style_bg_opa(splash, LV_OPA_COVER, 0);
+    lv_obj_add_flag(splash, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t *content = obj_new(splash, 40, 84, 240, 88);
+    lv_obj_set_style_opa(content, LV_OPA_TRANSP, 0);
+
+    lv_obj_t *brand = label_new(content, "LinSight", &lv_font_montserrat_24, COL_TEXT);
+    lv_obj_align(brand, LV_ALIGN_TOP_MID, 0, 0);
+
+    /* Blue accent bar, SF-symbol style. */
+    lv_obj_t *bar = obj_new(content, 100, 34, 40, 3);
+    lv_obj_set_style_bg_color(bar, COL_BLUE, 0);
+    lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(bar, 2, 0);
+
+    lv_obj_t *sub = label_new(content, "CAN ANALYZER", &lv_font_montserrat_12, COL_DIM);
+    lv_obj_align(sub, LV_ALIGN_TOP_MID, 0, 48);
+
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, content);
+    lv_anim_set_exec_cb(&a, splash_opa_cb);
+    lv_anim_set_values(&a, LV_OPA_TRANSP, LV_OPA_COVER);
+    lv_anim_set_time(&a, 450);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+    lv_anim_start(&a);
+
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, splash);
+    lv_anim_set_exec_cb(&a, splash_opa_cb);
+    lv_anim_set_values(&a, LV_OPA_COVER, LV_OPA_TRANSP);
+    lv_anim_set_delay(&a, 1200);
+    lv_anim_set_time(&a, 250);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_in);
+    lv_anim_set_ready_cb(&a, splash_ready_cb);
+    lv_anim_start(&a);
+}
+
 /* --------------------------------------------------------------- public */
 
 void linsight_ui_init(void)
@@ -1825,6 +1881,8 @@ void linsight_ui_init(void)
     object_show(s_toast, false);
 
     lv_timer_create(tick_cb, 50, NULL); /* 20 Hz */
+
+    splash_create(); /* boot animation; deletes itself after ~1.45 s */
 }
 
 void linsight_ui_set_conn(linsight_conn_t state, uint32_t rtt_ms)
