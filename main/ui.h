@@ -22,8 +22,9 @@ void linsight_ui_init(void);
  * drains; they are non-blocking and safe from any task (net_task, GPIO). */
 void linsight_ui_set_conn(linsight_conn_t state, uint32_t rtt_ms);
 
-/* GPIO0 user key: short press toggles display pause, long press cycles the
- * views Overview -> Raw -> Settings -> Overview. */
+/* GPIO0 user key: short press cycles DASH -> TRACE -> DIAG; long press opens
+ * Settings (any press there returns to the previous view). When the backlight
+ * is off, the first press only wakes the display. */
 void linsight_ui_handle_key(bool long_press);
 
 /* Host CONTROL (0x07) was applied: show REMOTE SYNC. The refresh timer reads

@@ -1,11 +1,13 @@
 #include "sd_store.h"
 
+#include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 
 #include "device_info.h"
@@ -62,6 +64,7 @@ static uint32_t s_file_index;
 static uint32_t s_file_bytes;
 static uint32_t s_file_start_ms;
 static uint32_t s_last_sync_ms;
+static uint32_t s_open_retry_ms; /* backoff after open_new() fails (card full/IO) */
 static int s_fd = -1;
 static char s_current[13]; /* "rec00001.lsc" */
 static bool s_dirty;
@@ -129,6 +132,35 @@ static void build_header(uint8_t out[LSC_HEADER_SIZE])
     linsight_put_u32(out + 24, s_boot);
 }
 
+/* FATFS with LFN disabled reports 8.3 names; depending on the volume's NT case
+ * flags readdir() may return them upper-case. Parse "recNNNNN.lsc" with any
+ * case so the retained-file scan and pruning work on real cards. */
+static bool parse_rec_name(const char *name, uint32_t *index)
+{
+    if (!name || strlen(name) != 12) {
+        return false;
+    }
+    if (tolower((unsigned char)name[0]) != 'r' ||
+        tolower((unsigned char)name[1]) != 'e' ||
+        tolower((unsigned char)name[2]) != 'c' || name[8] != '.' ||
+        tolower((unsigned char)name[9]) != 'l' ||
+        tolower((unsigned char)name[10]) != 's' ||
+        tolower((unsigned char)name[11]) != 'c') {
+        return false;
+    }
+    uint32_t value = 0;
+    for (int i = 3; i < 8; i++) {
+        if (name[i] < '0' || name[i] > '9') {
+            return false;
+        }
+        value = value * 10u + (uint32_t)(name[i] - '0');
+    }
+    if (index) {
+        *index = value;
+    }
+    return true;
+}
+
 /* Scan the card for retained .lsc files and pick the next free number. */
 static void scan_files(void)
 {
@@ -138,8 +170,8 @@ static void scan_files(void)
     if (d) {
         struct dirent *e;
         while ((e = readdir(d)) != NULL) {
-            unsigned idx = 0;
-            if (sscanf(e->d_name, "rec%5u.lsc", &idx) == 1) {
+            uint32_t idx = 0;
+            if (parse_rec_name(e->d_name, &idx)) {
                 count++;
                 if (idx > max_index) {
                     max_index = idx;
@@ -209,11 +241,11 @@ static bool prune_oldest(void)
     uint32_t oldest = 0;
     struct dirent *e;
     while ((e = readdir(d)) != NULL) {
-        unsigned idx = 0;
-        if (sscanf(e->d_name, "rec%5u.lsc", &idx) != 1) {
+        uint32_t idx = 0;
+        if (!parse_rec_name(e->d_name, &idx)) {
             continue;
         }
-        if (strcmp(e->d_name, s_current) == 0) {
+        if (strcasecmp(e->d_name, s_current) == 0) {
             continue;
         }
         if (oldest == 0 || idx < oldest) {
@@ -383,8 +415,17 @@ static void write_batch(const linsight_can_record_t *recs, uint32_t n, uint32_t 
     if (!s_mounted || n == 0) {
         return;
     }
-    if (s_fd < 0 && !open_new()) {
-        return;
+    if (s_fd < 0) {
+        /* A full card or a failing open must not be retried for every batch:
+         * that would spam sd_full events and the log at the capture rate. */
+        if (s_open_retry_ms != 0 && (int32_t)(now - s_open_retry_ms) < 0) {
+            return;
+        }
+        if (!open_new()) {
+            s_open_retry_ms = now + SD_RETRY_MS;
+            return;
+        }
+        s_open_retry_ms = 0;
     }
     if (s_file_bytes + n * LINSIGHT_REC_SIZE > SD_FILE_MAX_BYTES ||
         (s_file_start_ms != 0 && now - s_file_start_ms >= SD_FILE_MAX_MS)) {
@@ -392,6 +433,7 @@ static void write_batch(const linsight_can_record_t *recs, uint32_t n, uint32_t 
             close_current(true);
             twai_event_push("sd_rotate");
             if (!open_new()) {
+                s_open_retry_ms = now + SD_RETRY_MS;
                 return;
             }
         }
@@ -472,6 +514,7 @@ static bool mount_card(void)
 
     s_card = card;
     s_mounted = true;
+    s_open_retry_ms = 0;
     scan_files();
     write_readme();
     status_lock();
@@ -491,6 +534,7 @@ static void sd_task(void *arg)
     linsight_can_record_t batch[SD_WRITE_BATCH];
     uint32_t last_mount = 0;
     uint32_t last_mount_log = 0;
+    uint32_t last_free = 0;
 
     for (;;) {
         const uint32_t now = now_ms();
@@ -526,9 +570,15 @@ static void sd_task(void *arg)
             }
         }
 
-        status_lock();
-        s_status.free_kb = free_kb();
-        status_unlock();
+        /* esp_vfs_fat_info() walks the FAT; the UI/host only need a coarse
+         * value, so refresh it every couple of seconds instead of each loop. */
+        const uint32_t t = now_ms();
+        if (t - last_free >= 2000u) {
+            last_free = t;
+            status_lock();
+            s_status.free_kb = free_kb();
+            status_unlock();
+        }
     }
 }
 

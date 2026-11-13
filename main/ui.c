@@ -129,6 +129,7 @@ static uint32_t s_prev_total = 0;
 /* Mailbox from net_task */
 static volatile linsight_conn_t s_conn_req = UI_CONN_WIFI;
 static volatile uint32_t s_rtt_req = 0;
+static volatile bool s_remote_req = false;
 
 /* Capture history scanning & ranking */
 static linsight_can_record_t s_scan_buf[SCAN_N];
@@ -777,7 +778,10 @@ static void render_settings(const can_stats_t *st)
     }
 
     const can_mode_t mode = twai_current_mode();
-    LBL_SET(s_mode_label, s_txt_mode, mode == CAN_MODE_NORMAL ? "Normal (ACK)" : "Listen-Only");
+    LBL_SET(s_mode_label, s_txt_mode,
+            mode == CAN_MODE_NORMAL ? "Normal (ACK)"
+            : mode == CAN_MODE_SELFTEST ? "Self-test"
+                                        : "Listen-Only");
     lv_obj_set_style_bg_color(s_mode_pill, mode == CAN_MODE_NORMAL ? COL_AMBER : COL_GREEN, 0);
 
     const bool paused = s_frozen || st->paused;
@@ -843,6 +847,10 @@ static void tick_cb(lv_timer_t *timer)
     if (s_conn != s_conn_req || (s_conn == UI_CONN_ONLINE && s_rtt_ms != s_rtt_req)) {
         s_conn = s_conn_req;
         s_rtt_ms = s_rtt_req;
+    }
+    if (s_remote_req) {
+        s_remote_req = false;
+        toast_showf("REMOTE SYNC");
     }
 
     can_stats_t st;
@@ -1210,4 +1218,7 @@ void linsight_ui_handle_key(bool long_press)
 
 void linsight_ui_sync_control(void)
 {
+    /* Called from net_task: only raise a flag; the 20 Hz LVGL timer shows the
+     * toast, so no LVGL call ever happens on the network task. */
+    s_remote_req = true;
 }

@@ -103,5 +103,5 @@ void app_main(void)
     ESP_LOGI(TAG, "selftest burst queued: %u", (unsigned)sent);
 #endif
 
-    ESP_LOGI(TAG, "LinSight CAN ready (key: short=pause, long=cycle views)");
+    ESP_LOGI(TAG, "LinSight CAN ready (key: short=cycle views, long=settings)");
 }
