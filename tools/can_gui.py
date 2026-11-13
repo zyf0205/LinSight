@@ -175,6 +175,7 @@ class CanBenchApp:
         self._mon_total = 0
         self._prev_stats = None
         self._last_usb_state = None
+        self._last_busid = None
         self._last_can_present = False
         self._can_fail_count = 0
 
@@ -547,16 +548,23 @@ class CanBenchApp:
 
     def _can_stats(self):
         iface = self.iface_var.get().strip() or "can0"
-        try:
-            result = self._wsl_root(f"ip -j -d -s link show {iface}", 15)
-        except Exception:
-            return None
-        if result.returncode != 0 or not result.stdout.strip():
-            return None
-        try:
-            data = json.loads(result.stdout)[0]
-        except Exception:
-            return None
+        for attempt in (1, 2):
+            try:
+                result = self._wsl_root(f"ip -j -d -s link show {iface}", 15)
+            except Exception:
+                result = None
+            if result is not None and result.returncode == 0 \
+                    and result.stdout.strip():
+                try:
+                    return self._parse_can_stats(json.loads(result.stdout)[0])
+                except Exception:
+                    pass
+            if attempt == 1:
+                time.sleep(0.25)  # WSL 单次抖动，快速重试一次
+        return None
+
+    @staticmethod
+    def _parse_can_stats(data):
         info = (data.get("linkinfo") or {}).get("info_data") or {}
         timings = info.get("bittiming") or {}
         xstats = (data.get("linkinfo") or {}).get("info_xstats") or {}
@@ -578,10 +586,12 @@ class CanBenchApp:
 
     def _apply_usb_state(self, dev):
         state = dev["state"] if dev else None
-        if state != self._last_usb_state:
+        busid = dev["busid"] if dev else None
+        if state != self._last_usb_state or busid != self._last_busid:
             if dev:
                 self.log("info", f"USB 状态：{dev['name']} {dev['busid']} → {state}")
             self._last_usb_state = state
+            self._last_busid = busid
         if not dev:
             self._set_chip(self.chip_usb, "USB · 未检测到 PCAN", "bad")
             self._set_chip(self.chip_wsl, "WSL · 未连接", "idle")
@@ -603,8 +613,10 @@ class CanBenchApp:
             self._last_can_present = present
             if present:
                 self.log("ok", f"检测到 {iface}，接口已就绪")
-            else:
-                self.log("info", f"未检测到 {iface}")
+            elif self._last_usb_state == "Attached":
+                self.log("warn", f"{iface} 消失：USB 设备可能被重插，"
+                                 "或 WSL 探测连续失败")
+            # 设备本来未挂载时不再重复提示，状态灯已显示
         if not stats:
             self._set_chip(self.chip_can, "CAN · 未连接", "idle")
             self.tx_total_var.set("TX 0")
@@ -814,22 +826,27 @@ class CanBenchApp:
         if not 1000 <= bitrate <= 1000000:
             raise RuntimeError("比特率超出 1k–1M 范围")
         iface = self.iface_var.get().strip() or "can0"
-        # attach 后 can0 可能晚几百毫秒出现，先等接口节点就绪（最多 10 s）
-        script = (
+        # attach 后 can0 可能晚几百毫秒出现，先单独等接口节点就绪（最多 10 s）
+        self._wsl_root(
             f"for i in $(seq 1 50); do [ -e /sys/class/net/{iface} ] && break; "
-            "sleep 0.2; done; "
+            "sleep 0.2; done", 15)
+        script = (
             f"ip link set {iface} down 2>/dev/null; "
             f"ip link set {iface} type can bitrate {bitrate} restart-ms 100 && "
             f"ip link set {iface} txqueuelen 1000 && "
             f"ip link set {iface} up"
         )
-        result = self._wsl_root(script, 25)
-        if result.returncode != 0:
-            # WSL 启动/切换瞬间偶发一次空输出失败，配置幂等，重试一次
-            time.sleep(0.8)
-            result = self._wsl_root(script, 25)
-        if result.returncode != 0:
-            detail = output_of(result) or f"exit={result.returncode}"
+        result = None
+        for attempt in (1, 2, 3):
+            result = self._wsl_root(script, 20)
+            if result.returncode == 0:
+                break
+            if attempt < 3:
+                # WSL 状态切换瞬间可能空输出失败，配置幂等，短暂重试
+                time.sleep(0.6 * attempt)
+        if result is None or result.returncode != 0:
+            detail = (output_of(result) if result else "") or \
+                f"exit={result.returncode if result else '?'}"
             raise RuntimeError(
                 f"配置 {iface} 失败：{detail}（先确认已连接并出现 can0）")
         self.log("ok", f"{iface} 已启动 @ {bitrate} bps")
