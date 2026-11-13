@@ -12,15 +12,15 @@ Bench Wi-Fi credentials and the host IP are Kconfig defaults (`CONFIG_LINSIGHT_*
 
 ## Source of truth
 
-- `docs/project_plan.md` — scope, protocol v2.1, milestones, design decisions
 - `docs/hardware.md` — verified pinout, CAN wiring, LCD/touch init, sdkconfig gotchas
-- `docs/ui_design.md` — UI tokens, Overview/Raw/Settings layout, input/refresh contract (API in `main/ui.h`)
 - `protocol/frame.h` — wire format, limits, parser contract (shared with the host repo; keep both copies identical)
+- `main/ui.h` — UI API and the Overview/Raw/Settings contract consumed by `ui.c`
+- `~/linsight/host/README.md` — host daemon, CLI, report/export and bench reference
 - `tools/can_probe/` — standalone TWAI bench probe used for M0 wiring validation
 
 ## Documentation rules
 
-- **All project docs live in `docs/`.** The only markdown at the repo root is `CLAUDE.md`.
+- **Firmware docs live in `docs/`; host docs live in the WSL repo (`host/README.md`, `docs/hardware.md`).** The only markdown at this repo root is `CLAUDE.md`.
 - **Do not create new documents without explicit permission.** Update an existing file instead.
 - Keep docs short and scannable: tables and bullets over prose; target ≤120 lines per doc.
 - Do not duplicate content across docs; link to the source of truth instead.
@@ -47,9 +47,9 @@ idf.py menuconfig                  # LinSight → CAN mode, Wi-Fi SSID/password,
 
 - **Firmware tasks**: `twai_task` (core 1, prio 10) receives frames, timestamps (ms), pushes 20-byte records into the PSRAM ring (4 MiB, ~209k records, drop-oldest), mirrors the newest 512 into a capture-side UI history, fan-outs to the SD queue, and maintains counters; `net_task` (core 0, prio 5) owns Wi-Fi/TCP, streams CAN_BATCH frames, sends STATS at 1 Hz / DEVICE_INFO every 5 s / EVENTS / PING, parses CONTROL/FLOW/PING from the host; `sd_task` (core 1, prio 3) drains the 16k PSRAM queue and writes `recNNNNN.lsc`; the LVGL task pulls `twai_ui_tail` + stats at 20 Hz (the history is independent of the ring that `net_task` drains). Verified: 30000-frame boot burst at 4330 fps / 96% load, zero loss (30k < ~209k capacity, so overflow policy is covered by the host repo's `test_ring`).
 - **Ring** (`can_ring.c`): mutex-protected SPSC-style; overwrite-oldest on overflow with a visible drop counter; sequence numbers expose gaps.
-- **SD black box** (`sd_store.c`): independent PSRAM queue (16k, 4k internal fallback), never blocks `twai_task`; 1-bit SDMMC CLK/CMD/D0 = 47/48/21; FAT32/8.3 `recNNNNN.lsc` with the shared 32-byte header, 32 MiB or 10 min rotation, keep 8 files, `.met`/`.trg` sidecars. Code compiles; bench validation (mount, power loss, rotation) still pending.
+- **SD black box** (`sd_store.c`): independent PSRAM queue (16k, 4k internal fallback), never blocks `twai_task`; 1-bit SDMMC CLK/CMD/D0 = 47/48/21; FAT32/8.3 `recNNNNN.lsc` with the shared 32-byte header, 32 MiB or 10 min rotation, keep 8 files, `.met`/`.trg` sidecars. A `README.TXT` written at mount explains that `.lsc` is binary and points at the host commands (`linsight-cli report`, `export csv`). Code compiles; bench validation (mount, power loss, rotation) still pending.
 - **Shared protocol**: `protocol/frame.c` is pure C (no IDF, no malloc); the WSL host repo compiles a mirror of the same parser. 5-byte header `AA 55 type len_lo len_hi`; types 01 HELLO, 02 CAN_BATCH, 03 STATS, 04 EVENT, 05/06 PING/PONG, 07 CONTROL, 08 ACK, 09 FLOW, 10 DEVICE_INFO; record `seq u16 | ts_ms u32 | id u32 | flags u8 | dlc u8 | data[8]`; STATS/CONTROL payloads are small JSON; HELLO carries `device_id`/`boot`/`uptime_ms`; pause accepts a 5 s–30 min `lease_ms`.
-- **UI** (`ui.c`): Monitor page has two views — the default Overview (4 health counters + 6 large top-ID rows ranked by the tumbling 1 s rate, activity bars, tap-to-lock) and the secondary Raw view (8×21 px zebra trace with per-ID CNT); both share the status bar and the 20 Hz telemetry bar whose fourth tile shows OVF or `REC nF`/`SD READY`/`SD ERROR`/`NO SD`. Settings holds bitrate/mode, Std/Ext/locked-ID filter, one-shot error/locked-ID trigger, pause/clear/bus recover and a right-aligned status label. Overview ignores the filter; the filter applies to Raw only. GPIO0 short = display pause, long = cycle Overview → Raw → Settings → Overview; tap a row in either view to lock its ID. The filter/lock trigger jumps to Raw, the error trigger to Overview. Host CONTROL mirrors into the settings nav (REMOTE SYNC); net_task setters publish into a lock-free mailbox that the 20 Hz LVGL timer drains, while the GPIO0 handler takes the LVGL lock for its short action.
+- **UI** (`ui.c`): two pages, three views. Monitor defaults to Overview (4 health counters + 6 large top-ID rows ranked by the tumbling 1 s rate with activity bars) and switches to Raw (8×21 px zebra trace with per-ID CNT); both share the status bar and the 20 Hz telemetry bar whose fourth tile shows OVF or `REC nF`/`SD READY`/`SD ERROR`/`NO SD`. Settings holds bitrate/mode, pause, clear, bus recover and a right-aligned status label. GPIO0 short = display pause, long = cycle Overview → Raw → Settings → Overview. Host CONTROL mirrors into the settings nav (REMOTE SYNC); net_task setters publish into a lock-free mailbox that the 20 Hz LVGL timer drains, while the GPIO0 handler takes the LVGL lock for its short action.
 
 ## Hard constraints
 

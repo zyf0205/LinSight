@@ -158,6 +158,37 @@ static void scan_files(void)
     status_unlock();
 }
 
+/* Drop a plain-text guide on the card so a PC user immediately understands
+ * that the .lsc files are binary and how to convert them. */
+static void write_readme(void)
+{
+    static const char text[] =
+        "LinSight SD black box\r\n"
+        "\r\n"
+        "recNNNNN.lsc  binary CAN log (32-byte header + 20-byte records)\r\n"
+        "recNNNNN.met  JSON metadata (device, bitrate, mode, boot)\r\n"
+        "recNNNNN.trg  trigger/mark sidecar\r\n"
+        "\r\n"
+        "The .lsc files are binary, not text. On the PC (WSL host repo):\r\n"
+        "  linsight-cli report rec00001.lsc -o report.html\r\n"
+        "  linsight-cli export csv rec00001.lsc -o rec00001.csv\r\n"
+        "  linsight-cli export candump rec00001.lsc -o rec00001.log\r\n"
+        "  linsight-cli verify rec00001.lsc\r\n"
+        "Copy the file out of the card first; the card itself is FAT32.\r\n";
+    const char *path = SD_MOUNT_POINT "/README.TXT";
+    const int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0666);
+    if (fd < 0) {
+        return; /* already there (or the card is read-only) */
+    }
+    if (!write_all(fd, text, sizeof(text) - 1u)) {
+        close(fd);
+        unlink(path);
+        return;
+    }
+    fsync(fd);
+    close(fd);
+}
+
 static uint64_t free_kb(void)
 {
     uint64_t total = 0;
@@ -442,6 +473,7 @@ static bool mount_card(void)
     s_card = card;
     s_mounted = true;
     scan_files();
+    write_readme();
     status_lock();
     s_status.present = true;
     s_status.mounted = true;
