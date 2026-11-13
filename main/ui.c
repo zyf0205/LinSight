@@ -62,8 +62,8 @@ typedef struct {
 } id_count_t;
 
 typedef struct {
-    lv_obj_t *id, *rate, *per, *cnt, *bar, *share;
-    char txt_id[12], txt_rate[10], txt_per[8], txt_cnt[10], txt_share[6];
+    lv_obj_t *id, *rate, *per, *cnt, *bar_track, *bar, *share;
+    char txt_id[12], txt_rate[10], txt_per[8], txt_cnt[12], txt_share[6];
 } dash_row_t;
 
 typedef struct {
@@ -82,7 +82,7 @@ static lv_obj_t *s_nav_tab_btn[3], *s_nav_tab_label[3], *s_nav_settings_title;
 static lv_obj_t *s_nav_host_dot, *s_nav_host_label, *s_nav_sd_dot, *s_nav_sd_label;
 
 /* DASH View */
-static lv_obj_t *s_dash_fps_num, *s_dash_load_text, *s_dash_load_bar;
+static lv_obj_t *s_dash_fps_num, *s_dash_fps_unit, *s_dash_load_text, *s_dash_load_bar;
 static lv_obj_t *s_dash_health_pill, *s_dash_health_label, *s_dash_empty;
 static dash_row_t s_dash_row[TOP_N];
 
@@ -104,7 +104,7 @@ static lv_obj_t *s_bot_rx_label, *s_bot_load_label, *s_bot_sd_label;
 static lv_obj_t *s_bot_state_pill, *s_bot_state_label;
 
 /* Frame Detail Inspector Modal */
-static lv_obj_t *s_modal_mask, *s_modal_id_label, *s_modal_sub_label;
+static lv_obj_t *s_modal_mask, *s_modal_id_label, *s_modal_sub_label, *s_modal_sub2_label;
 static lv_obj_t *s_modal_byte_val[8], *s_modal_ascii_label;
 
 /* Toast Feedback */
@@ -112,11 +112,12 @@ static lv_obj_t *s_toast;
 static uint32_t s_toast_tick;
 
 /* Static text buffers */
-static char s_txt_nav_br[12], s_txt_nav_sd[12], s_txt_nav_host[16];
-static char s_txt_dash_fps[10], s_txt_dash_load[12], s_txt_dash_health[16];
-static char s_txt_diag_val[6][16], s_txt_mode[16], s_txt_set_pause[16];
+static char s_txt_nav_br[16], s_txt_nav_sd[12], s_txt_nav_host[16];
+static char s_txt_dash_fps[12], s_txt_dash_load[16], s_txt_dash_health[20];
+static char s_txt_diag_val[6][16], s_txt_mode[20], s_txt_set_pause[20];
 static char s_txt_bot_rx[16], s_txt_bot_load[16], s_txt_bot_sd[16], s_txt_bot_state[12];
-static char s_txt_modal_id[28], s_txt_modal_sub[48], s_txt_modal_byte[8][4], s_txt_modal_ascii[32];
+static char s_txt_modal_id[32], s_txt_modal_sub[48], s_txt_modal_sub2[48];
+static char s_txt_modal_byte[8][4], s_txt_modal_ascii[32];
 static char s_txt_toast[40];
 
 /* Runtime UI states */
@@ -275,10 +276,18 @@ static lv_obj_t *bar_new(lv_obj_t *screen, lv_coord_t y, lv_coord_t h)
 
 static lv_obj_t *empty_hint_create(lv_obj_t *page, lv_coord_t y, lv_coord_t h, const char *msg)
 {
-    lv_obj_t *box = obj_new(page, 4, y, 312, h);
-    lv_obj_t *l = label_new_centered(box, msg, &lv_font_montserrat_14, COL_DIM);
-    lv_obj_set_width(l, 280);
+    lv_obj_t *box = card_new(page, 16, y + 8, 288, h - 16);
+    lv_obj_set_style_bg_color(box, lv_color_hex(0x181B22), 0);
+    lv_obj_set_style_border_color(box, COL_CARD_BORDER, 0);
+    lv_obj_set_style_radius(box, 6, 0);
+
+    lv_obj_t *icon = label_new(box, LV_SYMBOL_REFRESH, &lv_font_montserrat_16, COL_CYAN);
+    lv_obj_align(icon, LV_ALIGN_TOP_MID, 0, 14);
+
+    lv_obj_t *l = label_new(box, msg, &lv_font_montserrat_12, COL_MUTED);
+    lv_obj_set_width(l, 260);
     lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(l, LV_ALIGN_BOTTOM_MID, 0, -14);
     return box;
 }
 
@@ -390,6 +399,7 @@ static void dash_clear_row(int i)
     LBL_SET(r->per, r->txt_per, "");
     LBL_SET(r->cnt, r->txt_cnt, "");
     LBL_SET(r->share, r->txt_share, "");
+    object_show(r->bar_track, false);
     object_show(r->bar, false);
 }
 
@@ -458,8 +468,10 @@ static void modal_show_slot(const id_count_t *slot)
     if (slot->rate > 0) snprintf(per, sizeof(per), "%u ms", (unsigned)(1000u / slot->rate));
     else snprintf(per, sizeof(per), "---");
 
-    LBL_SETF(s_modal_sub_label, s_txt_modal_sub, "Rate: %u Hz | Per: %s | Hits: %u | DLC: %u",
-             (unsigned)slot->rate, per, (unsigned)slot->count, (unsigned)slot->dlc);
+    LBL_SETF(s_modal_sub_label, s_txt_modal_sub, "Rate: %u Hz  |  Period: %s",
+             (unsigned)slot->rate, per);
+    LBL_SETF(s_modal_sub2_label, s_txt_modal_sub2, "Count: %u hits  |  DLC: %u Bytes",
+             (unsigned)slot->count, (unsigned)slot->dlc);
     modal_update_bytes(slot->data, slot->dlc);
 }
 
@@ -470,7 +482,8 @@ static void modal_show_record(const linsight_can_record_t *r)
     if (r->flags & LINSIGHT_REC_FLAG_ERR) {
         LBL_SET(s_modal_id_label, s_txt_modal_id, "ERR-FRM (Error Frame)");
         label_color(s_modal_id_label, COL_RED);
-        LBL_SET(s_modal_sub_label, s_txt_modal_sub, "Bus physical/protocol disturbance");
+        LBL_SET(s_modal_sub_label, s_txt_modal_sub, "Bus disturbance / Protocol violation");
+        LBL_SET(s_modal_sub2_label, s_txt_modal_sub2, "Check bus wiring & CAN termination");
         for (size_t i = 0; i < 8; i++) {
             LBL_SET(s_modal_byte_val[i], s_txt_modal_byte[i], "--");
             label_color(s_modal_byte_val[i], COL_DIM);
@@ -482,8 +495,10 @@ static void modal_show_record(const linsight_can_record_t *r)
         fmt_id(idbuf, sizeof(idbuf), r->id, ext);
         LBL_SETF(s_modal_id_label, s_txt_modal_id, "ID: 0x%s (%s)", idbuf, ext ? "EXT" : "STD");
         label_color(s_modal_id_label, ext ? COL_PURPLE : COL_CYAN);
-        LBL_SETF(s_modal_sub_label, s_txt_modal_sub, "DLC: %u Bytes | Hits: %u | Seq: %u",
-                 (unsigned)r->dlc, (unsigned)count_get(r->id, ext), (unsigned)r->seq);
+        LBL_SETF(s_modal_sub_label, s_txt_modal_sub, "DLC: %u Bytes  |  Total: %u hits",
+                 (unsigned)r->dlc, (unsigned)count_get(r->id, ext));
+        LBL_SETF(s_modal_sub2_label, s_txt_modal_sub2, "Seq: #%u  |  Timestamp: %u ms",
+                 (unsigned)r->seq, (unsigned)r->ts_ms);
         modal_update_bytes(r->data, r->dlc);
     }
 }
@@ -509,7 +524,7 @@ static void nav_tab_update(void)
     for (int i = 0; i < 3; i++) {
         const bool active = (s_current_view == (view_id_t)i);
         lv_obj_set_style_bg_color(s_nav_tab_btn[i], active ? COL_ACTIVE_TAB : COL_NAV_BAR, 0);
-        label_color(s_nav_tab_label[i], active ? COL_TEXT : COL_MUTED);
+        label_color(s_nav_tab_label[i], active ? COL_CYAN : COL_MUTED);
     }
 }
 
@@ -559,6 +574,7 @@ static void brightness_click_cb(lv_event_t *e)
     toast_showf("BRIGHTNESS %d%%", BRIGHTNESS_LEVELS[idx]);
     for (int i = 0; i < 4; i++) {
         lv_obj_set_style_bg_color(s_bl_pill[i], i == idx ? COL_GREEN : COL_ACTIVE_BTN, 0);
+        label_color((lv_obj_t *)lv_obj_get_child(s_bl_pill[i], 0), i == idx ? COL_BG : COL_TEXT);
     }
 }
 
@@ -617,6 +633,8 @@ static void scan_records(void)
 static void render_dash(const can_stats_t *st)
 {
     LBL_SETF(s_dash_fps_num, s_txt_dash_fps, "%u", (unsigned)st->fps);
+    lv_obj_update_layout(s_dash_fps_num);
+    lv_obj_align_to(s_dash_fps_unit, s_dash_fps_num, LV_ALIGN_OUT_RIGHT_BOTTOM, 4, -2);
 
     const uint32_t load_pct = st->load_permille / 10u;
     LBL_SETF(s_dash_load_text, s_txt_dash_load, "LOAD %u%%", (unsigned)load_pct);
@@ -635,10 +653,10 @@ static void render_dash(const can_stats_t *st)
         h_bg = COL_RED; h_txt = COL_TEXT;
     } else if (is_passive) {
         LBL_SET(s_dash_health_label, s_txt_dash_health, "PASSIVE");
-        h_bg = COL_AMBER; h_txt = COL_TEXT;
+        h_bg = COL_AMBER; h_txt = COL_BG;
     } else if (has_errors) {
         LBL_SETF(s_dash_health_label, s_txt_dash_health, "BERR %u", (unsigned)st->bus_errors);
-        h_bg = COL_AMBER; h_txt = COL_TEXT;
+        h_bg = COL_AMBER; h_txt = COL_BG;
     } else {
         LBL_SET(s_dash_health_label, s_txt_dash_health, LV_SYMBOL_OK " NORMAL");
     }
@@ -668,13 +686,14 @@ static void render_dash(const can_stats_t *st)
             else LBL_SETF(r->per, r->txt_per, "%ums", (unsigned)(1000u / slot->rate));
         }
 
-        char cnt[10];
+        char cnt[12];
         fmt_count(cnt, sizeof(cnt), slot->count);
         LBL_SET(r->cnt, r->txt_cnt, cnt);
 
         const uint32_t bar_w = (slot->rate * 40u) / top_max;
-        lv_obj_set_width(r->bar, (lv_coord_t)(bar_w < 3 ? 3 : bar_w));
+        lv_obj_set_width(r->bar, (lv_coord_t)(bar_w < 2 ? 2 : bar_w));
         lv_obj_set_style_bg_color(r->bar, slot->ext ? COL_PURPLE : COL_CYAN, 0);
+        object_show(r->bar_track, true);
         object_show(r->bar, true);
 
         const uint32_t pct = (st->fps > 0) ? (slot->rate * 100u / st->fps) : 0;
@@ -715,28 +734,34 @@ static void render_trace(void)
         if (err) {
             LBL_SET(r->id, r->txt_id, "ERR-FRM");
             label_color(r->id, COL_RED);
+            LBL_SET(r->dlc, r->txt_dlc, "-");
+            label_color(r->dlc, COL_DIM);
+            LBL_SET(r->data, r->txt_data, "** BUS ERROR **");
+            label_color(r->data, COL_RED);
         } else {
             char idbuf[12];
             fmt_id(idbuf, sizeof(idbuf), rec->id, ext);
             LBL_SET(r->id, r->txt_id, idbuf);
             label_color(r->id, ext ? COL_PURPLE : COL_CYAN);
-        }
 
-        if (rtr) {
-            LBL_SET(r->dlc, r->txt_dlc, "R");
-            LBL_SET(r->data, r->txt_data, "REMOTE REQUEST");
-            label_color(r->data, COL_AMBER);
-        } else {
-            LBL_SETF(r->dlc, r->txt_dlc, "%u", (unsigned)rec->dlc);
-            char hex[28];
-            size_t used = 0;
-            const uint8_t dlc = rec->dlc > 8 ? 8 : rec->dlc;
-            for (uint8_t b = 0; b < dlc; b++) {
-                used += snprintf(hex + used, sizeof(hex) - used, "%02X%s",
-                                 (unsigned)rec->data[b], b + 1 < dlc ? " " : "");
+            if (rtr) {
+                LBL_SET(r->dlc, r->txt_dlc, "R");
+                label_color(r->dlc, COL_AMBER);
+                LBL_SET(r->data, r->txt_data, "REMOTE FRAME");
+                label_color(r->data, COL_AMBER);
+            } else {
+                LBL_SETF(r->dlc, r->txt_dlc, "%u", (unsigned)rec->dlc);
+                label_color(r->dlc, COL_DIM);
+                char hex[28];
+                size_t used = 0;
+                const uint8_t dlc = rec->dlc > 8 ? 8 : rec->dlc;
+                for (uint8_t b = 0; b < dlc; b++) {
+                    used += snprintf(hex + used, sizeof(hex) - used, "%02X%s",
+                                     (unsigned)rec->data[b], b + 1 < dlc ? " " : "");
+                }
+                LBL_SET(r->data, r->txt_data, hex);
+                label_color(r->data, COL_TEXT);
             }
-            LBL_SET(r->data, r->txt_data, hex);
-            label_color(r->data, COL_TEXT);
         }
     }
 
@@ -775,6 +800,8 @@ static void render_settings(const can_stats_t *st)
     const can_bitrate_t cur_br = twai_current_bitrate();
     for (int i = 0; i < 4; i++) {
         lv_obj_set_style_bg_color(s_br_pill[i], BITRATES[i] == cur_br ? COL_CYAN : COL_ACTIVE_BTN, 0);
+        label_color((lv_obj_t *)lv_obj_get_child(s_br_pill[i], 0),
+                    BITRATES[i] == cur_br ? COL_BG : COL_TEXT);
     }
 
     const can_mode_t mode = twai_current_mode();
@@ -783,11 +810,13 @@ static void render_settings(const can_stats_t *st)
             : mode == CAN_MODE_SELFTEST ? "Self-test"
                                         : "Listen-Only");
     lv_obj_set_style_bg_color(s_mode_pill, mode == CAN_MODE_NORMAL ? COL_AMBER : COL_GREEN, 0);
+    label_color(s_mode_label, COL_BG);
 
     const bool paused = s_frozen || st->paused;
     LBL_SETF(s_set_pause_label, s_txt_set_pause, "%s %s",
              paused ? LV_SYMBOL_PLAY : LV_SYMBOL_PAUSE, paused ? "Resume" : "Pause");
     lv_obj_set_style_bg_color(s_set_pause_btn, paused ? COL_AMBER : COL_ACTIVE_BTN, 0);
+    label_color(s_set_pause_label, paused ? COL_BG : COL_TEXT);
 }
 
 static void render_bars(const can_stats_t *st)
@@ -800,9 +829,18 @@ static void render_bars(const can_stats_t *st)
     /* Top Nav: SD & Host badges */
     sd_status_t sd;
     sd_store_get_status(&sd);
-    object_show(s_nav_sd_dot, sd.recording);
-    LBL_SET(s_nav_sd_label, s_txt_nav_sd, sd.recording ? "REC" : sd.mounted ? "SD" : "");
-    label_color(s_nav_sd_label, sd.recording ? COL_RED : COL_MUTED);
+    object_show(s_nav_sd_dot, sd.mounted || sd.recording);
+    if (sd.recording) {
+        lv_obj_set_style_bg_color(s_nav_sd_dot, COL_RED, 0);
+        LBL_SET(s_nav_sd_label, s_txt_nav_sd, "REC");
+        label_color(s_nav_sd_label, COL_RED);
+    } else if (sd.mounted) {
+        lv_obj_set_style_bg_color(s_nav_sd_dot, COL_GREEN, 0);
+        LBL_SET(s_nav_sd_label, s_txt_nav_sd, "SD");
+        label_color(s_nav_sd_label, COL_MUTED);
+    } else {
+        LBL_SET(s_nav_sd_label, s_txt_nav_sd, "");
+    }
 
     const bool host_on = (s_conn == UI_CONN_ONLINE);
     const bool wifi_on = (s_conn == UI_CONN_WIFI);
@@ -820,7 +858,7 @@ static void render_bars(const can_stats_t *st)
     }
 
     /* Bottom Bar */
-    char rx_buf[10];
+    char rx_buf[12];
     fmt_count(rx_buf, sizeof(rx_buf), st->rx_total);
     LBL_SETF(s_bot_rx_label, s_txt_bot_rx, "RX: %s", rx_buf);
     LBL_SETF(s_bot_load_label, s_txt_bot_load, "FPS: %u", (unsigned)st->fps);
@@ -836,6 +874,7 @@ static void render_bars(const can_stats_t *st)
     const bool running = !paused && strcmp(st->state, "RUNNING") == 0;
     LBL_SET(s_bot_state_label, s_txt_bot_state, paused ? "PAUSED" : running ? "RUN" : "STOP");
     lv_obj_set_style_bg_color(s_bot_state_pill, paused ? COL_AMBER : running ? COL_GREEN : COL_DIM, 0);
+    label_color(s_bot_state_label, paused || running ? COL_BG : COL_TEXT);
 }
 
 /* ---------------------------------------------------------------- timer */
@@ -893,44 +932,44 @@ static void top_nav_create(lv_obj_t *screen)
     lv_obj_t *bar = bar_new(screen, 0, NAV_H);
 
     /* Left: Bitrate & Mode pill / Back button */
-    s_nav_br_pill = btn_new(bar, 6, 3, 68, 20, 4, COL_ACTIVE_BTN, settings_click_cb, NULL);
+    s_nav_br_pill = btn_new(bar, 5, 3, 60, 20, 4, COL_ACTIVE_BTN, settings_click_cb, NULL);
     s_nav_br_label = label_new_centered(s_nav_br_pill, "500K", &lv_font_montserrat_12, COL_CYAN);
 
-    s_nav_back_btn = btn_new(bar, 6, 3, 68, 20, 4, COL_ACTIVE_BTN, back_click_cb, NULL);
+    s_nav_back_btn = btn_new(bar, 5, 3, 60, 20, 4, COL_ACTIVE_BTN, back_click_cb, NULL);
     lv_obj_add_flag(s_nav_back_btn, LV_OBJ_FLAG_HIDDEN);
     label_new_centered(s_nav_back_btn, LV_SYMBOL_LEFT " Back", &lv_font_montserrat_12, COL_TEXT);
 
-    /* Center: Segmented Tab Bar [DASH | TRACE | DIAG] (X = (320 - 156) / 2 = 82) */
-    s_nav_tab_group = btn_new(bar, 82, 2, 156, 22, 6, lv_color_hex(0x1B1E28), NULL, NULL);
+    /* Center: Segmented Tab Bar [DASH | TRACE | DIAG] (X = 74, W = 138) */
+    s_nav_tab_group = btn_new(bar, 74, 2, 138, 22, 5, lv_color_hex(0x1B1E28), NULL, NULL);
     static const char *tab_names[3] = {"DASH", "TRACE", "DIAG"};
     for (int i = 0; i < 3; i++) {
-        s_nav_tab_btn[i] = btn_new(s_nav_tab_group, i * 52, 0, 52, 22, 5, COL_NAV_BAR,
+        s_nav_tab_btn[i] = btn_new(s_nav_tab_group, i * 46, 0, 46, 22, 4, COL_NAV_BAR,
                                    tab_click_cb, (void *)(intptr_t)i);
         s_nav_tab_label[i] = label_new_centered(s_nav_tab_btn[i], tab_names[i], &lv_font_montserrat_12, COL_MUTED);
     }
     nav_tab_update();
 
-    s_nav_settings_title = label_cell(bar, "SETTINGS", 82, 5, 156, &lv_font_montserrat_12, COL_TEXT, false);
+    s_nav_settings_title = label_cell(bar, "SETTINGS", 74, 5, 138, &lv_font_montserrat_12, COL_TEXT, false);
     lv_obj_set_style_text_align(s_nav_settings_title, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_add_flag(s_nav_settings_title, LV_OBJ_FLAG_HIDDEN);
 
-    /* Right: Host Dot + SD Dot & Labels */
-    s_nav_host_dot = btn_new(bar, 242, 11, 5, 5, LV_RADIUS_CIRCLE, COL_GREEN, NULL, NULL);
+    /* Right: Host Dot + SD Dot & Labels (cleanly partitioned from X=218 to 316) */
+    s_nav_host_dot = btn_new(bar, 220, 10, 6, 6, LV_RADIUS_CIRCLE, COL_GREEN, NULL, NULL);
     lv_obj_add_flag(s_nav_host_dot, LV_OBJ_FLAG_HIDDEN);
-    s_nav_host_label = label_cell(bar, "", 250, 5, 0, &lv_font_montserrat_12, COL_MUTED, false);
+    s_nav_host_label = label_cell(bar, "", 228, 5, 0, &lv_font_montserrat_12, COL_MUTED, false);
 
-    s_nav_sd_dot = btn_new(bar, 280, 11, 5, 5, LV_RADIUS_CIRCLE, COL_RED, NULL, NULL);
+    s_nav_sd_dot = btn_new(bar, 270, 10, 6, 6, LV_RADIUS_CIRCLE, COL_RED, NULL, NULL);
     lv_obj_add_flag(s_nav_sd_dot, LV_OBJ_FLAG_HIDDEN);
-    s_nav_sd_label = label_cell(bar, "", 288, 5, 0, &lv_font_montserrat_12, COL_MUTED, false);
+    s_nav_sd_label = label_cell(bar, "", 278, 5, 0, &lv_font_montserrat_12, COL_MUTED, false);
 }
 
 static void bottom_bar_create(lv_obj_t *screen)
 {
     lv_obj_t *bar = bar_new(screen, BOT_Y, BOT_H);
     s_bot_rx_label = label_cell(bar, "RX: 0", 8, 7, 0, &lv_font_montserrat_12, COL_TEXT, false);
-    s_bot_load_label = label_cell(bar, "FPS: 0", 106, 7, 0, &lv_font_montserrat_12, COL_MUTED, false);
-    s_bot_sd_label = label_cell(bar, "SD READY", 184, 7, 0, &lv_font_montserrat_12, COL_MUTED, false);
-    s_bot_state_pill = btn_new(bar, 266, 4, 48, 20, LV_RADIUS_CIRCLE, COL_GREEN, pause_click_cb, NULL);
+    s_bot_load_label = label_cell(bar, "FPS: 0", 96, 7, 0, &lv_font_montserrat_12, COL_MUTED, false);
+    s_bot_sd_label = label_cell(bar, "SD READY", 174, 7, 0, &lv_font_montserrat_12, COL_MUTED, false);
+    s_bot_state_pill = btn_new(bar, 258, 4, 54, 20, LV_RADIUS_CIRCLE, COL_GREEN, pause_click_cb, NULL);
     s_bot_state_label = label_new_centered(s_bot_state_pill, "RUN", &lv_font_montserrat_12, COL_BG);
 }
 
@@ -941,12 +980,14 @@ static void dash_view_create(lv_obj_t *parent)
 
     lv_obj_t *banner = card_new(page, 4, 3, 312, 38);
     s_dash_fps_num = label_cell(banner, "0", 8, 8, 0, &lv_font_montserrat_20, COL_TEXT, false);
-    label_cell(banner, "fps", 62, 14, 0, &lv_font_montserrat_12, COL_MUTED, false);
-    s_dash_load_text = label_cell(banner, "LOAD 0%", 100, 6, 0, &lv_font_montserrat_12, COL_TEXT, false);
+    s_dash_fps_unit = label_cell(banner, "fps", 24, 14, 0, &lv_font_montserrat_12, COL_MUTED, false);
+    lv_obj_align_to(s_dash_fps_unit, s_dash_fps_num, LV_ALIGN_OUT_RIGHT_BOTTOM, 4, -2);
+
+    s_dash_load_text = label_cell(banner, "LOAD 0%", 106, 6, 0, &lv_font_montserrat_12, COL_TEXT, false);
 
     s_dash_load_bar = lv_bar_create(banner);
-    lv_obj_set_pos(s_dash_load_bar, 100, 22);
-    lv_obj_set_size(s_dash_load_bar, 104, 7);
+    lv_obj_set_pos(s_dash_load_bar, 106, 22);
+    lv_obj_set_size(s_dash_load_bar, 96, 7);
     lv_obj_set_style_radius(s_dash_load_bar, 3, 0);
     lv_obj_set_style_bg_color(s_dash_load_bar, lv_color_hex(0x1F2432), 0);
     lv_obj_set_style_bg_opa(s_dash_load_bar, LV_OPA_COVER, 0);
@@ -956,32 +997,34 @@ static void dash_view_create(lv_obj_t *parent)
     lv_bar_set_range(s_dash_load_bar, 0, 100);
     lv_bar_set_value(s_dash_load_bar, 0, LV_ANIM_OFF);
 
-    s_dash_health_pill = btn_new(banner, 218, 7, 86, 24, LV_RADIUS_CIRCLE, lv_color_hex(0x064E3B), NULL, NULL);
+    s_dash_health_pill = btn_new(banner, 214, 7, 90, 24, LV_RADIUS_CIRCLE, lv_color_hex(0x064E3B), NULL, NULL);
     s_dash_health_label = label_new_centered(s_dash_health_pill, LV_SYMBOL_OK " NORMAL",
                                              &lv_font_montserrat_12, COL_GREEN);
 
     static const struct { const char *t; lv_coord_t x, w; } cols[] = {
-        {"ID", 8, 0}, {"RATE/s", 82, 46}, {"PER", 130, 38}, {"COUNT", 170, 50}, {"SHARE", 226, 82}
+        {"ID", 10, 0}, {"RATE/s", 92, 42}, {"PER", 138, 36}, {"COUNT", 178, 46}, {"SHARE", 230, 80}
     };
     for (int i = 0; i < 5; i++) {
-        label_cell(page, cols[i].t, cols[i].x, 44, cols[i].w, &lv_font_montserrat_12, COL_DIM, cols[i].w > 0);
+        label_cell(page, cols[i].t, cols[i].x, 43, cols[i].w, &lv_font_montserrat_12, COL_DIM, cols[i].w > 0);
     }
 
     for (int i = 0; i < TOP_N; i++) {
-        lv_obj_t *row = btn_new(page, 4, 60 + i * 24, 312, 23, 4,
+        lv_obj_t *row = btn_new(page, 4, 58 + i * 24, 312, 23, 4,
                                 (i & 1) ? COL_ROW_ODD : COL_ROW_EVEN,
                                 dash_row_click_cb, (void *)(intptr_t)i);
         dash_row_t *r = &s_dash_row[i];
-        r->id = label_cell(row, "", 6, 2, 74, &lv_font_montserrat_16, COL_CYAN, false);
-        r->rate = label_cell(row, "", 82, 3, 46, &lv_font_montserrat_14, COL_TEXT, true);
-        r->per = label_cell(row, "", 130, 4, 38, &lv_font_montserrat_12, COL_MUTED, true);
-        r->cnt = label_cell(row, "", 170, 4, 50, &lv_font_montserrat_12, COL_MUTED, true);
-        r->bar = btn_new(row, 226, 9, 40, 6, 3, COL_CYAN, NULL, NULL);
+        r->id = label_cell(row, "", 6, 4, 76, &lv_font_montserrat_14, COL_CYAN, false);
+        r->rate = label_cell(row, "", 88, 4, 42, &lv_font_montserrat_14, COL_TEXT, true);
+        r->per = label_cell(row, "", 134, 5, 36, &lv_font_montserrat_12, COL_MUTED, true);
+        r->cnt = label_cell(row, "", 174, 5, 46, &lv_font_montserrat_12, COL_MUTED, true);
+        r->bar_track = btn_new(row, 226, 8, 40, 7, 3, lv_color_hex(0x1F2432), NULL, NULL);
+        r->bar = btn_new(r->bar_track, 0, 0, 0, 7, 3, COL_CYAN, NULL, NULL);
+        object_show(r->bar_track, false);
         object_show(r->bar, false);
-        r->share = label_cell(row, "", 270, 4, 38, &lv_font_montserrat_12, COL_MUTED, true);
+        r->share = label_cell(row, "", 268, 5, 38, &lv_font_montserrat_12, COL_MUTED, true);
     }
 
-    s_dash_empty = empty_hint_create(page, 60, 120, "Waiting for CAN frames...\nCheck wiring & bitrate");
+    s_dash_empty = empty_hint_create(page, 52, 130, "Waiting for CAN frames...\nCheck wiring & bitrate");
 }
 
 static void trace_view_create(lv_obj_t *parent)
@@ -989,11 +1032,12 @@ static void trace_view_create(lv_obj_t *parent)
     lv_obj_t *page = obj_new(parent, 0, CONTENT_Y, UI_W, CONTENT_H);
     s_views[VIEW_TRACE] = page;
 
-    static const struct { const char *t; lv_coord_t x; } trace_cols[] = {
-        {"dt (ms)", 6}, {"ID", 60}, {"L", 134}, {"DATA (HEX)", 150}
+    static const struct { const char *t; lv_coord_t x, w; bool right; } trace_cols[] = {
+        {"dt (ms)", 10, 44, true}, {"ID", 60, 0, false}, {"LEN", 130, 16, false}, {"DATA (HEX)", 152, 0, false}
     };
     for (int i = 0; i < 4; i++) {
-        label_cell(page, trace_cols[i].t, trace_cols[i].x, 4, 0, &lv_font_montserrat_12, COL_DIM, false);
+        lv_obj_t *lbl = label_cell(page, trace_cols[i].t, trace_cols[i].x, 4, trace_cols[i].w, &lv_font_montserrat_12, COL_DIM, trace_cols[i].right);
+        if (i == 2) lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_CENTER, 0);
     }
 
     for (int i = 0; i < ROW_N; i++) {
@@ -1001,13 +1045,14 @@ static void trace_view_create(lv_obj_t *parent)
                                 (i & 1) ? COL_ROW_ODD : COL_ROW_EVEN,
                                 trace_row_click_cb, (void *)(intptr_t)i);
         trace_row_t *r = &s_trace_row[i];
-        r->dt = label_cell(row, "", 4, 3, 50, &lv_font_montserrat_12, COL_MUTED, false);
-        r->id = label_cell(row, "", 56, 3, 72, &lv_font_montserrat_12, COL_CYAN, false);
-        r->dlc = label_cell(row, "", 130, 3, 0, &lv_font_montserrat_12, COL_DIM, false);
-        r->data = label_cell(row, "", 146, 3, 160, &lv_font_montserrat_12, COL_TEXT, false);
+        r->dt = label_cell(row, "", 6, 4, 44, &lv_font_montserrat_12, COL_MUTED, true);
+        r->id = label_cell(row, "", 56, 4, 66, &lv_font_montserrat_12, COL_CYAN, false);
+        r->dlc = label_cell(row, "", 126, 4, 16, &lv_font_montserrat_12, COL_DIM, false);
+        lv_obj_set_style_text_align(r->dlc, LV_TEXT_ALIGN_CENTER, 0);
+        r->data = label_cell(row, "", 148, 4, 158, &lv_font_montserrat_12, COL_TEXT, false);
     }
 
-    s_trace_empty = empty_hint_create(page, 21, 160, "Waiting for CAN traffic...\nFrames will stream here");
+    s_trace_empty = empty_hint_create(page, 20, 162, "Waiting for CAN traffic...\nFrames will stream here");
 }
 
 static void diag_view_create(lv_obj_t *parent)
@@ -1015,21 +1060,29 @@ static void diag_view_create(lv_obj_t *parent)
     lv_obj_t *page = obj_new(parent, 0, CONTENT_Y, UI_W, CONTENT_H);
     s_views[VIEW_DIAG] = page;
 
-    static const char *titles[6] = {"TEC / REC", "BUS ERRORS", "BUS OFF", "FIFO MISS", "QUEUE FULL", "BLACKBOX"};
-    static const char *subtitles[6] = {"Tx/Rx Err Count", "Protocol Alerts", "Controller Off", "HW Overrun", "SW Ring Overrun", "SD Log Status"};
+    static const char *titles[6] = {
+        "TEC / REC", "BUS ERRORS", "BUS OFF",
+        "FIFO MISS", "QUEUE FULL", "BLACKBOX"
+    };
+    static const char *subtitles[6] = {
+        "Tx/Rx Errors", "Bit/CRC Alert", "Node Isolated",
+        "HW Overrun", "Ring Overrun", "SD Storage"
+    };
 
     for (int i = 0; i < 6; i++) {
-        lv_obj_t *card = card_new(page, 6 + (i % 3) * 104, 6 + (i / 3) * 66, 100, 60);
-        label_cell(card, titles[i], 6, 4, 0, &lv_font_montserrat_12, COL_MUTED, false);
-        s_diag_val[i] = label_cell(card, "0", 6, 20, 0, &lv_font_montserrat_16, COL_GREEN, false);
-        label_cell(card, subtitles[i], 6, 40, 90, &lv_font_montserrat_12, COL_DIM, false);
+        const lv_coord_t cx = 6 + (i % 3) * 105;
+        const lv_coord_t cy = 6 + (i / 3) * 66;
+        lv_obj_t *card = card_new(page, cx, cy, 98, 60);
+        label_cell(card, titles[i], 8, 6, 0, &lv_font_montserrat_12, COL_MUTED, false);
+        s_diag_val[i] = label_cell(card, "0", 8, 22, 0, &lv_font_montserrat_16, COL_GREEN, false);
+        label_cell(card, subtitles[i], 8, 42, 82, &lv_font_montserrat_12, COL_DIM, false);
     }
 
-    lv_obj_t *rec_btn = btn_new(page, 6, 142, 150, 36, 6, COL_ACTIVE_BTN, recover_click_cb, NULL);
-    label_new_centered(rec_btn, LV_SYMBOL_REFRESH " Bus Recover", &lv_font_montserrat_12, COL_TEXT);
+    lv_obj_t *rec_btn = btn_new(page, 6, 140, 148, 36, 6, COL_ACTIVE_BTN, recover_click_cb, NULL);
+    label_new_centered(rec_btn, LV_SYMBOL_REFRESH " Bus Recover", &lv_font_montserrat_14, COL_TEXT);
 
-    lv_obj_t *clr_btn = btn_new(page, 164, 142, 150, 36, 6, COL_ACTIVE_BTN, clear_click_cb, NULL);
-    label_new_centered(clr_btn, LV_SYMBOL_TRASH " Clear Stats", &lv_font_montserrat_12, COL_TEXT);
+    lv_obj_t *clr_btn = btn_new(page, 166, 140, 148, 36, 6, COL_ACTIVE_BTN, clear_click_cb, NULL);
+    label_new_centered(clr_btn, LV_SYMBOL_TRASH " Clear Stats", &lv_font_montserrat_14, COL_TEXT);
 }
 
 static void settings_view_create(lv_obj_t *parent)
@@ -1040,39 +1093,43 @@ static void settings_view_create(lv_obj_t *parent)
     /* Card 1: CAN Bitrate & Mode */
     lv_obj_t *card1 = card_new(page, 4, 6, 312, 46);
     for (int i = 0; i < 4; i++) {
-        s_br_pill[i] = btn_new(card1, 8 + i * 46, 8, 40, 30, 4, COL_ACTIVE_BTN,
+        s_br_pill[i] = btn_new(card1, 8 + i * 45, 8, 40, 30, 4, COL_ACTIVE_BTN,
                                bitrate_click_cb, (void *)(intptr_t)i);
         label_new_centered(s_br_pill[i], BITRATE_LABELS[i], &lv_font_montserrat_12, COL_TEXT);
     }
-    s_mode_pill = btn_new(card1, 196, 8, 108, 30, 4, COL_GREEN, mode_click_cb, NULL);
+    s_mode_pill = btn_new(card1, 192, 8, 112, 30, 4, COL_GREEN, mode_click_cb, NULL);
     s_mode_label = label_new_centered(s_mode_pill, "Listen-Only", &lv_font_montserrat_12, COL_BG);
 
     /* Card 2: Backlight & Actions */
     lv_obj_t *card2 = card_new(page, 4, 58, 312, 48);
-    label_cell(card2, "BL:", 6, 16, 0, &lv_font_montserrat_12, COL_MUTED, false);
+    label_cell(card2, "BL:", 8, 16, 0, &lv_font_montserrat_12, COL_MUTED, false);
 
     static const char *bl_labels[4] = {"20%", "50%", "80%", "100%"};
     for (int i = 0; i < 4; i++) {
-        s_bl_pill[i] = btn_new(card2, 32 + i * 36, 9, 32, 28, 4,
+        s_bl_pill[i] = btn_new(card2, 32 + i * 34, 9, 30, 30, 4,
                                i == 2 ? COL_GREEN : COL_ACTIVE_BTN,
                                brightness_click_cb, (void *)(intptr_t)i);
-        label_new_centered(s_bl_pill[i], bl_labels[i], &lv_font_montserrat_12, COL_TEXT);
+        label_new_centered(s_bl_pill[i], bl_labels[i], &lv_font_montserrat_12,
+                           i == 2 ? COL_BG : COL_TEXT);
     }
 
-    s_set_pause_btn = btn_new(card2, 180, 9, 60, 28, 4, COL_ACTIVE_BTN, pause_click_cb, NULL);
+    s_set_pause_btn = btn_new(card2, 172, 9, 66, 30, 4, COL_ACTIVE_BTN, pause_click_cb, NULL);
     s_set_pause_label = label_new_centered(s_set_pause_btn, LV_SYMBOL_PAUSE " Pause",
                                            &lv_font_montserrat_12, COL_TEXT);
 
-    lv_obj_t *mark_btn = btn_new(card2, 246, 9, 58, 28, 4, COL_ACTIVE_BTN, mark_click_cb, NULL);
+    lv_obj_t *mark_btn = btn_new(card2, 244, 9, 60, 30, 4, COL_ACTIVE_BTN, mark_click_cb, NULL);
     label_new_centered(mark_btn, LV_SYMBOL_SAVE " Mark", &lv_font_montserrat_12, COL_TEXT);
 
     /* Card 3: Device Info */
-    lv_obj_t *card3 = card_new(page, 4, 112, 312, 54);
-    label_cell(card3, "LinSight CAN v" LINSIGHT_FW_VERSION " | ESP32-S3 (8MB PSRAM)", 8, 8, 0, &lv_font_montserrat_12, COL_TEXT, false);
+    lv_obj_t *card3 = card_new(page, 4, 112, 312, 58);
+    label_cell(card3, "LinSight CAN Analyzer", 10, 8, 0, &lv_font_montserrat_12, COL_TEXT, false);
+
+    lv_obj_t *fw_pill = btn_new(card3, 238, 6, 64, 20, 4, lv_color_hex(0x232938), NULL, NULL);
+    label_new_centered(fw_pill, "v" LINSIGHT_FW_VERSION, &lv_font_montserrat_12, COL_CYAN);
 
     char dev_info[48];
-    snprintf(dev_info, sizeof(dev_info), "ID: %s | Reset: %s", linsight_device_id(), linsight_reset_reason());
-    label_cell(card3, dev_info, 8, 28, 0, &lv_font_montserrat_12, COL_MUTED, false);
+    snprintf(dev_info, sizeof(dev_info), "ID: %s  |  Reset: %s", linsight_device_id(), linsight_reset_reason());
+    label_cell(card3, dev_info, 10, 34, 0, &lv_font_montserrat_12, COL_MUTED, false);
 }
 
 static void modal_inspector_create(void)
@@ -1083,26 +1140,27 @@ static void modal_inspector_create(void)
     lv_obj_add_flag(s_modal_mask, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(s_modal_mask, modal_close_click_cb, LV_EVENT_CLICKED, NULL);
 
-    lv_obj_t *card = card_new(s_modal_mask, 16, 16, 288, 208);
+    lv_obj_t *card = card_new(s_modal_mask, 16, 14, 288, 212);
     lv_obj_set_style_border_color(card, COL_CYAN, 0);
     lv_obj_set_style_radius(card, 8, 0);
     lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
 
     s_modal_id_label = label_cell(card, "CAN FRAME DETAIL", 12, 10, 0, &lv_font_montserrat_16, COL_CYAN, false);
-    lv_obj_t *close_btn = btn_new(card, 252, 6, 28, 24, 4, COL_ACTIVE_BTN, modal_close_click_cb, NULL);
+    lv_obj_t *close_btn = btn_new(card, 248, 6, 28, 24, 4, COL_ACTIVE_BTN, modal_close_click_cb, NULL);
     label_new_centered(close_btn, LV_SYMBOL_CLOSE, &lv_font_montserrat_12, COL_TEXT);
 
-    s_modal_sub_label = label_cell(card, "", 12, 34, 0, &lv_font_montserrat_12, COL_MUTED, false);
+    s_modal_sub_label = label_cell(card, "", 12, 32, 0, &lv_font_montserrat_12, COL_TEXT, false);
+    s_modal_sub2_label = label_cell(card, "", 12, 48, 0, &lv_font_montserrat_12, COL_MUTED, false);
 
-    lv_obj_t *div = obj_new(card, 12, 54, 264, 1);
+    lv_obj_t *div = obj_new(card, 12, 66, 264, 1);
     lv_obj_set_style_bg_color(div, COL_CARD_BORDER, 0);
     lv_obj_set_style_bg_opa(div, LV_OPA_COVER, 0);
 
-    label_cell(card, "DATA BYTES (HEX):", 12, 62, 0, &lv_font_montserrat_12, COL_DIM, false);
+    label_cell(card, "PAYLOAD (HEX / ASCII):", 12, 73, 0, &lv_font_montserrat_12, COL_DIM, false);
 
     static const char *d_names[8] = {"D0", "D1", "D2", "D3", "D4", "D5", "D6", "D7"};
     for (int i = 0; i < 8; i++) {
-        lv_obj_t *box = card_new(card, 12 + i * 33, 80, 31, 38);
+        lv_obj_t *box = card_new(card, 12 + i * 33, 90, 31, 38);
         lv_obj_set_style_radius(box, 4, 0);
 
         s_modal_byte_val[i] = label_new(box, "--", &lv_font_montserrat_14, COL_TEXT);
@@ -1112,10 +1170,10 @@ static void modal_inspector_create(void)
         lv_obj_align(d_lbl, LV_ALIGN_BOTTOM_MID, 0, -3);
     }
 
-    s_modal_ascii_label = label_cell(card, "ASCII: \"........\"", 12, 130, 0, &lv_font_montserrat_12, COL_TEXT, false);
+    s_modal_ascii_label = label_cell(card, "ASCII: \"........\"", 12, 136, 0, &lv_font_montserrat_12, COL_CYAN, false);
 
     lv_obj_t *hint = label_new(card, "[ Tap anywhere or X to close ]", &lv_font_montserrat_12, COL_DIM);
-    lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -8);
 
     object_show(s_modal_mask, false);
 }
@@ -1123,7 +1181,7 @@ static void modal_inspector_create(void)
 /* ---------------------------------------------------------------- splash */
 
 #define SPLASH_CONTENT_W 240
-#define SPLASH_BAR_W 40
+#define SPLASH_BAR_W 60
 #define SPLASH_BAR_MS 900u
 
 static void splash_bar_cb(void *var, int32_t value)
@@ -1186,10 +1244,12 @@ void linsight_ui_init(void)
     view_show(VIEW_DASH);
     s_rate_tick = lv_tick_get();
 
-    s_toast = card_new(screen, 40, 214, 240, 22);
+    s_toast = card_new(lv_layer_top(), 48, 178, 224, 24);
     lv_obj_set_style_border_color(s_toast, COL_CYAN, 0);
+    lv_obj_set_style_radius(s_toast, 12, 0);
+    lv_obj_set_style_bg_color(s_toast, lv_color_hex(0x222734), 0);
     lv_obj_t *toast_lbl = label_new_centered(s_toast, "", &lv_font_montserrat_12, COL_TEXT);
-    lv_obj_set_width(toast_lbl, 230);
+    lv_obj_set_width(toast_lbl, 210);
     lv_obj_set_style_text_align(toast_lbl, LV_TEXT_ALIGN_CENTER, 0);
     object_show(s_toast, false);
 
