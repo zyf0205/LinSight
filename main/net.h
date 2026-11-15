@@ -2,6 +2,6 @@
 
 #include "esp_err.h"
 
-/* Starts Wi-Fi, the TCP client task, STATS/EVENT reporting and CONTROL
- * handling. Safe to call once from app_main after the capture and UI exist. */
+/* Starts Wi-Fi and the TCP client task (HELLO, CAN_BATCH, EVENT, PING/PONG).
+ * Safe to call once from app_main after the capture and UI exist. */
 esp_err_t net_start(void);

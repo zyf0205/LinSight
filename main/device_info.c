@@ -5,7 +5,6 @@
 
 #include "esp_mac.h"
 #include "esp_system.h"
-#include "frame.h"
 
 static char s_device_id[13];
 static bool s_id_ready;
@@ -51,9 +50,4 @@ const char *linsight_reset_reason(void)
     default:
         return "UNKNOWN";
     }
-}
-
-uint32_t linsight_caps(void)
-{
-    return LINSIGHT_CAP_SD | LINSIGHT_CAP_MARK | LINSIGHT_CAP_PAUSE_LEASE;
 }

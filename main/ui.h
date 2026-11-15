@@ -27,10 +27,6 @@ void linsight_ui_set_conn(linsight_conn_t state, uint32_t rtt_ms);
  * is off, the first press only wakes the display. */
 void linsight_ui_handle_key(bool long_press);
 
-/* Host CONTROL (0x07) was applied: show REMOTE SYNC. The refresh timer reads
- * authoritative capture state directly from twai. */
-void linsight_ui_sync_control(void);
-
 #ifdef __cplusplus
 }
 #endif

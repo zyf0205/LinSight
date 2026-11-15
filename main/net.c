@@ -6,10 +6,8 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
-#include <strings.h>
 #include <unistd.h>
 
-#include "cJSON.h"
 #include "can_ring.h"
 #include "device_info.h"
 #include "esp_check.h"
@@ -17,7 +15,6 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_netif.h"
-#include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "frame.h"
@@ -27,7 +24,6 @@
 #include "lwip/inet.h"
 #include "lwip/sockets.h"
 #include "sdkconfig.h"
-#include "sd_store.h"
 #include "settings.h"
 #include "twai.h"
 #include "ui.h"
@@ -45,7 +41,6 @@
 #define RX_BUF_SIZE 1024
 #define PARSER_BUF_SIZE 256u
 #define PING_INTERVAL_MS 5000u
-#define DEVICE_INFO_INTERVAL_MS 5000u
 #define HOST_TIMEOUT_MS 15000u
 #define RECONNECT_DELAY_MIN_MS 1000u
 #define RECONNECT_DELAY_MAX_MS 5000u
@@ -63,7 +58,6 @@ static uint16_t s_pending_count; /* popped but not yet fully sent; survives reco
 
 static uint32_t s_ping_value;
 static uint64_t s_ping_sent_us;
-static volatile bool s_stream_paused; /* FLOW from host: stop popping the ring */
 
 /* --------------------------------------------------------------- utilities */
 
@@ -89,7 +83,8 @@ static bool send_all(int fd, const uint8_t *data, size_t len)
     return true;
 }
 
-/* Small control/stats frames (<= 512 B payload) built on the stack. */
+/* Small session frames (<= 512 B payload: HELLO/EVENT/PING/PONG) built on the
+ * stack. */
 static bool send_frame(int fd, uint8_t type, const uint8_t *payload, uint16_t len)
 {
     uint8_t frame[LINSIGHT_FRAME_HEADER_SIZE + 512];
@@ -112,10 +107,6 @@ static bool send_frame(int fd, uint8_t type, const uint8_t *payload, uint16_t le
  * partial resend by ts_ms/seq. */
 static bool send_batches(int fd)
 {
-    if (s_stream_paused) {
-        return true;
-    }
-
     for (int i = 0; i < MAX_BATCHES_PER_TICK; i++) {
         if (s_pending_count == 0) {
             s_pending_count = (uint16_t)can_ring_pop(s_pop, LINSIGHT_BATCH_MAX_RECORDS);
@@ -143,147 +134,6 @@ static bool send_batches(int fd)
     return true;
 }
 
-/* --------------------------------------------------------------- controls */
-
-static void send_ack(int fd, uint16_t id, uint8_t code)
-{
-    char json[32];
-    const int n = snprintf(json, sizeof(json), "{\"id\":%u,\"code\":%u}", (unsigned)id,
-                           (unsigned)code);
-    if (n > 0 && !send_frame(fd, LINSIGHT_FRAME_ACK, (const uint8_t *)json, (uint16_t)n)) {
-        ESP_LOGW(TAG, "ACK send failed");
-    }
-}
-
-/* CONTROL.set_config accepts an optional bitrate and mode. Missing fields keep
- * the current configuration; present-but-invalid fields reject the whole
- * request instead of silently falling back to 500k/LISTEN_ONLY. */
-static bool parse_bitrate(const cJSON *item, can_bitrate_t *out)
-{
-    if (!cJSON_IsNumber(item)) {
-        return false;
-    }
-    switch ((int)item->valuedouble) {
-    case 125000:
-        *out = CAN_BITRATE_125K;
-        return true;
-    case 250000:
-        *out = CAN_BITRATE_250K;
-        return true;
-    case 500000:
-        *out = CAN_BITRATE_500K;
-        return true;
-    case 1000000:
-        *out = CAN_BITRATE_1M;
-        return true;
-    default:
-        return false;
-    }
-}
-
-static bool parse_mode(const cJSON *item, can_mode_t *out)
-{
-    if (!cJSON_IsString(item)) {
-        return false;
-    }
-    const char *s = item->valuestring;
-    if (strcasecmp(s, "listen") == 0 || strcasecmp(s, "listen_only") == 0) {
-        *out = CAN_MODE_LISTEN_ONLY;
-        return true;
-    }
-    if (strcasecmp(s, "normal") == 0) {
-        *out = CAN_MODE_NORMAL;
-        return true;
-    }
-    if (strcasecmp(s, "selftest") == 0 || strcasecmp(s, "no_ack") == 0) {
-        *out = CAN_MODE_SELFTEST;
-        return true;
-    }
-    return false;
-}
-
-/* Handles one CONTROL frame and sends its ACK. */
-static void handle_control(int fd, const uint8_t *payload, uint16_t len)
-{
-    char json[LINSIGHT_MAX_CONTROL + 1];
-
-    if (len == 0 || len > LINSIGHT_MAX_CONTROL) {
-        return;
-    }
-    memcpy(json, payload, len);
-    json[len] = '\0';
-
-    cJSON *root = cJSON_Parse(json);
-    if (!root) {
-        ESP_LOGW(TAG, "bad CONTROL JSON");
-        return;
-    }
-
-    const cJSON *id = cJSON_GetObjectItemCaseSensitive(root, "id");
-    const cJSON *action = cJSON_GetObjectItemCaseSensitive(root, "action");
-    const uint16_t ctrl_id = cJSON_IsNumber(id) ? (uint16_t)id->valuedouble : 0;
-    const char *act = cJSON_IsString(action) ? action->valuestring : "";
-    esp_err_t err = ESP_ERR_NOT_SUPPORTED;
-
-    if (strcmp(act, LINSIGHT_CTRL_PAUSE) == 0) {
-        uint32_t lease_ms = LINSIGHT_PAUSE_LEASE_DEFAULT_MS;
-        const cJSON *lease = cJSON_GetObjectItemCaseSensitive(root, "lease_ms");
-        if (cJSON_IsNumber(lease) && lease->valuedouble > 0) {
-            const double v = lease->valuedouble;
-            lease_ms = v > (double)UINT32_MAX ? UINT32_MAX : (uint32_t)v;
-        }
-        twai_capture_set_paused_lease(true, lease_ms);
-        err = ESP_OK;
-    } else if (strcmp(act, LINSIGHT_CTRL_RESUME) == 0) {
-        twai_capture_set_paused(false);
-        err = ESP_OK;
-    } else if (strcmp(act, LINSIGHT_CTRL_CLEAR) == 0) {
-        twai_stats_clear();
-        err = ESP_OK;
-    } else if (strcmp(act, LINSIGHT_CTRL_MARK) == 0) {
-        const cJSON *mark_id = cJSON_GetObjectItemCaseSensitive(root, "id");
-        const cJSON *mark_seq = cJSON_GetObjectItemCaseSensitive(root, "seq");
-        sd_store_mark("host",
-                      cJSON_IsNumber(mark_id) ? (uint32_t)mark_id->valuedouble : 0xFFFFFFFFu,
-                      cJSON_IsNumber(mark_seq) ? (uint16_t)mark_seq->valuedouble : 0);
-        err = ESP_OK;
-    } else if (strcmp(act, LINSIGHT_CTRL_CONFIG) == 0) {
-        const cJSON *bitrate = cJSON_GetObjectItemCaseSensitive(root, "bitrate");
-        const cJSON *mode = cJSON_GetObjectItemCaseSensitive(root, "mode");
-        can_bitrate_t br = twai_current_bitrate();
-        can_mode_t m = twai_current_mode();
-        bool valid = true;
-
-        if (bitrate && !parse_bitrate(bitrate, &br)) {
-            valid = false;
-        }
-        if (mode && !parse_mode(mode, &m)) {
-            valid = false;
-        }
-
-        if (!valid) {
-            err = ESP_ERR_INVALID_ARG;
-        } else if (br == twai_current_bitrate() && m == twai_current_mode()) {
-            err = ESP_OK; /* no-op: do not tear down capture for nothing */
-        } else {
-            err = twai_capture_restart(br, m);
-        }
-    }
-
-    if (err == ESP_OK) {
-        /* Host control was applied: show the settings nav badge. */
-        linsight_ui_sync_control();
-    }
-    const uint8_t ack_code =
-        err == ESP_OK ? LINSIGHT_ACK_OK
-        : (err == ESP_ERR_NOT_SUPPORTED || err == ESP_ERR_INVALID_ARG) ? LINSIGHT_ACK_BAD_ARG
-                                                                       : LINSIGHT_ACK_FAILED;
-    send_ack(fd, ctrl_id, ack_code);
-    ESP_LOGI(TAG, "CONTROL id=%u action=%s -> %s", (unsigned)ctrl_id, act,
-             esp_err_to_name(err));
-    cJSON_Delete(root);
-}
-
 /* --------------------------------------------------------------- session */
 
 static bool send_hello(int fd)
@@ -301,77 +151,6 @@ static bool send_hello(int fd)
         return false;
     }
     return send_frame(fd, LINSIGHT_FRAME_HELLO, (const uint8_t *)json, (uint16_t)n);
-}
-
-static bool send_device_info(int fd)
-{
-    can_ring_info_t ring;
-    can_ring_get_info(&ring);
-    sd_status_t sd;
-    sd_store_get_status(&sd);
-
-    int rssi = 0;
-    wifi_ap_record_t ap;
-    if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
-        rssi = ap.rssi;
-    }
-
-    char json[LINSIGHT_MAX_DEVICE_INFO];
-    const int n = snprintf(
-        json, sizeof(json),
-        "{\"fw\":\"%s\",\"proto\":%u,\"device_id\":\"%s\",\"boot\":%u,\"reset\":\"%s\","
-        "\"uptime_ms\":%u,\"heap_free\":%u,\"heap_min\":%u,\"psram_free\":%u,\"rssi\":%d,"
-        "\"ring_used\":%u,\"ring_cap\":%u,"
-        "\"sd\":%d,\"sd_rec\":%d,\"sd_files\":%u,\"sd_free_kb\":%llu,\"sd_drop\":%u,"
-        "\"caps\":%u}",
-        LINSIGHT_FW_VERSION, (unsigned)LINSIGHT_PROTO_VERSION, linsight_device_id(),
-        (unsigned)linsight_boot_count(), linsight_reset_reason(),
-        (unsigned)(esp_timer_get_time() / 1000), (unsigned)esp_get_free_heap_size(),
-        (unsigned)esp_get_minimum_free_heap_size(),
-        (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM), rssi, (unsigned)ring.used,
-        (unsigned)ring.cap, sd.present ? 1 : 0, sd.recording ? 1 : 0, (unsigned)sd.files,
-        (unsigned long long)sd.free_kb, (unsigned)sd.dropped, (unsigned)linsight_caps());
-    if (n <= 0 || n >= (int)sizeof(json)) {
-        ESP_LOGW(TAG, "DEVICE_INFO too long (%d)", n);
-        return true; /* telemetry is best-effort */
-    }
-    return send_frame(fd, LINSIGHT_FRAME_DEVICE_INFO, (const uint8_t *)json, (uint16_t)n);
-}
-
-static bool send_stats(int fd)
-{
-    can_stats_t st;
-    twai_stats_snapshot(&st);
-    can_ring_info_t ring;
-    can_ring_get_info(&ring);
-
-    static const char *bitrate_json[] = {
-        [CAN_BITRATE_125K] = "125000",
-        [CAN_BITRATE_250K] = "250000",
-        [CAN_BITRATE_500K] = "500000",
-        [CAN_BITRATE_1M] = "1000000",
-    };
-
-    char json[LINSIGHT_MAX_STATS];
-    const int n = snprintf(
-        json, sizeof(json),
-        "{\"fps\":%u,\"load_permille\":%u,\"total\":%u,\"dropped\":%u,\"missed\":%u,"
-        "\"rxq_full\":%u,"
-        "\"bus_err\":%u,\"bus_off\":%u,\"err_pass\":%u,\"tec\":%u,\"rec\":%u,"
-        "\"state\":\"%s\",\"bitrate\":%s,\"mode\":\"%s\",\"paused\":%d,"
-        "\"ring_used\":%u,\"ring_cap\":%u,\"uptime_ms\":%u}",
-        (unsigned)st.fps, (unsigned)st.load_permille, (unsigned)st.rx_total,
-        (unsigned)st.dropped,
-        (unsigned)st.rx_missed, (unsigned)st.rx_queue_full, (unsigned)st.bus_errors,
-        (unsigned)st.bus_off, (unsigned)st.err_passive, (unsigned)st.tec, (unsigned)st.rec,
-        st.state, bitrate_json[twai_current_bitrate()], can_mode_name(twai_current_mode()),
-        (int)st.paused, (unsigned)ring.used, (unsigned)ring.cap,
-        (unsigned)(esp_timer_get_time() / 1000));
-    if (n <= 0 || n >= (int)sizeof(json)) {
-        ESP_LOGW(TAG, "STATS JSON overflow (%d)", n);
-        return true; /* stats are best-effort, never break the session */
-    }
-    return send_frame(fd, LINSIGHT_FRAME_STATS, (const uint8_t *)json, (uint16_t)n);
 }
 
 static bool send_events(int fd)
@@ -428,17 +207,6 @@ static void on_frame(void *ctx, uint8_t type, const uint8_t *payload, uint16_t l
         }
         break;
 
-    case LINSIGHT_FRAME_CONTROL:
-        handle_control(*fd, payload, len);
-        break;
-
-    case LINSIGHT_FRAME_FLOW:
-        if (len == LINSIGHT_MAX_FLOW) {
-            s_stream_paused = payload[0] != 0;
-            ESP_LOGI(TAG, "FLOW: streaming %s", s_stream_paused ? "paused" : "resumed");
-        }
-        break;
-
     default:
         break;
     }
@@ -449,17 +217,13 @@ static void session_loop(int fd)
     uint8_t rx[RX_BUF_SIZE];
     uint64_t last_rx_ms = esp_timer_get_time() / 1000;
     uint64_t last_ping = 0;
-    uint64_t last_stats = 0;
-    uint64_t last_info = 0;
 
     linsight_parser_reset(&s_parser);
-    s_stream_paused = false;
 
-    if (!send_hello(fd) || !send_device_info(fd) || !send_ping(fd)) {
+    if (!send_hello(fd) || !send_ping(fd)) {
         return;
     }
     last_ping = last_rx_ms;
-    last_info = last_rx_ms;
     linsight_ui_set_conn(UI_CONN_ONLINE, 0);
     ESP_LOGI(TAG, "TCP session started");
 
@@ -490,18 +254,6 @@ static void session_loop(int fd)
         }
 
         const uint64_t now = esp_timer_get_time() / 1000;
-        if (now - last_stats >= 1000) {
-            if (!send_stats(fd)) {
-                break;
-            }
-            last_stats = now;
-        }
-        if (now - last_info >= DEVICE_INFO_INTERVAL_MS) {
-            if (!send_device_info(fd)) {
-                break;
-            }
-            last_info = now;
-        }
         if (now - last_ping >= PING_INTERVAL_MS) {
             if (!send_ping(fd)) {
                 break;
@@ -514,10 +266,7 @@ static void session_loop(int fd)
         }
     }
 
-    /* A host that paused capture and then died must not leave the device
-     * stopped forever. Pending batches stay in s_pop for the next session. */
-    twai_capture_set_paused(false);
-    s_stream_paused = false;
+    /* Pending batches stay in s_pop for the next session. */
     linsight_ui_set_conn(UI_CONN_RECONNECT, 0);
     ESP_LOGI(TAG, "TCP session ended");
 }
@@ -629,8 +378,8 @@ static int tcp_connect(const char *host, uint16_t port, int timeout_ms)
 #endif
     /* recv() also paces streaming: batches are only flushed after it returns.
      * 50 ms keeps end-to-end latency low (max ~1.3 MB/s through 2x16 KB sends)
-     * while still yielding to CONTROL/PING handling. A stuck host costs one
-     * bounded 500 ms send and a reconnect; the ring keeps the backlog. */
+     * while still yielding to PING handling. A stuck host costs one bounded
+     * 500 ms send and a reconnect; the ring keeps the backlog. */
     struct timeval rcv = {.tv_sec = 0, .tv_usec = 50000};
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rcv, sizeof(rcv));
     struct timeval snd = {.tv_sec = 0, .tv_usec = 500000};
@@ -705,8 +454,8 @@ static esp_err_t wifi_init(void)
 
 static esp_err_t buffers_init(void)
 {
-    /* Parser scratch covers CONTROL (the largest frame we actually read);
-     * anything bigger is skipped by the parser by design. */
+    /* Parser scratch covers any host frame we read (PING today); larger
+     * frames are skipped by the parser by design. */
     static uint8_t parser_scratch[PARSER_BUF_SIZE];
     linsight_parser_init(&s_parser, parser_scratch, PARSER_BUF_SIZE);
 

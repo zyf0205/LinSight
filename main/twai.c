@@ -34,8 +34,6 @@
 typedef struct {
     can_bitrate_t bitrate;
     can_mode_t mode;
-    volatile bool paused;
-    volatile uint32_t pause_until_ms; /* 0 = no lease */
     volatile bool running;
     TaskHandle_t volatile task;
     SemaphoreHandle_t lock;
@@ -276,22 +274,12 @@ static void twai_task(void *arg)
     uint64_t window_start = esp_timer_get_time();
 
     while (s_can.running) {
-        if (s_can.paused && s_can.pause_until_ms != 0) {
-            const uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
-            if ((int32_t)(now_ms - s_can.pause_until_ms) >= 0) {
-                s_can.paused = false;
-                s_can.pause_until_ms = 0;
-                push_event("lease_expired");
-                ESP_LOGW(TAG, "pause lease expired, capture resumed");
-            }
-        }
-
         twai_message_t msg;
         const esp_err_t err = twai_receive(&msg, pdMS_TO_TICKS(100));
 
-        if (err == ESP_OK && !s_can.paused) {
+        if (err == ESP_OK) {
             record_frame(&msg);
-        } else if (err != ESP_OK && err != ESP_ERR_TIMEOUT) {
+        } else if (err != ESP_ERR_TIMEOUT) {
             ESP_LOGW(TAG, "twai_receive: %s", esp_err_to_name(err));
         }
 
@@ -324,18 +312,15 @@ static void twai_task(void *arg)
             s_can.stats.rx_missed = status.rx_missed_count;
             s_can.stats.tec = status.tx_error_counter;
             s_can.stats.rec = status.rx_error_counter;
-            if (!s_can.paused) {
-                s_can.state = driver_state_name(status.state);
-            }
+            s_can.state = driver_state_name(status.state);
         }
         stats_unlock();
 
         can_ring_info_t ring;
         can_ring_get_info(&ring);
-        ESP_LOGI(TAG, "%s %s%s fps=%u load=%u.%u%% total=%u drop=%u missed=%u rxq_full=%u "
+        ESP_LOGI(TAG, "%s %s fps=%u load=%u.%u%% total=%u drop=%u missed=%u rxq_full=%u "
                       "bus_err=%u ring=%u/%u msgs_to_rx=%u state=%s heap=%u psram=%u",
                  can_bitrate_name(s_can.bitrate), can_mode_name(s_can.mode),
-                 s_can.paused ? " PAUSED" : "",
                  (unsigned)s_can.stats.fps, (unsigned)(s_can.stats.load_permille / 10),
                  (unsigned)(s_can.stats.load_permille % 10),
                  (unsigned)s_can.stats.rx_total, (unsigned)ring.dropped,
@@ -416,7 +401,7 @@ esp_err_t twai_capture_start(can_bitrate_t bitrate, can_mode_t mode)
     }
 
     /* Commit only after the driver is live: a failed install/start must not
-     * leave STATS/UI advertising a configuration that never took effect. */
+     * leave the UI advertising a configuration that never took effect. */
     stats_lock();
     s_can.bitrate = bitrate;
     s_can.mode = mode;
@@ -468,8 +453,6 @@ esp_err_t twai_capture_restart(can_bitrate_t bitrate, can_mode_t mode)
     if (s_can.task) {
         err = ESP_ERR_INVALID_STATE;
     } else {
-        /* paused is deliberately not touched: a bitrate/mode change is not a
-         * resume, and twai_capture_start() no longer clears it. */
         err = twai_capture_start(bitrate, mode);
     }
     xSemaphoreGive(s_restart_lock);
@@ -482,28 +465,6 @@ persist:
         }
     }
     return err;
-}
-
-void twai_capture_set_paused(bool paused)
-{
-    twai_capture_set_paused_lease(paused, LINSIGHT_PAUSE_LEASE_DEFAULT_MS);
-}
-
-void twai_capture_set_paused_lease(bool paused, uint32_t lease_ms)
-{
-    if (paused) {
-        if (lease_ms < LINSIGHT_PAUSE_LEASE_MIN_MS) {
-            lease_ms = LINSIGHT_PAUSE_LEASE_MIN_MS;
-        } else if (lease_ms > LINSIGHT_PAUSE_LEASE_MAX_MS) {
-            lease_ms = LINSIGHT_PAUSE_LEASE_MAX_MS;
-        }
-        s_can.pause_until_ms = (uint32_t)(esp_timer_get_time() / 1000) + lease_ms;
-    } else {
-        s_can.pause_until_ms = 0;
-    }
-    s_can.paused = paused;
-    ESP_LOGI(TAG, "capture %s%s", paused ? "PAUSED" : "RESUMED",
-             paused ? " (lease)" : "");
 }
 
 esp_err_t twai_capture_recover(void)
@@ -552,7 +513,6 @@ void twai_stats_snapshot(can_stats_t *out)
     stats_lock();
     *out = s_can.stats;
     out->state = s_can.state;
-    out->paused = s_can.paused;
     stats_unlock();
     out->dropped = ring.dropped;
 }

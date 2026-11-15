@@ -36,7 +36,6 @@
 #define COL_CARD        lv_color_hex(0x1A1D24)
 #define COL_CARD_BORDER lv_color_hex(0x282D38)
 #define COL_NAV_BAR     lv_color_hex(0x161920)
-#define COL_BOT_BAR     lv_color_hex(0x161920)
 #define COL_ACTIVE_TAB  lv_color_hex(0x282E3D)
 #define COL_ROW_EVEN    lv_color_hex(0x15181F)
 #define COL_ROW_ODD     lv_color_hex(0x1A1D25)
@@ -130,7 +129,6 @@ static uint32_t s_prev_total = 0;
 /* Mailbox from net_task */
 static volatile linsight_conn_t s_conn_req = UI_CONN_WIFI;
 static volatile uint32_t s_rtt_req = 0;
-static volatile bool s_remote_req = false;
 
 /* Capture history scanning & ranking */
 static linsight_can_record_t s_scan_buf[SCAN_N];
@@ -580,20 +578,8 @@ static void brightness_click_cb(lv_event_t *e)
 
 static void toggle_pause(void)
 {
-    if (s_frozen) {
-        s_frozen = false;
-        toast_showf("RESUMED");
-        return;
-    }
-    can_stats_t st;
-    twai_stats_snapshot(&st);
-    if (st.paused) {
-        twai_capture_set_paused(false);
-        toast_showf("CAPTURE RESUMED");
-        return;
-    }
-    s_frozen = true;
-    toast_showf("PAUSED");
+    s_frozen = !s_frozen;
+    toast_showf(s_frozen ? "PAUSED" : "RESUMED");
 }
 
 static void pause_click_cb(lv_event_t *e) { (void)e; toggle_pause(); }
@@ -795,7 +781,7 @@ static void render_diag(const can_stats_t *st)
     label_color(s_diag_val[5], sd.mounted ? COL_GREEN : COL_DIM);
 }
 
-static void render_settings(const can_stats_t *st)
+static void render_settings(void)
 {
     const can_bitrate_t cur_br = twai_current_bitrate();
     for (int i = 0; i < 4; i++) {
@@ -812,7 +798,7 @@ static void render_settings(const can_stats_t *st)
     lv_obj_set_style_bg_color(s_mode_pill, mode == CAN_MODE_NORMAL ? COL_AMBER : COL_GREEN, 0);
     label_color(s_mode_label, COL_BG);
 
-    const bool paused = s_frozen || st->paused;
+    const bool paused = s_frozen;
     LBL_SETF(s_set_pause_label, s_txt_set_pause, "%s %s",
              paused ? LV_SYMBOL_PLAY : LV_SYMBOL_PAUSE, paused ? "Resume" : "Pause");
     lv_obj_set_style_bg_color(s_set_pause_btn, paused ? COL_AMBER : COL_ACTIVE_BTN, 0);
@@ -870,7 +856,7 @@ static void render_bars(const can_stats_t *st)
     }
     label_color(s_bot_sd_label, sd.recording ? COL_GREEN : sd.mounted ? COL_MUTED : COL_DIM);
 
-    const bool paused = s_frozen || st->paused;
+    const bool paused = s_frozen;
     const bool running = !paused && strcmp(st->state, "RUNNING") == 0;
     LBL_SET(s_bot_state_label, s_txt_bot_state, paused ? "PAUSED" : running ? "RUN" : "STOP");
     lv_obj_set_style_bg_color(s_bot_state_pill, paused ? COL_AMBER : running ? COL_GREEN : COL_DIM, 0);
@@ -887,10 +873,6 @@ static void tick_cb(lv_timer_t *timer)
         s_conn = s_conn_req;
         s_rtt_ms = s_rtt_req;
     }
-    if (s_remote_req) {
-        s_remote_req = false;
-        toast_showf("REMOTE SYNC");
-    }
 
     can_stats_t st;
     twai_stats_snapshot(&st);
@@ -901,23 +883,18 @@ static void tick_cb(lv_timer_t *timer)
 
     scan_records();
 
-    if (st.paused) {
-        for (int i = 0; i < CNT_SLOTS; i++) s_counts[i].win = 0;
-        s_rate_tick = lv_tick_get();
-    } else {
-        rate_sample();
-    }
+    rate_sample();
 
     render_bars(&st);
 
     if (s_current_view == VIEW_DASH) {
-        if (!s_frozen && !st.paused) render_dash(&st);
+        if (!s_frozen) render_dash(&st);
     } else if (s_current_view == VIEW_TRACE) {
-        if (!s_frozen && !st.paused) render_trace();
+        if (!s_frozen) render_trace();
     } else if (s_current_view == VIEW_DIAG) {
         render_diag(&st);
     } else if (s_current_view == VIEW_SETTINGS) {
-        render_settings(&st);
+        render_settings();
     }
 
     if (s_toast && !lv_obj_has_flag(s_toast, LV_OBJ_FLAG_HIDDEN) && lv_tick_elaps(s_toast_tick) >= 1400u) {
@@ -1274,11 +1251,4 @@ void linsight_ui_handle_key(bool long_press)
         view_show((s_current_view + 1) % 3);
     }
     lvgl_port_unlock();
-}
-
-void linsight_ui_sync_control(void)
-{
-    /* Called from net_task: only raise a flag; the 20 Hz LVGL timer shows the
-     * toast, so no LVGL call ever happens on the network task. */
-    s_remote_req = true;
 }

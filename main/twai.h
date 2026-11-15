@@ -10,7 +10,7 @@
 extern "C" {
 #endif
 
-/* CAN bitrates supported by the Settings page and CONTROL.set_config. */
+/* CAN bitrates supported by the Settings page. */
 typedef enum {
     CAN_BITRATE_125K = 0,
     CAN_BITRATE_250K = 1,
@@ -37,7 +37,6 @@ typedef struct {
     uint32_t fps;           /* frames received in the last full second */
     uint32_t load_permille; /* estimated bus load, 0..1000 */
     const char *state;      /* "RUNNING" / "BUS_OFF" / "RECOVERING" / "STOPPED" */
-    bool paused;
 } can_stats_t;
 
 typedef struct {
@@ -54,18 +53,11 @@ esp_err_t twai_capture_init(void);
  * must never take that lock itself. */
 esp_err_t twai_capture_start(can_bitrate_t bitrate, can_mode_t mode);
 
-/* Stop and re-configure (Settings page / CONTROL.set_config). Serialized
- * against other restarts and manual recovery; paused state is preserved. */
+/* Stop and re-configure (Settings page). Serialized against other restarts
+ * and manual recovery. */
 esp_err_t twai_capture_restart(can_bitrate_t bitrate, can_mode_t mode);
 
-void twai_capture_set_paused(bool paused);
-
-/* Pause capture with an automatic resume lease. A host that crashes while
- * paused must not stop capture forever; lease_ms is clamped to
- * LINSIGHT_PAUSE_LEASE_MIN_MS..MAX_MS. Pass paused=false to resume now. */
-void twai_capture_set_paused_lease(bool paused, uint32_t lease_ms);
-
-/* Push an event into the host/UI event queue (SD mount/full/io, lease expiry). */
+/* Push an event into the host/UI event queue (SD mount/full/io, bus errors). */
 void twai_event_push(const char *type);
 
 /* Manual bus-off recovery (Settings "Bus Recover"). No-op while running. */
@@ -82,7 +74,7 @@ bool twai_event_pop(can_event_t *out);
  * popping records for streaming must not blank or bias the trace. */
 uint32_t twai_ui_tail(linsight_can_record_t *out, uint32_t n);
 
-/* Reset the software counters (CONTROL.clear_stats); TWAI TEC/REC untouched. */
+/* Reset the software counters (Settings Clear button); TWAI TEC/REC untouched. */
 void twai_stats_clear(void);
 
 const char *can_bitrate_name(can_bitrate_t br);   /* "500k" */
