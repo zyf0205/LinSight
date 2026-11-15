@@ -128,7 +128,7 @@ static void build_header(uint8_t out[LSC_HEADER_SIZE])
     linsight_put_u32(out + 6, bitrate_hz());
     linsight_put_u32(out + 10, LSC_FLAG_TS_UPTIME_ONLY | LSC_FLAG_BOOT_VALID);
     /* start_wall (16..23) and anchor_ms (28..31) stay zero: this file is
-     * explicitly uptime-only until linsight-cli import re-anchors it. */
+     * explicitly uptime-only until tools/lsc.py import re-anchors it. */
     linsight_put_u32(out + 24, s_boot);
 }
 
@@ -201,12 +201,12 @@ static void write_readme(void)
         "recNNNNN.met  JSON metadata (device, bitrate, mode, boot)\r\n"
         "recNNNNN.trg  trigger/mark sidecar\r\n"
         "\r\n"
-        "The .lsc files are binary, not text. On the PC (WSL host repo):\r\n"
-        "  linsight-cli report rec00001.lsc -o report.html\r\n"
-        "  linsight-cli export csv rec00001.lsc -o rec00001.csv\r\n"
-        "  linsight-cli export candump rec00001.lsc -o rec00001.log\r\n"
-        "  linsight-cli verify rec00001.lsc\r\n"
-        "Copy the file out of the card first; the card itself is FAT32.\r\n";
+        "The .lsc files are binary, not text. Copy them out of the card first\r\n"
+        "(the card is FAT32), then on the PC (WSL host repo):\r\n"
+        "  python3 tools/lsc.py export csv rec00001.lsc -o rec00001.csv\r\n"
+        "  python3 tools/lsc.py export candump rec00001.lsc -o rec00001.log\r\n"
+        "  python3 tools/lsc.py verify rec00001.lsc\r\n"
+        "Open the csv in a spreadsheet/PlotJuggler, the log in SavvyCAN/can-utils.\r\n";
     const char *path = SD_MOUNT_POINT "/README.TXT";
     const int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0666);
     if (fd < 0) {
