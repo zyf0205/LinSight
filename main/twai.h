@@ -4,13 +4,12 @@
 #include <stdint.h>
 
 #include "esp_err.h"
-#include "frame.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/* CAN bitrates supported by the Settings page. */
+/* CAN bitrates supported by the SETUP page. */
 typedef enum {
     CAN_BITRATE_125K = 0,
     CAN_BITRATE_250K = 1,
@@ -26,12 +25,10 @@ typedef enum {
 
 typedef struct {
     uint32_t rx_total;      /* frames stored since boot (or since clear) */
-    uint32_t dropped;       /* ring overwrites (can_ring) */
     uint32_t rx_missed;     /* lost in the TWAI RX FIFO */
     uint32_t rx_queue_full; /* software RX queue full alerts */
     uint32_t bus_errors;    /* bus error alerts */
     uint32_t bus_off;       /* bus-off events */
-    uint32_t err_passive;   /* error-passive entries */
     uint32_t tec;           /* transmit error counter */
     uint32_t rec;           /* receive error counter */
     uint32_t fps;           /* frames received in the last full second */
@@ -53,14 +50,14 @@ esp_err_t twai_capture_init(void);
  * must never take that lock itself. */
 esp_err_t twai_capture_start(can_bitrate_t bitrate, can_mode_t mode);
 
-/* Stop and re-configure (Settings page). Serialized against other restarts
- * and manual recovery. */
+/* Stop and re-configure (SETUP page). Serialized against other restarts and
+ * manual recovery. */
 esp_err_t twai_capture_restart(can_bitrate_t bitrate, can_mode_t mode);
 
 /* Push an event into the host/UI event queue (SD mount/full/io, bus errors). */
 void twai_event_push(const char *type);
 
-/* Manual bus-off recovery (Settings "Bus Recover"). No-op while running. */
+/* Manual bus-off recovery (DASH/DIAG bus-off action). No-op while running. */
 esp_err_t twai_capture_recover(void);
 
 /* Copy the counters. Thread-safe. */
@@ -69,12 +66,7 @@ void twai_stats_snapshot(can_stats_t *out);
 /* Drain at most one pending event. Thread-safe. */
 bool twai_event_pop(can_event_t *out);
 
-/* Copy the newest n captured records for the local UI (oldest first).
- * This is capture-side history, independent of the network ring: net_task
- * popping records for streaming must not blank or bias the trace. */
-uint32_t twai_ui_tail(linsight_can_record_t *out, uint32_t n);
-
-/* Reset the software counters (Settings Clear button); TWAI TEC/REC untouched. */
+/* Reset the software counters (DIAG Clear Stats); TWAI TEC/REC untouched. */
 void twai_stats_clear(void);
 
 const char *can_bitrate_name(can_bitrate_t br);   /* "500k" */

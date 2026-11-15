@@ -48,6 +48,7 @@
 #define MAX_BATCHES_PER_TICK 2
 
 static int tcp_connect(const char *host, uint16_t port, int timeout_ms);
+static esp_err_t wifi_init(void);
 
 static EventGroupHandle_t s_wifi_events;
 
@@ -83,15 +84,12 @@ static bool send_all(int fd, const uint8_t *data, size_t len)
     return true;
 }
 
-/* Small session frames (<= 512 B payload: HELLO/EVENT/PING/PONG) built on the
+/* Small session frames (<= 256 B payload: HELLO/EVENT/PING/PONG) built on the
  * stack. */
 static bool send_frame(int fd, uint8_t type, const uint8_t *payload, uint16_t len)
 {
-    uint8_t frame[LINSIGHT_FRAME_HEADER_SIZE + 512];
+    uint8_t frame[LINSIGHT_FRAME_HEADER_SIZE + LINSIGHT_MAX_HELLO];
 
-    if (len > 512) {
-        return false;
-    }
     linsight_frame_write_header(frame, type, len);
     if (len) {
         memcpy(frame + LINSIGHT_FRAME_HEADER_SIZE, payload, len);
@@ -117,11 +115,6 @@ static bool send_batches(int fd)
 
         const size_t payload = linsight_batch_pack(s_tx_buf, LINSIGHT_MAX_CAN_BATCH, s_pop,
                                                    s_pending_count);
-        if (payload == 0) {
-            ESP_LOGE(TAG, "batch pack failed for %u records", (unsigned)s_pending_count);
-            s_pending_count = 0;
-            return false;
-        }
 
         uint8_t hdr[LINSIGHT_FRAME_HEADER_SIZE];
         linsight_frame_write_header(hdr, LINSIGHT_FRAME_CAN_BATCH, (uint16_t)payload);
@@ -146,10 +139,6 @@ static bool send_hello(int fd)
         (unsigned)LINSIGHT_PROTO_VERSION, LINSIGHT_FW_VERSION, linsight_device_id(),
         (unsigned)linsight_boot_count(), (unsigned)(esp_timer_get_time() / 1000),
         can_bitrate_name(twai_current_bitrate()), can_mode_name(twai_current_mode()));
-    if (n <= 0 || n >= (int)sizeof(json)) {
-        ESP_LOGE(TAG, "HELLO too long (%d)", n);
-        return false;
-    }
     return send_frame(fd, LINSIGHT_FRAME_HELLO, (const uint8_t *)json, (uint16_t)n);
 }
 
@@ -163,10 +152,6 @@ static bool send_events(int fd)
         char json[96];
         const int n = snprintf(json, sizeof(json), "{\"type\":\"%s\",\"ts_ms\":%u}", ev.type,
                                (unsigned)ev.ts_ms);
-        if (n <= 0 || n >= (int)sizeof(json)) {
-            ESP_LOGW(TAG, "EVENT JSON overflow");
-            continue;
-        }
         if (!send_frame(fd, LINSIGHT_FRAME_EVENT, (const uint8_t *)json, (uint16_t)n)) {
             return false;
         }
@@ -190,18 +175,14 @@ static void on_frame(void *ctx, uint8_t type, const uint8_t *payload, uint16_t l
 
     switch (type) {
     case LINSIGHT_FRAME_PING:
-        if (len <= LINSIGHT_MAX_PING) {
-            send_frame(*fd, LINSIGHT_FRAME_PONG, payload, len);
-        }
+        send_frame(*fd, LINSIGHT_FRAME_PONG, payload, len);
         break;
 
     case LINSIGHT_FRAME_PONG:
         if (len == LINSIGHT_MAX_PONG && s_ping_sent_us &&
             linsight_get_u32(payload) == s_ping_value) {
-            uint32_t rtt = (uint32_t)((esp_timer_get_time() - s_ping_sent_us) / 1000);
-            if (rtt == 0) {
-                rtt = 1;
-            }
+            const uint32_t rtt =
+                (uint32_t)((esp_timer_get_time() - s_ping_sent_us) / 1000);
             linsight_ui_set_conn(UI_CONN_ONLINE, rtt);
             s_ping_sent_us = 0;
         }
@@ -276,6 +257,19 @@ static void net_task(void *arg)
     (void)arg;
 
     linsight_ui_set_conn(UI_CONN_WIFI, 0);
+
+    /* Wi-Fi is initialized here, not in net_start(), so the task stack is
+     * allocated before the driver claims ~30 KB of internal RAM. */
+    const esp_err_t wifi_err = wifi_init();
+    if (wifi_err != ESP_OK) {
+        ESP_LOGE(TAG, "wifi init failed: %s", esp_err_to_name(wifi_err));
+        vTaskDelete(NULL);
+        return;
+    }
+    ESP_LOGI(TAG, "wifi up: internal=%u largest=%u psram=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
     ESP_LOGI(TAG, "connecting Wi-Fi SSID=\"%s\"", CONFIG_LINSIGHT_WIFI_SSID);
 
     uint32_t backoff_ms = RECONNECT_DELAY_MIN_MS;
@@ -367,15 +361,6 @@ static int tcp_connect(const char *host, uint16_t port, int timeout_ms)
     fcntl(fd, F_SETFL, flags);
     const int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
-#if defined(TCP_KEEPIDLE)
-    const int keep_idle = 10;
-    const int keep_intvl = 5;
-    const int keep_cnt = 3;
-    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &keep_idle, sizeof(keep_idle));
-    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &keep_intvl, sizeof(keep_intvl));
-    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &keep_cnt, sizeof(keep_cnt));
-#endif
     /* recv() also paces streaming: batches are only flushed after it returns.
      * 50 ms keeps end-to-end latency low (max ~1.3 MB/s through 2x16 KB sends)
      * while still yielding to PING handling. A stuck host costs one bounded
@@ -468,14 +453,20 @@ static esp_err_t buffers_init(void)
     return s_wifi_events ? ESP_OK : ESP_ERR_NO_MEM;
 }
 
+static StackType_t *s_net_stack = NULL;
+static StaticTask_t s_net_tcb;
+
 esp_err_t net_start(void)
 {
     ESP_RETURN_ON_ERROR(buffers_init(), TAG, "buffers");
-    ESP_RETURN_ON_ERROR(wifi_init(), TAG, "wifi");
 
-    const BaseType_t ok = xTaskCreatePinnedToCore(net_task, "net", NET_TASK_STACK, NULL,
-                                                  NET_TASK_PRIO, NULL, NET_CORE);
-    ESP_RETURN_ON_FALSE(ok == pdPASS, ESP_ERR_NO_MEM, TAG, "net task");
+    s_net_stack = heap_caps_malloc(NET_TASK_STACK, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    ESP_RETURN_ON_FALSE(s_net_stack != NULL, ESP_ERR_NO_MEM, TAG, "net stack");
+
+    TaskHandle_t th = xTaskCreateStaticPinnedToCore(net_task, "net", NET_TASK_STACK, NULL,
+                                                    NET_TASK_PRIO, s_net_stack, &s_net_tcb,
+                                                    NET_CORE);
+    ESP_RETURN_ON_FALSE(th != NULL, ESP_ERR_NO_MEM, TAG, "net task");
 
     ESP_LOGI(TAG, "net started, host %s:%u", CONFIG_LINSIGHT_HOST_IP,
              (unsigned)CONFIG_LINSIGHT_HOST_PORT);

@@ -26,7 +26,6 @@ static const char *TAG = "bsp";
 #define PCA9557_ADDR 0x19
 #define PCA9557_REG_OUTPUT 0x01
 #define PCA9557_REG_CONFIG 0x03
-#define PCA9557_BIT_LCD_CS 0
 
 /* LCD */
 #define BSP_LCD_SPI_NUM SPI3_HOST
@@ -67,21 +66,6 @@ static esp_err_t pca9557_write(uint8_t reg, uint8_t value)
                                       pdMS_TO_TICKS(100));
 }
 
-static esp_err_t lcd_cs_set(int level)
-{
-    uint8_t out = 0;
-    ESP_RETURN_ON_ERROR(i2c_master_write_read_device(BSP_I2C_NUM, PCA9557_ADDR,
-                                                     (const uint8_t[]){PCA9557_REG_OUTPUT}, 1,
-                                                     &out, 1, pdMS_TO_TICKS(100)),
-                        TAG, "pca9557 read");
-    if (level) {
-        out |= (1u << PCA9557_BIT_LCD_CS);
-    } else {
-        out &= ~(1u << PCA9557_BIT_LCD_CS);
-    }
-    return pca9557_write(PCA9557_REG_OUTPUT, out);
-}
-
 static esp_err_t pca9557_init(void)
 {
     /* DVP_PWDN=1, PA_EN=0, LCD_CS=1; low 3 pins output, rest input */
@@ -118,12 +102,6 @@ static esp_err_t backlight_init(void)
 
 esp_err_t bsp_backlight_set(int percent)
 {
-    if (percent < 0) {
-        percent = 0;
-    } else if (percent > 100) {
-        percent = 100;
-    }
-
     uint32_t duty = (1023u * (uint32_t)percent) / 100u;
     ESP_RETURN_ON_ERROR(ledc_set_duty(LEDC_LOW_SPEED_MODE, BSP_LCD_LEDC_CH, duty),
                         TAG, "ledc duty");
@@ -198,7 +176,7 @@ esp_err_t bsp_user_button_init(bsp_button_cb_t cb)
     };
     ESP_RETURN_ON_ERROR(gpio_config(&io), TAG, "user button gpio");
 
-    BaseType_t ok = xTaskCreate(user_button_task, "user_btn", 4096, (void *)cb, 2, NULL);
+    BaseType_t ok = xTaskCreate(user_button_task, "user_btn", 2048, (void *)cb, 2, NULL);
     ESP_RETURN_ON_FALSE(ok == pdPASS, ESP_ERR_NO_MEM, TAG, "user button task");
     return ESP_OK;
 }
@@ -239,7 +217,7 @@ static esp_err_t lcd_init(void)
 
     /* order matters: reset -> CS low -> init */
     ESP_RETURN_ON_ERROR(esp_lcd_panel_reset(s_panel), TAG, "panel reset");
-    ESP_RETURN_ON_ERROR(lcd_cs_set(0), TAG, "lcd cs");
+    ESP_RETURN_ON_ERROR(pca9557_write(PCA9557_REG_OUTPUT, 0x04), TAG, "lcd cs");
     ESP_RETURN_ON_ERROR(esp_lcd_panel_init(s_panel), TAG, "panel init");
     ESP_RETURN_ON_ERROR(esp_lcd_panel_invert_color(s_panel, true), TAG, "invert");
     ESP_RETURN_ON_ERROR(esp_lcd_panel_swap_xy(s_panel, true), TAG, "swap xy");

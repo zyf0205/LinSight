@@ -13,14 +13,13 @@ extern "C" {
 /*
  * PSRAM ring buffer of CAN records (one line of the plan's "twai_task -> PSRAM
  * ring" pipeline). Single producer (twai task), one consumer: net_task pops
- * records to send over TCP. The local trace does not read this ring; it uses
- * twai's capture-side UI history so streaming cannot blank the display.
+ * records to send over TCP.
  * All entry points take an internal mutex; hold times are memcpy-sized.
  *
  * Overflow policy is "drop old, keep new" (plan §8): pushing into a full ring
- * overwrites the oldest record and bumps the dropped counter, so the UI always
- * shows the latest bus activity and a reconnecting host receives the most
- * recent window. Sequence numbers make every gap visible downstream.
+ * overwrites the oldest record and bumps the dropped counter, so a host that
+ * reconnects receives the most recent window. Sequence numbers make every gap
+ * visible downstream.
  */
 
 typedef struct {
@@ -39,9 +38,6 @@ void can_ring_push(linsight_can_record_t *rec);
 uint32_t can_ring_pop(linsight_can_record_t *out, uint32_t max);
 
 void can_ring_get_info(can_ring_info_t *out);
-
-/* Clear the overflow counter shown as OVF (Clear Stats); records are untouched. */
-void can_ring_reset_dropped(void);
 
 #ifdef __cplusplus
 }

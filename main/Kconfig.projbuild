@@ -40,12 +40,4 @@ menu "LinSight"
         range 1 65535
         default 8888
 
-    config LINSIGHT_BENCH_SELFTEST
-        bool "Bench self-test load generator (boot-time TX burst)"
-        default n
-        help
-            Boot in TWAI self-test mode and transmit a burst of self-received
-            frames to validate the capture core without an external CAN node.
-            Bench diagnostics only; leave off for real buses.
-
 endmenu

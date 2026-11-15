@@ -5,21 +5,22 @@ This file provides guidance to Claude Code when working in the Windows firmware 
 ## Repository state
 
 LinSight ESP32-S3 firmware: TWAI capture, PSRAM ring, SD black-box recording, LVGL UI, Wi-Fi streaming.
-The Linux host (epoll daemon, CLI, `.lsc` logging, tests, optional SocketCAN/ROS 2 bridge) lives in
+The Linux host (epoll bridge, tests, optional SocketCAN forwarding) lives in
 the separate WSL repository `~/linsight`; do not keep, build, or run host code in this checkout.
 Bench Wi-Fi credentials and the host IP are Kconfig defaults (`CONFIG_LINSIGHT_*` in
 `main/Kconfig.projbuild`); production builds should override them via menuconfig.
 
 ## Source of truth
 
+- `README.md` — project overview, features, build/flash, repository layout
 - `docs/hardware.md` — verified pinout, CAN wiring, LCD/touch init, sdkconfig gotchas
 - `protocol/frame.h` — wire format, limits, parser contract (shared with the host repo; keep both copies identical)
-- `main/ui.h` — UI API and the DASH/TRACE/DIAG/Settings contract consumed by `ui.c`
-- `~/linsight/host/README.md` — host bridge daemon, `tools/lsc.py` and bench reference
+- `main/ui.h` — UI API and the DASH/DIAG/SETUP contract consumed by `ui.c`
+- `~/linsight/README.md` — host bridge daemon and bench reference
 
 ## Documentation rules
 
-- **Firmware docs live in `docs/`; host docs live in the WSL repo (`host/README.md`, `docs/hardware.md`).** The only markdown at this repo root is `CLAUDE.md`.
+- **Firmware docs live in `docs/`; host docs live in the WSL repo (`README.md`, `docs/hardware.md`).** Root markdown is limited to `README.md` (project entry) and `CLAUDE.md` (agent guidance).
 - **Do not create new documents without explicit permission.** Update an existing file instead.
 - Keep docs short and scannable: tables and bullets over prose; target ≤120 lines per doc.
 - Do not duplicate content across docs; link to the source of truth instead.
@@ -40,20 +41,20 @@ idf.py menuconfig                  # LinSight → CAN mode, Wi-Fi SSID/password,
 ```
 
 - Bench Wi-Fi/TCP endpoint is configured in `main/Kconfig.projbuild` (`CONFIG_LINSIGHT_*`, bench values as defaults); production builds override it in menuconfig. The device sets the CN 1–13 regulatory domain for 2.4 GHz bench channels.
-- Bench: the device joins the PC hotspot and connects to `linsightd` in WSL; PCAN traffic is generated on WSL `can0` (usbipd + `peak_usb`), not from Windows. Default `TWAI_MODE_LISTEN_ONLY` never ACKs — switch Settings/`menuconfig` to Normal only on a two-node bench.
+- Bench: the device joins the PC hotspot and connects to `linsightd` in WSL; PCAN traffic is generated on WSL `can0` (usbipd + `peak_usb`), not from Windows. Default `TWAI_MODE_LISTEN_ONLY` never ACKs — switch the SETUP page/`menuconfig` to Normal only on a two-node bench.
 
 ## Architecture
 
-- **Firmware tasks**: `twai_task` (core 1, prio 10) receives frames, timestamps (ms), pushes 20-byte records into the PSRAM ring (4 MiB, ~209k records, drop-oldest), mirrors the newest 512 into a capture-side UI history, fan-outs to the SD queue, and maintains counters; `net_task` (core 0, prio 5) owns Wi-Fi/TCP, streams CAN_BATCH frames, sends EVENTS/PING and answers PING with PONG; `sd_task` (core 1, prio 3) drains the 16k PSRAM queue and writes `recNNNNN.lsc`; the LVGL task pulls `twai_ui_tail` + stats at 20 Hz (the history is independent of the ring that `net_task` drains). Verified: 30000-frame boot burst at 4330 fps / 96% load, zero loss (30k < ~209k capacity, so overflow policy is covered by the host repo's `test_ring`).
+- **Firmware tasks**: `twai_task` (core 1, prio 10) receives frames, timestamps (ms), pushes 20-byte records into the PSRAM ring (4 MiB, ~209k records, drop-oldest), fans out to the SD queue, and maintains counters; `net_task` (core 0, prio 5) owns Wi-Fi/TCP, streams CAN_BATCH frames, sends EVENTS/PING and answers PING with PONG; `sd_task` (core 1, prio 3) drains the 16k PSRAM queue and writes `recNNNNN.log`; the LVGL task pulls stats and SD status at 20 Hz. Bench-validated at 4330 fps / 96% load with zero loss; overflow policy is covered by the host repo's `test_ring`.
 - **Ring** (`can_ring.c`): mutex-protected SPSC-style; overwrite-oldest on overflow with a visible drop counter; sequence numbers expose gaps.
-- **SD black box** (`sd_store.c`): independent PSRAM queue (16k, 4k internal fallback), never blocks `twai_task`; 1-bit SDMMC CLK/CMD/D0 = 47/48/21; FAT32/8.3 `recNNNNN.lsc` with the shared 32-byte header, 32 MiB or 10 min rotation, keep 8 files, `.met`/`.trg` sidecars. A `README.TXT` written at mount explains that `.lsc` is binary and points at the host tool (`python3 tools/lsc.py export csv|candump`, `verify`). Bench-validated 2026-11-13: mount/remount and index continuation across resets, case-insensitive 8.3 scan/prune (FATFS returns upper-case names), byte- and time-based rotation plus keep-N pruning (exercised with temporary reduced limits), zero SD drops at ~850 fps.
+- **SD black box** (`sd_store.c`): independent PSRAM queue (16k), never blocks `twai_task`; 1-bit SDMMC CLK/CMD/D0 = 47/48/21; FAT32/8.3 `recNNNNN.log` in candump text (`(uptime_s.usec) can0 ID#DATA`, same syntax as can-utils and the host `--dump`; opens directly in SavvyCAN), 32 MiB or 10 min rotation, keep 8 files, `.trg` mark sidecars, `README.TXT` rewritten at each mount. Timestamps are device uptime (no RTC), so SavvyCAN shows 1970 + uptime. Bench-validated 2026-11-13: mount/remount and index continuation across resets, case-insensitive 8.3 scan/prune (FATFS returns upper-case names), byte- and time-based rotation plus keep-N pruning (exercised with temporary reduced limits), zero SD drops at ~850 fps.
 - **Shared protocol**: `protocol/frame.c` is pure C (no IDF, no malloc); the WSL host repo compiles a mirror of the same parser. 5-byte header `AA 55 type len_lo len_hi`; types 01 HELLO, 02 CAN_BATCH, 03 STATS, 04 EVENT, 05/06 PING/PONG, 07 CONTROL, 08 ACK, 09 FLOW, 10 DEVICE_INFO; record `seq u16 | ts_ms u32 | id u32 | flags u8 | dlc u8 | data[8]`; HELLO carries `device_id`/`boot`/`uptime_ms`. The firmware implements only HELLO/CAN_BATCH/EVENT/PING/PONG; the other types remain in the shared header for the host mirror.
-- **UI** (`ui.c`): three tabs plus Settings. DASH ranks the top 5 IDs by the tumbling 1 s rate with activity bars, a health pill (NORMAL/PASSIVE/BERR/BUS-OFF) and a 1 s FPS/load banner; TRACE shows the newest 7 frames with per-ID counters; DIAG shows TEC/REC, bus errors/off, FIFO/queue overflow, SD state and Bus Recover/Clear. The bottom telemetry bar shows RX total, FPS, SD (`REC nF`/`SD READY`/`NO SD`) and a RUN/PAUSED pill; tapping a dash or trace row opens the frame-inspector modal. Settings (bitrate/mode, backlight, pause, mark, device info) opens from the bitrate pill or a long GPIO0 press; GPIO0 short = cycle DASH → TRACE → DIAG, long = Settings (any press there returns), and a dark screen only wakes on the first press. net_task setters publish into a lock-free mailbox that the 20 Hz LVGL timer drains, while the GPIO0 handler takes the LVGL lock for its short action.
+- **UI** (`ui.c`): three tabs DASH/DIAG/SETUP. DASH shows bus load, throughput (fps, RX total), bus health (state, TEC/REC, errors) and PAUSE/MARK buttons; DIAG shows TEC/REC bars, bus errors/off, RX missed, SD black-box status/free/dropped and Clear Stats/MARK; SETUP selects bitrate (125k/250k/500k/1M), controller mode (LISTEN/NORMAL/SELFTEST), backlight (20/50/80/100%) and shows host link status. The bottom dock switches views; GPIO0 short = cycle DASH → DIAG → SETUP, long = current view action (pause / clear stats / back to DASH), and a dark screen only wakes on the first press. net_task setters publish into a lock-free mailbox that the 20 Hz LVGL timer drains, while the GPIO0 handler takes the LVGL lock for its short action.
 
 ## Hard constraints
 
 - Only the LVGL task and the GPIO0 key handler touch LVGL. `linsight_ui_handle_key` runs on the button task and takes `lvgl_port_lock` for its short view-switch action; `net_task` must only publish into the lock-free mailbox in `ui.c` — never take the LVGL mutex from `net_task` (`lvgl_port_lock(0)` waits forever, which stalls PING/PONG until the host drops the session).
-- LCD CS is **PCA9557 BIT0 @0x19**, not a GPIO. Order: `bsp_i2c_init()` → `pca9557_init()` → `panel_reset()` → `lcd_cs(0)` → `panel_init()`.
+- LCD CS is **PCA9557 BIT0 @0x19**, not a GPIO. Order: `bsp_i2c_init()` → `pca9557_init()` → `panel_reset()` → write PCA9557 output `0x04` (CS low) → `panel_init()`.
 - LVGL draw buffers: internal DMA RAM, 320×40 ×2. CAN ring: PSRAM.
 - `CONFIG_LV_COLOR_16_SWAP=y`.
 - sdkconfig: CPU 240 MHz, `CONFIG_COMPILER_OPTIMIZATION_PERF`, `FREERTOS_HZ=1000`, TCP window 32 KB.

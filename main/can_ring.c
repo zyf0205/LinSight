@@ -56,10 +56,6 @@ void can_ring_push(linsight_can_record_t *rec)
 
 uint32_t can_ring_pop(linsight_can_record_t *out, uint32_t max)
 {
-    if (max == 0) {
-        return 0;
-    }
-
     xSemaphoreTake(s_lock, portMAX_DELAY);
 
     const uint32_t n = s_count < max ? s_count : max;
@@ -83,15 +79,5 @@ void can_ring_get_info(can_ring_info_t *out)
     out->used = s_count;
     out->cap = s_cap;
     out->dropped = s_dropped;
-    xSemaphoreGive(s_lock);
-}
-
-void can_ring_reset_dropped(void)
-{
-    if (!s_lock) {
-        return;
-    }
-    xSemaphoreTake(s_lock, portMAX_DELAY);
-    s_dropped = 0;
     xSemaphoreGive(s_lock);
 }

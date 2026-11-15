@@ -28,7 +28,7 @@
 | 43 / 44 | UART0 TX / RX | CH340K |
 
 - 除扩展口外没有引出其他 GPIO（GPIO12、22–25 需焊测试点）；所有 IO 为 **3.3V，不耐 5V**。
-- TF 卡：板载 1-bit SDMMC（CLK/CMD/D0 = 47/48/21），无卡检测脚；FAT32、8.3 名 `recNNNNN.lsc`，每 5 s 重试挂载。日志是二进制，挂载时写入的 `README.TXT` 给出 `python3 tools/lsc.py export csv|candump` / `verify` 转换命令。`README.TXT` 只在不存在时写入（O_EXCL）：旧卡上的过期文案需手动删除后重新挂载才会重写。
+- TF 卡：板载 1-bit SDMMC（CLK/CMD/D0 = 47/48/21），无卡检测脚；FAT32、8.3 名 `recNNNNN.log`，每 5 s 重试挂载。日志是 candump 文本（`(开机秒.微秒) can0 ID#DATA`），SavvyCAN 可直接打开；设备无 RTC，时间戳为开机计时。`.trg`（标记）侧车，挂载时重写 `README.TXT`。
 
 ## 3. 显示与触摸
 
@@ -44,7 +44,7 @@
 **初始化顺序（漏了就黑屏）**：
 
 ```text
-bsp_i2c_init() → pca9557_init() → panel_reset() → lcd_cs(0) → panel_init()
+bsp_i2c_init() → pca9557_init() → panel_reset() → 写 PCA9557 输出 0x04（LCD_CS 低） → panel_init()
 ```
 
 **LVGL**：官方基线 320×20、单缓冲、PSRAM；本项目用 320×40、双缓冲、内部 DMA RAM。`CONFIG_LV_COLOR_16_SWAP=y`。
@@ -94,10 +94,11 @@ USB-CAN            CAN_H ── 收发器 CANH
 
 - 高速连续发送会让部分 PCAN-USB 假活（`CAN_Write` OK、status 0x0，回显/上行停摆）；
   软复位无效，只能拔插或管理员 `pnputil /restart-device`。
-- 台架改用 **WSL2 SocketCAN**：Windows 侧 `python tools/can_gui.py`（自动 `usbipd attach`、`modprobe peak_usb`、配置 `can0`，
+- 台架改用 **WSL2 SocketCAN**：Windows 侧 `python tools/can_gui.py`（自动 `usbipd attach`、配置 `can0`，
   含切速率 / 发帧 / 监听 / TX·RX 统计；首次或换 USB 口需管理员 bind，程序自动弹 UAC）。主机仓库一键脚本：
-  `tools/can-up.sh [BUSID] [BITRATE]`、`tools/can-down.sh --status`。手动等价：`usbipd bind/attach --wsl --busid <id>`，
-  WSL 内 `sudo modprobe peak_usb`、`sudo ip link set can0 type can bitrate 500000 restart-ms 100 && sudo ip link set can0 up`，
+  `tools/can-up.sh [BUSID] [BITRATE]`、`tools/can-down.sh --status`。手动等价：
+  `usbipd bind/attach --wsl --busid <id>`，WSL 内 `sudo modprobe peak_usb`、
+  `sudo ip link set can0 type can bitrate 500000 restart-ms 100 && sudo ip link set can0 up`，
   `cangen can0 -n 500 -g 20 -I 0x123 -L 8` 发帧，以设备 `total` 为判据（不依赖回显）。实测 50 fps/10 s +500；
   PCAN-USB 经 usbip 约 1 ms/帧，持续上限约 830–920 fps，`missed/rxq_full/dropped` 全 0。
 

@@ -4,9 +4,9 @@
 
 #include "can_ring.h"
 #include "driver/twai.h"
+#include "frame.h"
 #include "sd_store.h"
 #include "settings.h"
-#include "esp_check.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_system.h"
@@ -25,7 +25,6 @@
 #define TWAI_CORE 1
 #define TWAI_RX_QUEUE_LEN 200
 #define EVENT_QUEUE_LEN 8
-#define UI_HISTORY 512 /* records retained for the 20 Hz trace view (~10 KB) */
 
 /* Wire bits per frame, ignoring stuffing: standard ~47+8*dlc, extended ~67+8*dlc. */
 #define STD_FRAME_OVERHEAD_BITS 47u
@@ -54,60 +53,33 @@ static can_state_t s_can = {
  * task's alert handler can take it and observe running == false. */
 static SemaphoreHandle_t s_restart_lock;
 
-/* Capture-side UI history: unlike the network ring, these records are never
- * popped by net_task, so the display always has a complete recent window. */
-static linsight_can_record_t s_ui_hist[UI_HISTORY];
-static uint32_t s_ui_head;
-static uint32_t s_ui_count;
-
-static uint32_t bitrate_hz(can_bitrate_t br)
-{
-    switch (br) {
-    case CAN_BITRATE_125K:
-        return 125000u;
-    case CAN_BITRATE_250K:
-        return 250000u;
-    case CAN_BITRATE_1M:
-        return 1000000u;
-    default:
-        return 500000u;
-    }
-}
-
 /* IDF's TWAI_*CONFIG_*() macros expand to struct initializers, so they can
- * only initialize objects -- hence this table instead of returning &{...}. */
-static const twai_timing_config_t TIMING_125K = TWAI_TIMING_CONFIG_125KBITS();
-static const twai_timing_config_t TIMING_250K = TWAI_TIMING_CONFIG_250KBITS();
-static const twai_timing_config_t TIMING_500K = TWAI_TIMING_CONFIG_500KBITS();
-static const twai_timing_config_t TIMING_1M = TWAI_TIMING_CONFIG_1MBITS();
+ * only appear in static initializers -- hence this table. */
+typedef struct {
+    uint32_t hz;
+    const char *name;
+    twai_timing_config_t timing;
+} bitrate_info_t;
+
+static const bitrate_info_t BITRATES[] = {
+    [CAN_BITRATE_125K] = {125000u, "125k", TWAI_TIMING_CONFIG_125KBITS()},
+    [CAN_BITRATE_250K] = {250000u, "250k", TWAI_TIMING_CONFIG_250KBITS()},
+    [CAN_BITRATE_500K] = {500000u, "500k", TWAI_TIMING_CONFIG_500KBITS()},
+    [CAN_BITRATE_1M] = {1000000u, "1M", TWAI_TIMING_CONFIG_1MBITS()},
+};
 static const twai_filter_config_t FILTER_ACCEPT_ALL = TWAI_FILTER_CONFIG_ACCEPT_ALL();
 
-static const twai_timing_config_t *timing_for(can_bitrate_t br)
+static const bitrate_info_t *bitrate_info(can_bitrate_t br)
 {
-    switch (br) {
-    case CAN_BITRATE_125K:
-        return &TIMING_125K;
-    case CAN_BITRATE_250K:
-        return &TIMING_250K;
-    case CAN_BITRATE_1M:
-        return &TIMING_1M;
-    default:
-        return &TIMING_500K;
+    if ((unsigned)br > (unsigned)CAN_BITRATE_1M) {
+        br = CAN_BITRATE_500K;
     }
+    return &BITRATES[br];
 }
 
 const char *can_bitrate_name(can_bitrate_t br)
 {
-    switch (br) {
-    case CAN_BITRATE_125K:
-        return "125k";
-    case CAN_BITRATE_250K:
-        return "250k";
-    case CAN_BITRATE_1M:
-        return "1M";
-    default:
-        return "500k";
-    }
+    return bitrate_info(br)->name;
 }
 
 const char *can_mode_name(can_mode_t mode)
@@ -179,12 +151,6 @@ static void record_frame(const twai_message_t *msg)
     sd_store_push(&rec); /* independent SD fan-out; never blocks */
 
     stats_lock();
-    s_ui_hist[s_ui_head] = rec;
-    s_ui_head = (s_ui_head + 1) % UI_HISTORY;
-    if (s_ui_count < UI_HISTORY) {
-        s_ui_count++;
-    }
-
     /* Single-writer counters; readers copy them under the same lock. */
     s_can.frames_window++;
     s_can.stats.rx_total++;
@@ -236,9 +202,6 @@ static void handle_alerts(void)
         xSemaphoreGive(s_restart_lock);
     }
     if (alerts & TWAI_ALERT_ERR_PASS) {
-        stats_lock();
-        s_can.stats.err_passive++;
-        stats_unlock();
         push_event("err_passive");
     }
     if (alerts & TWAI_ALERT_BUS_ERROR) {
@@ -306,7 +269,7 @@ static void twai_task(void *arg)
         s_can.bits_window = 0;
         s_can.stats.fps = (uint32_t)((uint64_t)frames * 1000000u / elapsed_us);
         uint32_t permille = (uint32_t)((uint64_t)bits * 1000000000ull /
-                                       ((uint64_t)bitrate_hz(s_can.bitrate) * elapsed_us));
+                                       ((uint64_t)bitrate_info(s_can.bitrate)->hz * elapsed_us));
         s_can.stats.load_permille = permille > 1000u ? 1000u : permille;
         if (status_ok) {
             s_can.stats.rx_missed = status.rx_missed_count;
@@ -342,17 +305,10 @@ static void twai_task(void *arg)
 
 esp_err_t twai_capture_init(void)
 {
-    /* Called once during startup. Preserve any objects already created if a
-     * partial initialization is retried. */
-    if (!s_can.lock) {
-        s_can.lock = xSemaphoreCreateMutex();
-    }
-    if (!s_can.events) {
-        s_can.events = xQueueCreate(EVENT_QUEUE_LEN, sizeof(can_event_t));
-    }
-    if (!s_restart_lock) {
-        s_restart_lock = xSemaphoreCreateMutex();
-    }
+    /* Called once from app_main before the UI and capture task start. */
+    s_can.lock = xSemaphoreCreateMutex();
+    s_can.events = xQueueCreate(EVENT_QUEUE_LEN, sizeof(can_event_t));
+    s_restart_lock = xSemaphoreCreateMutex();
     return (s_can.lock && s_can.events && s_restart_lock) ? ESP_OK : ESP_ERR_NO_MEM;
 }
 
@@ -360,10 +316,6 @@ esp_err_t twai_capture_start(can_bitrate_t bitrate, can_mode_t mode)
 {
     if (s_can.task) {
         return ESP_ERR_INVALID_STATE;
-    }
-
-    if (!s_can.lock || !s_can.events || !s_restart_lock) {
-        ESP_RETURN_ON_ERROR(twai_capture_init(), TAG, "twai init");
     }
 
     twai_general_config_t general = TWAI_GENERAL_CONFIG_DEFAULT(TWAI_TX_GPIO, TWAI_RX_GPIO,
@@ -385,7 +337,7 @@ esp_err_t twai_capture_start(can_bitrate_t bitrate, can_mode_t mode)
                              TWAI_ALERT_ERR_PASS | TWAI_ALERT_BUS_ERROR |
                              TWAI_ALERT_RX_QUEUE_FULL;
 
-    const esp_err_t install_err = twai_driver_install(&general, timing_for(bitrate),
+    const esp_err_t install_err = twai_driver_install(&general, &bitrate_info(bitrate)->timing,
                                                       &FILTER_ACCEPT_ALL);
     if (install_err != ESP_OK) {
         set_state("STOPPED");
@@ -428,9 +380,6 @@ esp_err_t twai_capture_start(can_bitrate_t bitrate, can_mode_t mode)
 
 esp_err_t twai_capture_restart(can_bitrate_t bitrate, can_mode_t mode)
 {
-    if (!s_restart_lock) {
-        ESP_RETURN_ON_ERROR(twai_capture_init(), TAG, "twai init");
-    }
     xSemaphoreTake(s_restart_lock, portMAX_DELAY);
 
     esp_err_t err;
@@ -469,9 +418,6 @@ persist:
 
 esp_err_t twai_capture_recover(void)
 {
-    if (!s_restart_lock) {
-        ESP_RETURN_ON_ERROR(twai_capture_init(), TAG, "twai init");
-    }
     xSemaphoreTake(s_restart_lock, portMAX_DELAY);
 
     esp_err_t err;
@@ -507,14 +453,10 @@ out:
 
 void twai_stats_snapshot(can_stats_t *out)
 {
-    can_ring_info_t ring;
-    can_ring_get_info(&ring);
-
     stats_lock();
     *out = s_can.stats;
     out->state = s_can.state;
     stats_unlock();
-    out->dropped = ring.dropped;
 }
 
 bool twai_event_pop(can_event_t *out)
@@ -522,31 +464,10 @@ bool twai_event_pop(can_event_t *out)
     return xQueueReceive(s_can.events, out, 0) == pdTRUE;
 }
 
-uint32_t twai_ui_tail(linsight_can_record_t *out, uint32_t n)
-{
-    if (!out || n == 0 || !s_can.lock) {
-        return 0;
-    }
-    if (n > UI_HISTORY) {
-        n = UI_HISTORY;
-    }
-
-    stats_lock();
-    const uint32_t avail = s_ui_count < n ? s_ui_count : n;
-    uint32_t idx = (s_ui_head + UI_HISTORY - avail) % UI_HISTORY;
-    for (uint32_t i = 0; i < avail; i++) {
-        out[i] = s_ui_hist[idx];
-        idx = (idx + 1) % UI_HISTORY;
-    }
-    stats_unlock();
-    return avail;
-}
-
 void twai_stats_clear(void)
 {
     stats_lock();
     memset(&s_can.stats, 0, sizeof(s_can.stats));
     stats_unlock();
-    can_ring_reset_dropped(); /* Clear Stats also clears the OVF indicator */
     ESP_LOGI(TAG, "stats cleared");
 }
