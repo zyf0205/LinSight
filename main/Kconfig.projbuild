@@ -33,11 +33,34 @@ menu "LinSight"
         string "Host IPv4 address"
         default "10.75.237.181"
         help
-            Address of the PC running linsightd.
+            Fallback address of the PC running linsightd when UDP discovery
+            is disabled or gets no reply. Also the primary endpoint when
+            discovery is disabled.
 
     config LINSIGHT_HOST_PORT
         int "Host TCP port"
         range 1 65535
         default 8888
+        help
+            Fallback TCP port. When discovery succeeds, the reply carries
+            the port configured in linsightd (--port).
+
+    config LINSIGHT_DISCOVERY
+        bool "Discover linsightd over UDP broadcast"
+        default y
+        help
+            Probe the LAN for linsightd so a changed host IP does not
+            require rebuilding the firmware. The probe is sent to UDP
+            LINSIGHT_DISCOVERY_PORT; the reply supplies the host address
+            and TCP port. On failure the firmware falls back to
+            LINSIGHT_HOST_IP/LINSIGHT_HOST_PORT.
+
+    config LINSIGHT_DISCOVERY_PORT
+        int "Discovery UDP port"
+        range 1 65535
+        default 8889
+        depends on LINSIGHT_DISCOVERY
+        help
+            Must match linsightd --discovery-port (default 8889).
 
 endmenu

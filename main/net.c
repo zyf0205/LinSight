@@ -5,6 +5,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -47,7 +48,16 @@
 /* Batches (max 819 records each) sent per session-loop iteration. */
 #define MAX_BATCHES_PER_TICK 2
 
-static int tcp_connect(const char *host, uint16_t port, int timeout_ms);
+#define DISCOVERY_PROBE "LINSIGHT?1"
+#define DISCOVERY_PROBE_LEN 10u
+#define DISCOVERY_REPLY_PREFIX "LINSIGHT!1 "
+#define DISCOVERY_REPLY_PREFIX_LEN 11u
+#define DISCOVERY_TIMEOUT_MS 300
+#define DISCOVERY_ATTEMPTS 2
+#define DISCOVERY_RETRY_FAILURES 3u
+
+static int tcp_connect_addr(uint32_t ip_be, uint16_t port, int timeout_ms, int *err_out);
+static bool discover_host(uint32_t *ip_be, uint16_t *port);
 static esp_err_t wifi_init(void);
 
 static EventGroupHandle_t s_wifi_events;
@@ -59,6 +69,16 @@ static size_t s_pending_len;              /* packed frame bytes awaiting send; s
 
 static uint32_t s_ping_value;
 static uint64_t s_ping_sent_us;
+
+/* Host discovery state. Only net_task mutates the endpoint; the IP event
+ * handler publishes the subnet broadcast and a dirty flag. */
+static esp_ip4_addr_t s_bcast_addr;
+static bool s_bcast_valid;
+static bool s_need_discovery = true;
+static uint32_t s_host_ip;      /* network byte order */
+static uint16_t s_host_port;    /* host byte order */
+static bool s_host_valid;
+static bool s_host_discovered;
 
 /* --------------------------------------------------------------- utilities */
 
@@ -274,6 +294,7 @@ static void net_task(void *arg)
     ESP_LOGI(TAG, "connecting Wi-Fi SSID=\"%s\"", CONFIG_LINSIGHT_WIFI_SSID);
 
     uint32_t backoff_ms = RECONNECT_DELAY_MIN_MS;
+    uint32_t fail_streak = 0;
 
     for (;;) {
         if (!(xEventGroupGetBits(s_wifi_events) & WIFI_CONNECTED_BIT)) {
@@ -283,13 +304,68 @@ static void net_task(void *arg)
             continue;
         }
 
+        if (__atomic_load_n(&s_need_discovery, __ATOMIC_ACQUIRE) || !s_host_valid) {
+            uint32_t ip = 0;
+            uint16_t port = 0;
+            bool found = false;
+#if CONFIG_LINSIGHT_DISCOVERY
+            found = discover_host(&ip, &port);
+#endif
+            if (found) {
+                s_host_ip = ip;
+                s_host_port = port;
+                s_host_valid = true;
+                s_host_discovered = true;
+                linsight_ui_set_host_endpoint(ip, port);
+                esp_ip4_addr_t ep = {.addr = ip};
+                ESP_LOGI(TAG, "discovered host " IPSTR ":%u", IP2STR(&ep), (unsigned)port);
+            } else if (!s_host_valid) {
+                struct in_addr fallback;
+                if (inet_pton(AF_INET, CONFIG_LINSIGHT_HOST_IP, &fallback) == 1) {
+                    s_host_ip = fallback.s_addr;
+                    s_host_port = CONFIG_LINSIGHT_HOST_PORT;
+                    s_host_valid = true;
+                    s_host_discovered = false;
+                    linsight_ui_set_host_endpoint(s_host_ip, s_host_port);
+#if CONFIG_LINSIGHT_DISCOVERY
+                    ESP_LOGW(TAG, "discovery failed, fallback %s:%u",
+                             CONFIG_LINSIGHT_HOST_IP, (unsigned)CONFIG_LINSIGHT_HOST_PORT);
+#else
+                    ESP_LOGI(TAG, "discovery disabled, using %s:%u",
+                             CONFIG_LINSIGHT_HOST_IP, (unsigned)CONFIG_LINSIGHT_HOST_PORT);
+#endif
+                } else {
+                    ESP_LOGE(TAG, "bad fallback host address: %s", CONFIG_LINSIGHT_HOST_IP);
+                }
+            } else {
+#if CONFIG_LINSIGHT_DISCOVERY
+                esp_ip4_addr_t ep = {.addr = s_host_ip};
+                ESP_LOGW(TAG, "discovery failed, keeping " IPSTR ":%u", IP2STR(&ep),
+                         (unsigned)s_host_port);
+#endif
+            }
+            __atomic_store_n(&s_need_discovery, false, __ATOMIC_RELEASE);
+        }
+
+        if (!s_host_valid) {
+            vTaskDelay(pdMS_TO_TICKS(RECONNECT_DELAY_MAX_MS));
+            continue;
+        }
+
         linsight_ui_set_conn(UI_CONN_HOST, 0);
-        const int fd = tcp_connect(CONFIG_LINSIGHT_HOST_IP, CONFIG_LINSIGHT_HOST_PORT, 3000);
+        int err = 0;
+        const int fd = tcp_connect_addr(s_host_ip, s_host_port, 3000, &err);
         if (fd < 0) {
-            static uint32_t attempts;
-            if (++attempts % 10u == 1u) {
-                ESP_LOGI(TAG, "host %s:%u unreachable (attempt %u)", CONFIG_LINSIGHT_HOST_IP,
-                         (unsigned)CONFIG_LINSIGHT_HOST_PORT, (unsigned)attempts);
+            fail_streak++;
+            if (fail_streak == 1u || fail_streak % 10u == 0u) {
+                esp_ip4_addr_t ep = {.addr = s_host_ip};
+                ESP_LOGW(TAG, "host " IPSTR ":%u unreachable (attempt %u, errno %d, %s)",
+                         IP2STR(&ep), (unsigned)s_host_port, (unsigned)fail_streak, err,
+                         s_host_discovered ? "discovered" : "fallback");
+            }
+            if (fail_streak % DISCOVERY_RETRY_FAILURES == 0u || err == EHOSTUNREACH ||
+                err == ENETUNREACH) {
+                __atomic_store_n(&s_need_discovery, true, __ATOMIC_RELEASE);
             }
             linsight_ui_set_conn(UI_CONN_RECONNECT, 0);
             vTaskDelay(pdMS_TO_TICKS(backoff_ms));
@@ -299,42 +375,47 @@ static void net_task(void *arg)
         }
 
         backoff_ms = RECONNECT_DELAY_MIN_MS;
+        fail_streak = 0;
+        esp_ip4_addr_t ep = {.addr = s_host_ip};
+        ESP_LOGI(TAG, "TCP session started with " IPSTR ":%u (%s)", IP2STR(&ep),
+                 (unsigned)s_host_port, s_host_discovered ? "discovered" : "fallback");
         session_loop(fd);
         close(fd);
         linsight_ui_set_conn(UI_CONN_RECONNECT, 0);
+        /* The host may have moved while the session was up; probe once before
+         * the next connect. */
+        __atomic_store_n(&s_need_discovery, true, __ATOMIC_RELEASE);
         vTaskDelay(pdMS_TO_TICKS(RECONNECT_DELAY_MIN_MS));
     }
 }
 
 /* --------------------------------------------------------------- transport */
 
-static int tcp_connect(const char *host, uint16_t port, int timeout_ms)
+static int tcp_connect_addr(uint32_t ip_be, uint16_t port, int timeout_ms, int *err_out)
 {
+    int err = 0;
     const int fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (fd < 0) {
-        ESP_LOGW(TAG, "socket failed: errno %d", errno);
-        return -1;
+        err = errno;
+        ESP_LOGW(TAG, "socket failed: errno %d", err);
+        goto fail;
     }
 
     struct sockaddr_in dest = {0};
     dest.sin_family = AF_INET;
     dest.sin_port = htons(port);
-    if (inet_pton(AF_INET, host, &dest.sin_addr) != 1) {
-        ESP_LOGE(TAG, "bad host address: %s", host);
-        close(fd);
-        return -1;
-    }
+    dest.sin_addr.s_addr = ip_be;
 
     const int flags = fcntl(fd, F_GETFL, 0);
     fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 
     int rc = connect(fd, (struct sockaddr *)&dest, sizeof(dest));
     if (rc < 0 && errno != EINPROGRESS) {
-        /* Per-attempt failures are routine (host offline) — summary is logged
-         * by the caller every 10th attempt. */
-        ESP_LOGD(TAG, "connect failed: errno %d", errno);
-        close(fd);
-        return -1;
+        /* Per-attempt failures are routine (host offline) — the caller owns
+         * the visible summary. */
+        err = errno;
+        ESP_LOGD(TAG, "connect failed: errno %d", err);
+        goto fail;
     }
     if (rc < 0) {
         fd_set wfds;
@@ -346,16 +427,17 @@ static int tcp_connect(const char *host, uint16_t port, int timeout_ms)
         };
         rc = select(fd + 1, NULL, &wfds, NULL, &tv);
         if (rc <= 0) {
-            ESP_LOGD(TAG, "connect timeout to %s:%u", host, (unsigned)port);
-            close(fd);
-            return -1;
+            err = rc == 0 ? ETIMEDOUT : errno;
+            ESP_LOGD(TAG, "connect timeout");
+            goto fail;
         }
         int so_error = 0;
         socklen_t optlen = sizeof(so_error);
-        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_error, &optlen) != 0 || so_error != 0) {
-            ESP_LOGD(TAG, "connect error: %d", so_error);
-            close(fd);
-            return -1;
+        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_error, &optlen) != 0 ||
+            so_error != 0) {
+            err = so_error ? so_error : errno;
+            ESP_LOGD(TAG, "connect error: %d", err);
+            goto fail;
         }
     }
 
@@ -370,7 +452,151 @@ static int tcp_connect(const char *host, uint16_t port, int timeout_ms)
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rcv, sizeof(rcv));
     struct timeval snd = {.tv_sec = 0, .tv_usec = 500000};
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &snd, sizeof(snd));
+    if (err_out) {
+        *err_out = 0;
+    }
     return fd;
+
+fail:
+    if (err_out) {
+        *err_out = err;
+    }
+    if (fd >= 0) {
+        close(fd);
+    }
+    return -1;
+}
+
+static bool discover_host(uint32_t *ip_be, uint16_t *port)
+{
+#if CONFIG_LINSIGHT_DISCOVERY
+    const int fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (fd < 0) {
+        ESP_LOGW(TAG, "discovery socket failed: errno %d", errno);
+        return false;
+    }
+
+    /* IP_SOF_BROADCAST is 0 in this IDF build, so this is best-effort for
+     * forward compatibility. */
+    const int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_BROADCAST, &one, sizeof(one));
+
+    struct sockaddr_in local = {0};
+    local.sin_family = AF_INET;
+    local.sin_port = 0;
+    local.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (bind(fd, (struct sockaddr *)&local, sizeof(local)) < 0) {
+        ESP_LOGW(TAG, "discovery bind failed: errno %d", errno);
+        close(fd);
+        return false;
+    }
+    const int flags = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+
+    struct sockaddr_in targets[2] = {0};
+    int target_count = 1;
+    targets[0].sin_family = AF_INET;
+    targets[0].sin_port = htons(CONFIG_LINSIGHT_DISCOVERY_PORT);
+    targets[0].sin_addr.s_addr = htonl(INADDR_BROADCAST);
+
+    const bool bcast_valid = __atomic_load_n(&s_bcast_valid, __ATOMIC_ACQUIRE);
+    const uint32_t bcast = __atomic_load_n(&s_bcast_addr.addr, __ATOMIC_ACQUIRE);
+    if (bcast_valid && bcast != htonl(INADDR_BROADCAST)) {
+        targets[target_count].sin_family = AF_INET;
+        targets[target_count].sin_port = htons(CONFIG_LINSIGHT_DISCOVERY_PORT);
+        targets[target_count].sin_addr.s_addr = bcast;
+        target_count++;
+    }
+
+    for (int attempt = 0; attempt < DISCOVERY_ATTEMPTS; attempt++) {
+        bool sent = false;
+        for (int i = 0; i < target_count; i++) {
+            if (sendto(fd, DISCOVERY_PROBE, DISCOVERY_PROBE_LEN, 0,
+                       (struct sockaddr *)&targets[i], sizeof(targets[i])) >= 0) {
+                sent = true;
+            } else {
+                ESP_LOGD(TAG, "discovery send failed: errno %d", errno);
+            }
+        }
+        if (!sent) {
+            break;
+        }
+
+        const int64_t deadline = esp_timer_get_time() / 1000 + DISCOVERY_TIMEOUT_MS;
+        while (true) {
+            const int64_t now = esp_timer_get_time() / 1000;
+            if (now >= deadline) {
+                break;
+            }
+            const int64_t left = deadline - now;
+            fd_set rfds;
+            FD_ZERO(&rfds);
+            FD_SET(fd, &rfds);
+            struct timeval tv = {
+                .tv_sec = (time_t)(left / 1000),
+                .tv_usec = (suseconds_t)((left % 1000) * 1000),
+            };
+            const int rc = select(fd + 1, &rfds, NULL, NULL, &tv);
+            if (rc < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                ESP_LOGD(TAG, "discovery select failed: errno %d", errno);
+                break;
+            }
+            if (rc == 0) {
+                break;
+            }
+
+            for (;;) {
+                char reply[64];
+                struct sockaddr_in from;
+                socklen_t from_len = sizeof(from);
+                const int n = recvfrom(fd, reply, sizeof(reply) - 1, 0,
+                                       (struct sockaddr *)&from, &from_len);
+                if (n < 0) {
+                    if (errno == EINTR) {
+                        continue;
+                    }
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                        break;
+                    }
+                    ESP_LOGD(TAG, "discovery recv failed: errno %d", errno);
+                    break;
+                }
+                reply[n] = '\0';
+                if (n <= (int)DISCOVERY_REPLY_PREFIX_LEN ||
+                    strncmp(reply, DISCOVERY_REPLY_PREFIX,
+                            DISCOVERY_REPLY_PREFIX_LEN) != 0) {
+                    continue;
+                }
+                char *end = NULL;
+                const unsigned long reply_port =
+                    strtoul(reply + DISCOVERY_REPLY_PREFIX_LEN, &end, 10);
+                if (end == reply + DISCOVERY_REPLY_PREFIX_LEN || reply_port == 0 ||
+                    reply_port > 65535 || (*end != '\n' && *end != '\r' && *end != '\0')) {
+                    continue;
+                }
+                const uint32_t src = from.sin_addr.s_addr;
+                if (src == 0 || src == htonl(INADDR_BROADCAST) ||
+                    (ntohl(src) >> 28) == 0xEu) {
+                    continue;
+                }
+                *ip_be = src;
+                *port = (uint16_t)reply_port;
+                close(fd);
+                return true;
+            }
+        }
+    }
+
+    close(fd);
+    return false;
+#else
+    (void)ip_be;
+    (void)port;
+    return false;
+#endif
 }
 
 /* ------------------------------------------------------------ bring-up */
@@ -386,7 +612,16 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         linsight_ui_set_conn(UI_CONN_RECONNECT, 0);
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         const ip_event_got_ip_t *ev = (const ip_event_got_ip_t *)data;
-        ESP_LOGI(TAG, "Wi-Fi got IP " IPSTR, IP2STR(&ev->ip_info.ip));
+        const uint32_t mask = ev->ip_info.netmask.addr;
+        const uint32_t bcast = (ev->ip_info.ip.addr & mask) | ~mask;
+        esp_ip4_addr_t bcast_addr = {.addr = bcast};
+        __atomic_store_n(&s_bcast_addr.addr, bcast, __ATOMIC_RELEASE);
+        __atomic_store_n(&s_bcast_valid, mask != 0 && mask != 0xFFFFFFFFu,
+                         __ATOMIC_RELEASE);
+        __atomic_store_n(&s_need_discovery, true, __ATOMIC_RELEASE);
+        ESP_LOGI(TAG, "Wi-Fi got IP " IPSTR "/" IPSTR " gw " IPSTR " bcast " IPSTR,
+                 IP2STR(&ev->ip_info.ip), IP2STR(&ev->ip_info.netmask),
+                 IP2STR(&ev->ip_info.gw), IP2STR(&bcast_addr));
         xEventGroupSetBits(s_wifi_events, WIFI_CONNECTED_BIT);
         linsight_ui_set_conn(UI_CONN_HOST, 0);
     }
@@ -472,7 +707,13 @@ esp_err_t net_start(void)
                                                     NET_CORE);
     ESP_RETURN_ON_FALSE(th != NULL, ESP_ERR_NO_MEM, TAG, "net task");
 
-    ESP_LOGI(TAG, "net started, host %s:%u", CONFIG_LINSIGHT_HOST_IP,
+#if CONFIG_LINSIGHT_DISCOVERY
+    ESP_LOGI(TAG, "net started, discovery udp :%u, fallback %s:%u",
+             (unsigned)CONFIG_LINSIGHT_DISCOVERY_PORT, CONFIG_LINSIGHT_HOST_IP,
              (unsigned)CONFIG_LINSIGHT_HOST_PORT);
+#else
+    ESP_LOGI(TAG, "net started, discovery disabled, host %s:%u", CONFIG_LINSIGHT_HOST_IP,
+             (unsigned)CONFIG_LINSIGHT_HOST_PORT);
+#endif
     return ESP_OK;
 }
