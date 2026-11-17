@@ -114,7 +114,7 @@ USB-CAN            CAN_H ── 收发器 CANH
 | FATFS | `LFN_NONE=y`、`ALLOC_PREFER_EXTRAM=y`（SD 黑盒，8.3 文件名） |
 | 分区表 | 加 64KB `coredump` 分区 |
 
-注意：`CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384` 会让 >16KB 的 `malloc` 落 PSRAM；draw buffer 必须 `heap_caps_malloc(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL)`。
+注意：`CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=1024` 会让 >1KB 的普通 `malloc` 落 PSRAM；draw buffer 必须 `heap_caps_malloc(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL)`。
 
 ## 7. 上电自检
 

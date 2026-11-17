@@ -102,6 +102,11 @@ static esp_err_t backlight_init(void)
 
 esp_err_t bsp_backlight_set(int percent)
 {
+    if (percent < 0) {
+        percent = 0;
+    } else if (percent > 100) {
+        percent = 100;
+    }
     uint32_t duty = (1023u * (uint32_t)percent) / 100u;
     ESP_RETURN_ON_ERROR(ledc_set_duty(LEDC_LOW_SPEED_MODE, BSP_LCD_LEDC_CH, duty),
                         TAG, "ledc duty");

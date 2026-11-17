@@ -295,10 +295,11 @@ def bytes_to_ascii(data_bytes):
     return "".join(chr(b) if 32 <= b <= 126 else "." for b in data_bytes)
 
 
-def cansend_frame(can_id, data, extended, is_rtr=False):
+def cansend_frame(can_id, data, extended, is_rtr=False, dlc=None):
     id_text = f"{can_id:08X}" if (extended or can_id > 0x7FF) else f"{can_id:03X}"
     if is_rtr:
-        return f"{id_text}#R{len(data) if data else ''}"
+        rtr_dlc = len(data) if dlc is None else max(0, min(8, int(dlc)))
+        return f"{id_text}#R{rtr_dlc}" if rtr_dlc else f"{id_text}#R"
     return f"{id_text}#{data.hex().upper()}"
 
 
@@ -334,6 +335,7 @@ class CanBenchApp:
         self._last_busid = None
         self._last_can_present = False
         self._can_fail_count = 0
+        self._usb_poll_skip = 0
         self._base_tx_packets = 0
         self._base_rx_packets = 0
 
@@ -376,6 +378,7 @@ class CanBenchApp:
         self._auto_scroll = cfg.get("autoscroll", True)
 
         self.data_var.trace_add("write", self._sync_dlc_from_data)
+        self.rtr_var.trace_add("write", self._sync_dlc_from_data)
 
     def _save_config(self):
         cfg = {
@@ -696,7 +699,13 @@ class CanBenchApp:
         canvas.bind("<Configure>", _on_canvas_configure)
 
         def _on_mousewheel(event):
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            w = event.widget
+            while w is not None:
+                if w is parent:
+                    if scroll_content.winfo_reqheight() > canvas.winfo_height():
+                        canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+                    break
+                w = getattr(w, "master", None)
 
         canvas.bind_all("<MouseWheel>", _on_mousewheel, add="+")
 
@@ -1157,7 +1166,7 @@ class CanBenchApp:
         ttk.Label(
             foot,
             text="💡 提示：LinSight 固件默认处于 LISTEN_ONLY 模式（不应答 ACK）；"
-                 "双节点收发联调请在 ESP32 固件 menuconfig 中切换为 NORMAL 模式。",
+                 "双节点收发联调请在设备 SETUP 页面（或 menuconfig）切换为 NORMAL 模式。",
             style="Sub.TLabel",
         ).pack(side="left")
 
@@ -1229,35 +1238,47 @@ class CanBenchApp:
             self.preset_tree.delete(item)
         for i, p in enumerate(self.presets):
             tag = "even" if i % 2 == 0 else "odd"
-            ext_str = "扩展" if p.get("ext") else "标准"
+            if p.get("rtr"):
+                type_str = "远程"
+            else:
+                type_str = "扩展" if p.get("ext") else "标准"
+            data_disp = f"RTR (DLC={p.get('dlc', 0)})" if p.get("rtr") else p.get("data", "")
             self.preset_tree.insert(
                 "",
                 "end",
-                values=(p.get("name", "预设"), p.get("id", "123"), ext_str, p.get("data", "")),
+                values=(p.get("name", "预设"), p.get("id", "123"), type_str, data_disp),
                 tags=(tag,),
             )
 
     def _load_selected_preset(self):
         sel = self.preset_tree.selection()
         if not sel:
-            return
+            return False
         idx = self.preset_tree.index(sel[0])
         if 0 <= idx < len(self.presets):
             p = self.presets[idx]
             self.canid_var.set(p.get("id", "123"))
-            self.ext_var.set(p.get("ext", False))
-            self.data_var.set(p.get("data", ""))
+            self.ext_var.set(bool(p.get("ext", False)))
+            is_rtr = bool(p.get("rtr", False))
+            self.rtr_var.set(is_rtr)
+            if is_rtr:
+                self.dlc_var.set(int(p.get("dlc", 0)))
+                self.data_var.set("")
+            else:
+                self.data_var.set(p.get("data", ""))
             self.log("info", f"已载入预设报文 [{p.get('name')}]")
+            return True
+        return False
 
     def _send_selected_preset(self):
-        self._load_selected_preset()
-        self.do_send_single()
+        if self._load_selected_preset():
+            self.do_send_single()
+        else:
+            self.log("warn", "请先在预设列表中选中一条报文")
 
     def _add_current_as_preset(self):
         try:
-            can_id = parse_can_id(self.canid_var.get())
-            data = parse_payload(self.data_var.get())
-            extended = bool(self.ext_var.get()) or can_id > 0x7FF
+            can_id, data, extended, is_rtr = self._frame_inputs()
         except ValueError as exc:
             messagebox.showerror("参数错误", str(exc), parent=self.root)
             return
@@ -1268,13 +1289,15 @@ class CanBenchApp:
         if not name:
             return
         id_str = f"{can_id:08X}" if extended else f"{can_id:03X}"
+        dlc = int(self.dlc_var.get()) if is_rtr else len(data)
         self.presets.append(
             {
                 "name": name.strip(),
                 "id": id_str,
                 "ext": extended,
-                "dlc": len(data),
-                "data": format_payload_spaced(data),
+                "rtr": is_rtr,
+                "dlc": dlc,
+                "data": "" if is_rtr else format_payload_spaced(data),
             }
         )
         self._refresh_presets_table()
@@ -1294,6 +1317,16 @@ class CanBenchApp:
 
     # --------------------------------------------------------- format & ui --
     def _sync_dlc_from_data(self, *_args):
+        if self.rtr_var.get():
+            try:
+                data = parse_payload(self.data_var.get())
+                dlc = len(data) if data else int(self.dlc_var.get())
+            except ValueError:
+                dlc = int(self.dlc_var.get())
+            dlc = max(0, min(8, dlc))
+            self.dlc_var.set(dlc)
+            self.dlc_label_var.set(f"DLC: {dlc} 字节 (RTR 远程帧)")
+            return
         try:
             data = parse_payload(self.data_var.get())
             self.dlc_var.set(len(data))
@@ -1360,27 +1393,7 @@ class CanBenchApp:
                 filt = self.filter_var.get().strip().lower()
                 for f in new_frames:
                     if self._matches_filter(f, filt):
-                        tag = "even" if f["idx"] % 2 == 0 else "odd"
-                        tags = [tag]
-                        if f["type"] == "扩展":
-                            tags.append("ext")
-                        elif f["type"] == "远程":
-                            tags.append("rtr")
-                        self.mon_tree.insert(
-                            "",
-                            "end",
-                            values=(
-                                f["idx"],
-                                f["time"],
-                                f["delta"],
-                                f["canid_str"],
-                                f["type"],
-                                f["dlc"],
-                                f["data"],
-                                f["ascii"],
-                            ),
-                            tags=tuple(tags),
-                        )
+                        self._insert_frame_row(f)
 
                 # 保留 Treeview 中最多 400 条渲染条目以维持极致性能
                 children = self.mon_tree.get_children()
@@ -1430,6 +1443,9 @@ class CanBenchApp:
             if current not in distros and distros:
                 self.distro_var.set(distros[0])
 
+        elif kind == "poll_now":
+            self._trigger_poll(force_usb=True)
+
     def _set_conn_enabled(self, enabled):
         state = "normal" if enabled else "disabled"
         for btn in (
@@ -1443,21 +1459,15 @@ class CanBenchApp:
             btn.configure(state=state)
 
     # ------------------------------------------------------- state & poll ---
-    def _wsl_root(self, script, timeout=25):
+    def _wsl_exec(self, argv, timeout=15):
+        """直接执行 WSL 二进制程序（跳过 bash 启动开销）。"""
         return run_cmd(
-            [
-                "wsl",
-                "-d",
-                self.distro_var.get().strip(),
-                "-u",
-                "root",
-                "--exec",
-                "bash",
-                "-c",
-                script,
-            ],
+            ["wsl", "-d", self.distro_var.get().strip(), "-u", "root", "--exec", *argv],
             timeout,
         )
+
+    def _wsl_root(self, script, timeout=25):
+        return self._wsl_exec(["bash", "-c", script], timeout)
 
     def _find_device(self):
         usbipd = find_usbipd()
@@ -1487,22 +1497,15 @@ class CanBenchApp:
 
     def _can_stats(self):
         iface = self.iface_var.get().strip() or "can0"
-        for attempt in (1, 2):
+        try:
+            result = self._wsl_exec(["ip", "-j", "-d", "-s", "link", "show", iface], 10)
+        except Exception:
+            return None
+        if result and result.returncode == 0 and result.stdout.strip():
             try:
-                result = self._wsl_root(f"ip -j -d -s link show {iface}", 15)
+                return self._parse_can_stats(json.loads(result.stdout)[0])
             except Exception:
-                result = None
-            if (
-                result is not None
-                and result.returncode == 0
-                and result.stdout.strip()
-            ):
-                try:
-                    return self._parse_can_stats(json.loads(result.stdout)[0])
-                except Exception:
-                    pass
-            if attempt == 1:
-                time.sleep(0.25)
+                pass
         return None
 
     @staticmethod
@@ -1631,16 +1634,36 @@ class CanBenchApp:
             self.rx_total_lbl.configure(text="0")
             self.log("info", "已重置软件统计发包计数基准")
 
+    def _trigger_poll(self, force_usb=False):
+        if self._closing or self._polling:
+            return
+        self._polling = True
+        threading.Thread(target=self._poll_worker, args=(force_usb,), daemon=True).start()
+
     def _poll_loop(self):
         if self._closing:
             return
-        if not self._polling:
-            self._polling = True
-            threading.Thread(target=self._poll_worker, daemon=True).start()
-        self.root.after(1800, self._poll_loop)
+        self._trigger_poll()
+        interval = 2000 if self._last_can_present else 3000
+        self.root.after(interval, self._poll_loop)
 
-    def _poll_worker(self):
+    def _poll_worker(self, force_usb=False):
         try:
+            # 当 can0 已在线且正常工作时，跳过大部分 usbipd list 子进程以降低系统开销
+            if (
+                not force_usb
+                and self._last_usb_state == "Attached"
+                and self._last_can_present
+                and self._usb_poll_skip < 4
+            ):
+                stats = self._can_stats()
+                if stats is not None:
+                    self._usb_poll_skip += 1
+                    self._can_fail_count = 0
+                    self.post("can", stats)
+                    return
+
+            self._usb_poll_skip = 0
             dev = self._find_device()
             self.post("usb", dev)
             if dev and dev["state"] == "Attached":
@@ -1885,9 +1908,9 @@ class CanBenchApp:
     # --------------------------------------------------------------- send --
     def _frame_inputs(self):
         can_id = parse_can_id(self.canid_var.get())
-        data = parse_payload(self.data_var.get())
-        extended = bool(self.ext_var.get()) or can_id > 0x7FF
         is_rtr = bool(self.rtr_var.get())
+        data = b"" if (is_rtr and not self.data_var.get().strip()) else parse_payload(self.data_var.get())
+        extended = bool(self.ext_var.get()) or can_id > 0x7FF
         return can_id, data, extended, is_rtr
 
     def do_send_single(self):
@@ -1898,14 +1921,15 @@ class CanBenchApp:
             return
 
         iface = self.iface_var.get().strip() or "can0"
-        frame = cansend_frame(can_id, data, extended, is_rtr)
+        dlc = int(self.dlc_var.get()) if is_rtr else None
+        frame = cansend_frame(can_id, data, extended, is_rtr, dlc=dlc)
         threading.Thread(
             target=self._send_single_worker, args=(iface, frame), daemon=True
         ).start()
 
     def _send_single_worker(self, iface, frame):
         try:
-            result = self._wsl_root(f"cansend {iface} {frame}", 15)
+            result = self._wsl_exec(["cansend", iface, frame], 10)
             if result.returncode != 0:
                 self.log("err", f"发送失败 {frame}：{output_of(result)}")
             else:
@@ -2001,7 +2025,7 @@ class CanBenchApp:
         proc = self._gen_proc
         self._gen_proc = None
         try:
-            self._wsl_root("pkill -x cangen 2>/dev/null || true", 8)
+            self._wsl_exec(["pkill", "-x", "cangen"], 8)
         except Exception:
             pass
         if proc and proc.poll() is None:
@@ -2073,20 +2097,23 @@ class CanBenchApp:
                 stamp += f".{int(now * 1000) % 1000:03d}"
 
                 is_ext = canid > 0x7FF or len(parsed["raw_canid_str"]) > 3
-                can_type = "标准"
-                if "remote request" in parsed["data"].lower():
+                is_rtr = "remote request" in parsed["data"].lower()
+                if is_rtr:
                     can_type = "远程"
-                elif is_ext:
-                    can_type = "扩展"
+                    data_str = "RTR"
+                else:
+                    can_type = "扩展" if is_ext else "标准"
+                    data_str = parsed["data"]
 
                 canid_str = f"0x{canid:08X}" if is_ext else f"0x{canid:03X}"
 
                 # ASCII 解析
                 raw_bytes = b""
-                try:
-                    raw_bytes = bytes.fromhex(parsed["data"].replace(" ", ""))
-                except Exception:
-                    pass
+                if not is_rtr and data_str:
+                    try:
+                        raw_bytes = bytes.fromhex(data_str.replace(" ", ""))
+                    except Exception:
+                        pass
                 ascii_repr = bytes_to_ascii(raw_bytes) if raw_bytes else ""
 
                 frame_item = {
@@ -2097,7 +2124,7 @@ class CanBenchApp:
                     "canid_str": canid_str,
                     "type": can_type,
                     "dlc": parsed["dlc"],
-                    "data": parsed["data"],
+                    "data": data_str,
                     "ascii": ascii_repr,
                 }
                 batch.append(frame_item)
@@ -2121,7 +2148,7 @@ class CanBenchApp:
         proc = self._mon_proc
         self._mon_proc = None
         try:
-            self._wsl_root("pkill -x candump 2>/dev/null || true", 8)
+            self._wsl_exec(["pkill", "-x", "candump"], 8)
         except Exception:
             pass
         if proc and proc.poll() is None:
@@ -2161,6 +2188,28 @@ class CanBenchApp:
             or filt in f["type"].lower()
         )
 
+    def _insert_frame_row(self, f):
+        tags = ["even" if f["idx"] % 2 == 0 else "odd"]
+        if f["type"] == "扩展":
+            tags.append("ext")
+        elif f["type"] == "远程":
+            tags.append("rtr")
+        self.mon_tree.insert(
+            "",
+            "end",
+            values=(
+                f["idx"],
+                f["time"],
+                f["delta"],
+                f["canid_str"],
+                f["type"],
+                f["dlc"],
+                f["data"],
+                f["ascii"],
+            ),
+            tags=tuple(tags),
+        )
+
     def _on_filter_changed(self, *_args):
         self._rebuild_tree_from_buffer()
 
@@ -2172,27 +2221,7 @@ class CanBenchApp:
         # 显示最后匹配的 400 条
         matched = [f for f in self._raw_frames if self._matches_filter(f, filt)][-400:]
         for f in matched:
-            tag = "even" if f["idx"] % 2 == 0 else "odd"
-            tags = [tag]
-            if f["type"] == "扩展":
-                tags.append("ext")
-            elif f["type"] == "远程":
-                tags.append("rtr")
-            self.mon_tree.insert(
-                "",
-                "end",
-                values=(
-                    f["idx"],
-                    f["time"],
-                    f["delta"],
-                    f["canid_str"],
-                    f["type"],
-                    f["dlc"],
-                    f["data"],
-                    f["ascii"],
-                ),
-                tags=tuple(tags),
-            )
+            self._insert_frame_row(f)
         if self._auto_scroll and matched:
             self.mon_tree.yview_moveto(1.0)
 
@@ -2270,9 +2299,16 @@ class CanBenchApp:
             vals = self.mon_tree.item(sel[0], "values")
             if vals and len(vals) >= 7:
                 can_id_str = vals[3].replace("0x", "")
+                is_rtr = vals[4] == "远程"
+                is_ext = vals[4] == "扩展" or len(can_id_str) > 3
                 self.canid_var.set(can_id_str)
-                self.ext_var.set(vals[4] == "扩展")
-                self.data_var.set(vals[6])
+                self.ext_var.set(is_ext)
+                self.rtr_var.set(is_rtr)
+                if is_rtr:
+                    self.dlc_var.set(int(vals[5]))
+                    self.data_var.set("")
+                else:
+                    self.data_var.set(vals[6])
                 self.send_notebook.select(0)
                 self.log("info", f"已载入报文 [ID: 0x{can_id_str}] 到单帧发送区")
 
@@ -2283,8 +2319,9 @@ class CanBenchApp:
         vals = self.mon_tree.item(sel[0], "values")
         if vals and len(vals) >= 7:
             can_id_str = vals[3].replace("0x", "")
-            is_ext = vals[4] == "扩展"
-            data_str = vals[6]
+            is_rtr = vals[4] == "远程"
+            is_ext = vals[4] == "扩展" or len(can_id_str) > 3
+            data_str = "" if is_rtr else vals[6]
             name = simpledialog.askstring(
                 "添加到预设", "请输入预设报文名称:", initialvalue=f"报文_0x{can_id_str}", parent=self.root
             )
@@ -2295,6 +2332,7 @@ class CanBenchApp:
                     "name": name.strip(),
                     "id": can_id_str,
                     "ext": is_ext,
+                    "rtr": is_rtr,
                     "dlc": int(vals[5]),
                     "data": data_str,
                 }

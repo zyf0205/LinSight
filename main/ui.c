@@ -12,9 +12,8 @@
 
 #include "bsp.h"
 #include "esp_lvgl_port.h"
-#include "esp_timer.h"
-#include "frame.h"
 #include "lvgl.h"
+#include "sdkconfig.h"
 #include "sd_store.h"
 #include "twai.h"
 
@@ -110,17 +109,14 @@ static char s_txt_diag_tec[12], s_txt_diag_rec[12];
 static char s_txt_diag_err[16], s_txt_diag_boff[16], s_txt_diag_ovf[16];
 static char s_txt_diag_act[20];
 static char s_txt_diag_sd_st[20], s_txt_diag_sd_free[20], s_txt_diag_sd_drop[16];
+static char s_txt_set_host_ep[56];
 static char s_txt_set_host_link[48];
 static char s_txt_toast[48];
 
 /* Runtime states */
-static linsight_conn_t s_conn = UI_CONN_WIFI;
-static uint32_t s_rtt_ms = 0;
+static uint32_t s_conn_mailbox = (uint32_t)UI_CONN_WIFI << 24;
 static bool s_frozen = false;
 static can_stats_t s_frozen_stats;
-static volatile linsight_conn_t s_conn_req = UI_CONN_WIFI;
-static volatile uint32_t s_rtt_req = 0;
-static volatile bool s_remote_req = false;
 
 static const can_bitrate_t BITRATES[4]  = {CAN_BITRATE_125K, CAN_BITRATE_250K, CAN_BITRATE_500K, CAN_BITRATE_1M};
 static const char *BITRATE_LABELS[4]    = {"125K", "250K", "500K", "1M"};
@@ -363,10 +359,6 @@ static void brightness_click_cb(lv_event_t *e)
     char buf[32];
     snprintf(buf, sizeof(buf), "BRIGHTNESS: %d%%", BRIGHTNESS_LEVELS[idx]);
     toast_show(buf);
-    for (int i = 0; i < 4; i++) {
-        obj_bg_color(s_set_bl_btn[i], i == idx ? COL_ACCENT_CYAN : COL_BG_CARD, 0);
-        label_color(lv_obj_get_child(s_set_bl_btn[i], 0), i == idx ? COL_BG_ROOT : COL_TEXT_PRI);
-    }
 }
 
 /* ------------------------------------------------------------- View Builders */
@@ -526,12 +518,18 @@ static void build_set_view(lv_obj_t *parent)
         lv_obj_center(l);
     }
 
-    /* Row 4: Host Telemetry & AP Info Card (absorbs detailed link info from top bar) */
+    /* Row 4: Host Telemetry (Wi-Fi STA / TCP endpoint & live link state) */
     lv_obj_t *host_card = card_new(parent, PAD_X, 116, CARD_FULL_W, 58);
-    lbl_new(host_card, "PC HOST TELEMETRY (Wi-Fi AP)", 8, 6, &lv_font_montserrat_12, COL_ACCENT_CYAN);
-    lbl_new(host_card, "SSID: LinSight_AP   |   IP: 192.168.4.1", 8, 23, &lv_font_montserrat_12, COL_TEXT_SEC);
+    lbl_new(host_card, "HOST STREAM (Wi-Fi STA / TCP)", 8, 6, &lv_font_montserrat_12, COL_ACCENT_CYAN);
 
-    snprintf(s_txt_set_host_link, sizeof(s_txt_set_host_link), "Status: AP READY (Waiting for PC)");
+    snprintf(s_txt_set_host_ep, sizeof(s_txt_set_host_ep), "SSID: %.14s | %s:%u",
+             CONFIG_LINSIGHT_WIFI_SSID, CONFIG_LINSIGHT_HOST_IP,
+             (unsigned)CONFIG_LINSIGHT_HOST_PORT);
+    lv_obj_t *ep_lbl = lbl_new(host_card, s_txt_set_host_ep, 8, 23, &lv_font_montserrat_12, COL_TEXT_SEC);
+    lv_obj_set_width(ep_lbl, CARD_FULL_W - 16);
+    lv_label_set_long_mode(ep_lbl, LV_LABEL_LONG_DOT);
+
+    snprintf(s_txt_set_host_link, sizeof(s_txt_set_host_link), "Status: JOINING WI-FI...");
     s_set_host_link_lbl = lbl_new(host_card, s_txt_set_host_link, 8, 40, &lv_font_montserrat_12, COL_WARN_AMBER);
 }
 
@@ -601,12 +599,10 @@ static void ui_tick_cb(lv_timer_t *timer)
 {
     (void)timer;
 
-    /* Drain remote connection mailbox */
-    if (s_remote_req) {
-        s_conn = s_conn_req;
-        s_rtt_ms = s_rtt_req;
-        s_remote_req = false;
-    }
+    /* Read lock-free remote connection mailbox */
+    const uint32_t conn_packed = __atomic_load_n(&s_conn_mailbox, __ATOMIC_RELAXED);
+    const linsight_conn_t conn = (linsight_conn_t)(conn_packed >> 24);
+    const uint32_t rtt_ms = conn_packed & 0xFFFFFFu;
 
     /* Auto-hide toast after 1.5s */
     if (s_toast && !lv_obj_has_flag(s_toast, LV_OBJ_FLAG_HIDDEN)) {
@@ -651,7 +647,7 @@ static void ui_tick_cb(lv_timer_t *timer)
     if (sd.recording) {
         LBL_FMT(s_top_badge_lbl, s_txt_top_badge, "REC #%02lu", (unsigned long)sd.files);
         label_color(s_top_badge_lbl, COL_ERR_RED);
-    } else if (s_conn == UI_CONN_ONLINE) {
+    } else if (conn == UI_CONN_ONLINE) {
         LBL_SET(s_top_badge_lbl, s_txt_top_badge, "HOST LINK");
         label_color(s_top_badge_lbl, COL_OK_GREEN);
     } else if (sd.mounted) {
@@ -755,6 +751,7 @@ static void ui_tick_cb(lv_timer_t *timer)
     /* 4. View 2: SET */
     if (s_current_view == VIEW_SET) {
         const can_bitrate_t cur_br = twai_current_bitrate();
+        const int cur_bl = bsp_backlight_get();
         for (int i = 0; i < 4; i++) {
             const bool act = (BITRATES[i] == cur_br);
             obj_bg_color(s_set_br_btn[i], act ? COL_ACCENT_CYAN : COL_BG_CARD, 0);
@@ -765,14 +762,27 @@ static void ui_tick_cb(lv_timer_t *timer)
             obj_bg_color(s_set_mode_btn[i], act ? COL_ACCENT_CYAN : COL_BG_CARD, 0);
             label_color(lv_obj_get_child(s_set_mode_btn[i], 0), act ? COL_BG_ROOT : COL_TEXT_PRI);
         }
+        for (int i = 0; i < 4; i++) {
+            const bool act = (BRIGHTNESS_LEVELS[i] == cur_bl);
+            obj_bg_color(s_set_bl_btn[i], act ? COL_ACCENT_CYAN : COL_BG_CARD, 0);
+            label_color(lv_obj_get_child(s_set_bl_btn[i], 0), act ? COL_BG_ROOT : COL_TEXT_PRI);
+        }
 
-        if (s_conn == UI_CONN_ONLINE) {
+        if (conn == UI_CONN_ONLINE) {
             LBL_FMT(s_set_host_link_lbl, s_txt_set_host_link,
-                    "Status:HOST ONLINE  (RTT: %lu ms)", (unsigned long)s_rtt_ms);
+                    "Status: ONLINE  (RTT: %lu ms)", (unsigned long)rtt_ms);
             label_color(s_set_host_link_lbl, COL_OK_GREEN);
+        } else if (conn == UI_CONN_HOST) {
+            LBL_SET(s_set_host_link_lbl, s_txt_set_host_link,
+                    "Status: CONNECTING TO HOST...");
+            label_color(s_set_host_link_lbl, COL_ACCENT_CYAN);
+        } else if (conn == UI_CONN_RECONNECT) {
+            LBL_SET(s_set_host_link_lbl, s_txt_set_host_link,
+                    "Status: RECONNECTING...");
+            label_color(s_set_host_link_lbl, COL_WARN_AMBER);
         } else {
             LBL_SET(s_set_host_link_lbl, s_txt_set_host_link,
-                    "Status: AP READY  (Waiting for PC)");
+                    "Status: JOINING WI-FI...");
             label_color(s_set_host_link_lbl, COL_WARN_AMBER);
         }
     }
@@ -817,10 +827,6 @@ void linsight_ui_init(void)
     /* Initial state */
     view_show(VIEW_DASH);
 
-    /* Initial brightness highlight (50%) */
-    obj_bg_color(s_set_bl_btn[1], COL_ACCENT_CYAN, 0);
-    label_color(lv_obj_get_child(s_set_bl_btn[1], 0), COL_BG_ROOT);
-
     /* 20 Hz tick timer */
     lv_timer_create(ui_tick_cb, 50, NULL);
 
@@ -830,9 +836,9 @@ void linsight_ui_init(void)
 
 void linsight_ui_set_conn(linsight_conn_t state, uint32_t rtt_ms)
 {
-    s_conn_req = state;
-    s_rtt_req = rtt_ms;
-    s_remote_req = true;
+    const uint32_t clamped = rtt_ms > 0xFFFFFFu ? 0xFFFFFFu : rtt_ms;
+    const uint32_t packed = ((uint32_t)state << 24) | clamped;
+    __atomic_store_n(&s_conn_mailbox, packed, __ATOMIC_RELAXED);
 }
 
 void linsight_ui_handle_key(bool long_press)

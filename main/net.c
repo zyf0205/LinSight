@@ -53,9 +53,9 @@ static esp_err_t wifi_init(void);
 static EventGroupHandle_t s_wifi_events;
 
 static linsight_parser_t s_parser;
-static uint8_t *s_tx_buf;                         /* PSRAM, one CAN_BATCH frame */
-static linsight_can_record_t s_pop[LINSIGHT_BATCH_MAX_RECORDS]; /* internal, 16 KB */
-static uint16_t s_pending_count; /* popped but not yet fully sent; survives reconnect */
+static uint8_t *s_tx_buf;                 /* PSRAM: header + one CAN_BATCH payload */
+static linsight_can_record_t *s_pop;      /* PSRAM: LINSIGHT_BATCH_MAX_RECORDS */
+static size_t s_pending_len;              /* packed frame bytes awaiting send; survives reconnect */
 
 static uint32_t s_ping_value;
 static uint64_t s_ping_sent_us;
@@ -100,29 +100,30 @@ static bool send_frame(int fd, uint8_t type, const uint8_t *payload, uint16_t le
 /* ------------------------------------------------------------- batch path */
 
 /* Send up to MAX_BATCHES_PER_TICK batches; returns false on socket error.
- * A popped batch stays in s_pop until its whole frame is sent, so a failed
- * send/reconnect does not consume ring records. The host dedupes a possible
- * partial resend by ts_ms/seq. */
+ * A popped batch stays packed in s_tx_buf until its whole frame is sent, so a
+ * failed send/reconnect does not consume ring records. The host dedupes a
+ * possible partial resend by ts_ms/seq. */
 static bool send_batches(int fd)
 {
     for (int i = 0; i < MAX_BATCHES_PER_TICK; i++) {
-        if (s_pending_count == 0) {
-            s_pending_count = (uint16_t)can_ring_pop(s_pop, LINSIGHT_BATCH_MAX_RECORDS);
-            if (s_pending_count == 0) {
+        if (s_pending_len == 0) {
+            const uint16_t count =
+                (uint16_t)can_ring_pop(s_pop, LINSIGHT_BATCH_MAX_RECORDS);
+            if (count == 0) {
                 return true;
             }
+            const size_t payload = linsight_batch_pack(
+                s_tx_buf + LINSIGHT_FRAME_HEADER_SIZE, LINSIGHT_MAX_CAN_BATCH,
+                s_pop, count);
+            linsight_frame_write_header(s_tx_buf, LINSIGHT_FRAME_CAN_BATCH,
+                                        (uint16_t)payload);
+            s_pending_len = LINSIGHT_FRAME_HEADER_SIZE + payload;
         }
 
-        const size_t payload = linsight_batch_pack(s_tx_buf, LINSIGHT_MAX_CAN_BATCH, s_pop,
-                                                   s_pending_count);
-
-        uint8_t hdr[LINSIGHT_FRAME_HEADER_SIZE];
-        linsight_frame_write_header(hdr, LINSIGHT_FRAME_CAN_BATCH, (uint16_t)payload);
-        if (!send_all(fd, hdr, sizeof(hdr)) ||
-            !send_all(fd, s_tx_buf, payload)) {
+        if (!send_all(fd, s_tx_buf, s_pending_len)) {
             return false;
         }
-        s_pending_count = 0;
+        s_pending_len = 0;
     }
     return true;
 }
@@ -247,7 +248,7 @@ static void session_loop(int fd)
         }
     }
 
-    /* Pending batches stay in s_pop for the next session. */
+    /* Pending batch stays packed in s_tx_buf for the next session. */
     linsight_ui_set_conn(UI_CONN_RECONNECT, 0);
     ESP_LOGI(TAG, "TCP session ended");
 }
@@ -444,8 +445,11 @@ static esp_err_t buffers_init(void)
     static uint8_t parser_scratch[PARSER_BUF_SIZE];
     linsight_parser_init(&s_parser, parser_scratch, PARSER_BUF_SIZE);
 
-    s_tx_buf = heap_caps_malloc(LINSIGHT_MAX_CAN_BATCH, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!s_tx_buf) {
+    s_tx_buf = heap_caps_malloc(LINSIGHT_FRAME_HEADER_SIZE + LINSIGHT_MAX_CAN_BATCH,
+                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    s_pop = heap_caps_malloc(LINSIGHT_BATCH_MAX_RECORDS * sizeof(*s_pop),
+                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_tx_buf || !s_pop) {
         return ESP_ERR_NO_MEM;
     }
 
