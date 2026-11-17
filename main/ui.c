@@ -94,6 +94,7 @@ static lv_obj_t *s_diag_sd_st_val, *s_diag_sd_free_val, *s_diag_sd_drop_val;
 static lv_obj_t *s_set_br_btn[4];
 static lv_obj_t *s_set_mode_btn[3];
 static lv_obj_t *s_set_bl_btn[4];
+static lv_obj_t *s_set_host_ep_lbl;
 static lv_obj_t *s_set_host_link_lbl;
 
 /* Toast */
@@ -115,6 +116,11 @@ static char s_txt_toast[48];
 
 /* Runtime states */
 static uint32_t s_conn_mailbox = (uint32_t)UI_CONN_WIFI << 24;
+/* Host endpoint publication: single writer (net_task), reader in LVGL tick. */
+static uint32_t s_ep_seq;
+static uint32_t s_ep_ip;
+static uint32_t s_ep_port;
+static uint32_t s_ep_seen;
 static bool s_frozen = false;
 static can_stats_t s_frozen_stats;
 
@@ -528,6 +534,7 @@ static void build_set_view(lv_obj_t *parent)
     lv_obj_t *ep_lbl = lbl_new(host_card, s_txt_set_host_ep, 8, 23, &lv_font_montserrat_12, COL_TEXT_SEC);
     lv_obj_set_width(ep_lbl, CARD_FULL_W - 16);
     lv_label_set_long_mode(ep_lbl, LV_LABEL_LONG_DOT);
+    s_set_host_ep_lbl = ep_lbl;
 
     snprintf(s_txt_set_host_link, sizeof(s_txt_set_host_link), "Status: JOINING WI-FI...");
     s_set_host_link_lbl = lbl_new(host_card, s_txt_set_host_link, 8, 40, &lv_font_montserrat_12, COL_WARN_AMBER);
@@ -595,6 +602,29 @@ static void splash_create(void)
 }
 
 /* ------------------------------------------------------------- 20Hz Refresh */
+
+/* Seqlock reader for the host endpoint published by net_task. The writer
+ * bumps seq to odd, stores ip/port, then bumps to even. */
+static bool host_endpoint_read(uint32_t *ip, uint32_t *port)
+{
+    for (int i = 0; i < 3; i++) {
+        const uint32_t seq1 = __atomic_load_n(&s_ep_seq, __ATOMIC_ACQUIRE);
+        if (seq1 & 1u) {
+            continue;
+        }
+        const uint32_t ipv = __atomic_load_n(&s_ep_ip, __ATOMIC_RELAXED);
+        const uint32_t portv = __atomic_load_n(&s_ep_port, __ATOMIC_RELAXED);
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        const uint32_t seq2 = __atomic_load_n(&s_ep_seq, __ATOMIC_ACQUIRE);
+        if (seq1 == seq2) {
+            *ip = ipv;
+            *port = portv;
+            return true;
+        }
+    }
+    return false;
+}
+
 static void ui_tick_cb(lv_timer_t *timer)
 {
     (void)timer;
@@ -750,6 +780,23 @@ static void ui_tick_cb(lv_timer_t *timer)
 
     /* 4. View 2: SET */
     if (s_current_view == VIEW_SET) {
+        const uint32_t ep_seq = __atomic_load_n(&s_ep_seq, __ATOMIC_ACQUIRE);
+        if (ep_seq != s_ep_seen && !(ep_seq & 1u)) {
+            uint32_t ep_ip = 0;
+            uint32_t ep_port = 0;
+            if (host_endpoint_read(&ep_ip, &ep_port)) {
+                s_ep_seen = ep_seq;
+                const uint8_t *octet = (const uint8_t *)&ep_ip;
+                snprintf(s_txt_set_host_ep, sizeof(s_txt_set_host_ep),
+                         "SSID: %.14s | %u.%u.%u.%u:%u", CONFIG_LINSIGHT_WIFI_SSID,
+                         (unsigned)octet[0], (unsigned)octet[1], (unsigned)octet[2],
+                         (unsigned)octet[3], (unsigned)ep_port);
+                if (s_set_host_ep_lbl) {
+                    lv_label_set_text_static(s_set_host_ep_lbl, s_txt_set_host_ep);
+                }
+            }
+        }
+
         const can_bitrate_t cur_br = twai_current_bitrate();
         const int cur_bl = bsp_backlight_get();
         for (int i = 0; i < 4; i++) {
@@ -839,6 +886,17 @@ void linsight_ui_set_conn(linsight_conn_t state, uint32_t rtt_ms)
     const uint32_t clamped = rtt_ms > 0xFFFFFFu ? 0xFFFFFFu : rtt_ms;
     const uint32_t packed = ((uint32_t)state << 24) | clamped;
     __atomic_store_n(&s_conn_mailbox, packed, __ATOMIC_RELAXED);
+}
+
+void linsight_ui_set_host_endpoint(uint32_t ip_be, uint16_t port)
+{
+    const uint32_t seq = __atomic_load_n(&s_ep_seq, __ATOMIC_RELAXED);
+    __atomic_store_n(&s_ep_seq, seq + 1u, __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    __atomic_store_n(&s_ep_ip, ip_be, __ATOMIC_RELAXED);
+    __atomic_store_n(&s_ep_port, (uint32_t)port, __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    __atomic_store_n(&s_ep_seq, seq + 2u, __ATOMIC_RELEASE);
 }
 
 void linsight_ui_handle_key(bool long_press)

@@ -22,6 +22,10 @@ void linsight_ui_init(void);
  * drains; they are non-blocking and safe from any task (net_task, GPIO). */
 void linsight_ui_set_conn(linsight_conn_t state, uint32_t rtt_ms);
 
+/* Publish the active host endpoint (network byte order). Safe from net_task;
+ * the 20 Hz timer updates the SETUP label. */
+void linsight_ui_set_host_endpoint(uint32_t ip_be, uint16_t port);
+
 /* GPIO0 user key: short press cycles DASH -> DIAG -> SETUP; long press runs
  * the current view action (DASH pause, DIAG clear stats, SETUP back to DASH).
  * When the backlight is off, the first press only wakes the display. */
