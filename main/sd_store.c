@@ -10,6 +10,7 @@
 
 #include "driver/gpio.h"
 #include "driver/sdmmc_host.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_vfs_fat.h"
@@ -45,6 +46,8 @@ typedef struct {
 static QueueHandle_t s_queue;
 static QueueHandle_t s_marks;
 static SemaphoreHandle_t s_lock;
+static linsight_can_record_t *s_batch; /* PSRAM: SD_WRITE_BATCH records */
+static char *s_lines;                  /* PSRAM: SD_WRITE_BATCH * SD_LINE_MAX */
 static sdmmc_card_t *s_card;
 static sd_status_t s_status;
 static volatile bool s_mounted;
@@ -202,10 +205,9 @@ static bool prune_oldest(void)
         return false;
     }
 
+    /* Remove the oldest log and its optional mark sidecar. */
     char path[40];
     snprintf(path, sizeof(path), SD_MOUNT_POINT "/rec%05u.log", (unsigned)oldest);
-    unlink(path);
-    snprintf(path, sizeof(path), SD_MOUNT_POINT "/rec%05u.met", (unsigned)oldest);
     unlink(path);
     snprintf(path, sizeof(path), SD_MOUNT_POINT "/rec%05u.trg", (unsigned)oldest);
     unlink(path);
@@ -322,6 +324,7 @@ static void io_fail(const char *what)
  * the board has no RTC. Returns the line length; always < SD_LINE_MAX. */
 static int format_line(const linsight_can_record_t *r, char *out)
 {
+    static const char HEX[] = "0123456789ABCDEF";
     const bool ext = (r->flags & LINSIGHT_REC_FLAG_EXT) != 0;
     const uint8_t dlc = r->dlc > LINSIGHT_DLC_MAX ? LINSIGHT_DLC_MAX : r->dlc;
     int n = snprintf(out, SD_LINE_MAX, "(%u.%06u) can0 %0*X#",
@@ -332,7 +335,9 @@ static int format_line(const linsight_can_record_t *r, char *out)
         out[n++] = 'R';
     } else {
         for (uint8_t i = 0; i < dlc; i++) {
-            n += snprintf(out + n, SD_LINE_MAX - (size_t)n, "%02X", (unsigned)r->data[i]);
+            const uint8_t b = r->data[i];
+            out[n++] = HEX[b >> 4];
+            out[n++] = HEX[b & 0x0Fu];
         }
     }
     out[n++] = '\n';
@@ -345,10 +350,9 @@ static void write_batch(const linsight_can_record_t *recs, uint32_t n, uint32_t 
         return;
     }
 
-    static char lines[SD_WRITE_BATCH * SD_LINE_MAX];
     size_t len = 0;
     for (uint32_t i = 0; i < n; i++) {
-        len += (size_t)format_line(&recs[i], lines + len);
+        len += (size_t)format_line(&recs[i], s_lines + len);
     }
 
     if (s_fd < 0) {
@@ -374,7 +378,7 @@ static void write_batch(const linsight_can_record_t *recs, uint32_t n, uint32_t 
         }
     }
 
-    if (!write_all(s_fd, lines, len)) {
+    if (!write_all(s_fd, s_lines, len)) {
         io_fail("write");
         return;
     }
@@ -460,7 +464,6 @@ static bool mount_card(void)
 static void sd_task(void *arg)
 {
     (void)arg;
-    linsight_can_record_t batch[SD_WRITE_BATCH];
     uint32_t last_mount = 0;
     uint32_t last_mount_log = 0;
     uint32_t last_free = 0;
@@ -486,12 +489,12 @@ static void sd_task(void *arg)
         }
 
         UBaseType_t n = 0;
-        if (xQueueReceive(s_queue, &batch[0], pdMS_TO_TICKS(100)) == pdTRUE) {
+        if (xQueueReceive(s_queue, &s_batch[0], pdMS_TO_TICKS(100)) == pdTRUE) {
             n = 1;
-            while (n < SD_WRITE_BATCH && xQueueReceive(s_queue, &batch[n], 0) == pdTRUE) {
+            while (n < SD_WRITE_BATCH && xQueueReceive(s_queue, &s_batch[n], 0) == pdTRUE) {
                 n++;
             }
-            write_batch(batch, n, now_ms());
+            write_batch(s_batch, n, now_ms());
         } else if (s_dirty && s_fd >= 0 && now_ms() - s_last_sync_ms >= 1000u) {
             if (fsync(s_fd) == 0) {
                 s_last_sync_ms = now_ms();
@@ -517,7 +520,11 @@ void sd_store_init(void)
     s_marks = xQueueCreate(8, sizeof(sd_mark_t));
     s_queue = xQueueCreateWithCaps(SD_QUEUE_LEN, sizeof(linsight_can_record_t),
                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!s_lock || !s_marks || !s_queue) {
+    s_batch = heap_caps_malloc(SD_WRITE_BATCH * sizeof(*s_batch),
+                               MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    s_lines = heap_caps_malloc(SD_WRITE_BATCH * SD_LINE_MAX,
+                               MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_lock || !s_marks || !s_queue || !s_batch || !s_lines) {
         ESP_LOGE(TAG, "SD subsystem init failed; recording disabled");
         return; /* never block capture/network on storage */
     }

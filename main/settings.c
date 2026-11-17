@@ -1,11 +1,13 @@
 #include "settings.h"
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #include "esp_check.h"
 #include "esp_log.h"
 #include "nvs.h"
 #include "nvs_flash.h"
+#include "sdkconfig.h"
 
 #define TAG "settings"
 #define NVS_NS "ls"
@@ -15,7 +17,13 @@
 
 static uint32_t s_boot_count;
 static can_bitrate_t s_bitrate = CAN_BITRATE_500K;
+#if CONFIG_LINSIGHT_CAN_MODE_NORMAL
+static can_mode_t s_mode = CAN_MODE_NORMAL;
+#else
 static can_mode_t s_mode = CAN_MODE_LISTEN_ONLY;
+#endif
+static bool s_has_bitrate;
+static bool s_has_mode;
 
 esp_err_t settings_init(void)
 {
@@ -47,9 +55,11 @@ esp_err_t settings_init(void)
     uint8_t raw = 0;
     if (nvs_get_u8(h, NVS_KEY_BITRATE, &raw) == ESP_OK && raw <= CAN_BITRATE_1M) {
         s_bitrate = (can_bitrate_t)raw;
+        s_has_bitrate = true;
     }
     if (nvs_get_u8(h, NVS_KEY_MODE, &raw) == ESP_OK && raw <= CAN_MODE_SELFTEST) {
         s_mode = (can_mode_t)raw;
+        s_has_mode = true;
     }
 
     err = nvs_set_u32(h, NVS_KEY_BOOT, boot);
@@ -76,8 +86,12 @@ uint32_t linsight_boot_count(void)
 
 void settings_load_can(can_bitrate_t *bitrate, can_mode_t *mode)
 {
-    *bitrate = s_bitrate;
-    *mode = s_mode;
+    if (bitrate && s_has_bitrate) {
+        *bitrate = s_bitrate;
+    }
+    if (mode && s_has_mode) {
+        *mode = s_mode;
+    }
 }
 
 esp_err_t settings_save_can(can_bitrate_t bitrate, can_mode_t mode)
@@ -98,6 +112,8 @@ esp_err_t settings_save_can(can_bitrate_t bitrate, can_mode_t mode)
     if (err == ESP_OK) {
         s_bitrate = bitrate;
         s_mode = mode;
+        s_has_bitrate = true;
+        s_has_mode = true;
     }
     return err;
 }

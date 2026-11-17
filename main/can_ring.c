@@ -1,5 +1,7 @@
 #include "can_ring.h"
 
+#include <string.h>
+
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -59,15 +61,18 @@ uint32_t can_ring_pop(linsight_can_record_t *out, uint32_t max)
     xSemaphoreTake(s_lock, portMAX_DELAY);
 
     const uint32_t n = s_count < max ? s_count : max;
-    uint32_t idx = s_head + s_cap - s_count; /* oldest record; never underflows */
-    for (uint32_t i = 0; i < n; i++) {
+    if (n > 0) {
+        uint32_t idx = s_head + s_cap - s_count; /* oldest record; never underflows */
         if (idx >= s_cap) {
             idx -= s_cap;
         }
-        out[i] = s_buf[idx];
-        idx++;
+        const uint32_t first = (s_cap - idx) < n ? (s_cap - idx) : n;
+        memcpy(out, &s_buf[idx], (size_t)first * sizeof(*s_buf));
+        if (first < n) {
+            memcpy(&out[first], s_buf, (size_t)(n - first) * sizeof(*s_buf));
+        }
+        s_count -= n;
     }
-    s_count -= n;
 
     xSemaphoreGive(s_lock);
     return n;
