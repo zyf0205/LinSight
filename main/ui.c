@@ -466,7 +466,7 @@ static void build_dash_view(lv_obj_t *parent)
     lv_obj_t *c_fps = card_new(parent, 163, 5, 151, 76);
     lbl_new(c_fps, "FPS", 12, 8, FONT_12, COL_TEXT_SEC);
 
-    snprintf(s_txt_drop, sizeof(s_txt_drop), "");
+    s_txt_drop[0] = '\0';
     s_dash_drop_lbl = lbl_new(c_fps, s_txt_drop, 76, 8, FONT_12, COL_RED);
     lv_obj_set_width(s_dash_drop_lbl, 63);
     lv_obj_set_style_text_align(s_dash_drop_lbl, LV_TEXT_ALIGN_RIGHT, 0);
