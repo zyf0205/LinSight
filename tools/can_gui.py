@@ -57,9 +57,11 @@ def find_usbipd() -> str:
     return str(candidate) if candidate.exists() else "usbipd"
 
 
-def run_cmd(args: list[str], timeout: float = 12.0) -> subprocess.CompletedProcess:
+def run_cmd(args: list[str], timeout: float = 12.0,
+            stdin_text: str | None = None) -> subprocess.CompletedProcess:
     try:
-        raw = subprocess.run(args, capture_output=True, timeout=timeout, creationflags=NO_WINDOW)
+        raw = subprocess.run(args, input=stdin_text.encode() if stdin_text is not None else None,
+                             capture_output=True, timeout=timeout, creationflags=NO_WINDOW)
         out = (raw.stdout or b"").replace(b"\x00", b"").decode("utf-8", errors="replace")
         err = (raw.stderr or b"").replace(b"\x00", b"").decode("utf-8", errors="replace")
         return subprocess.CompletedProcess(args, raw.returncode, out, err)
@@ -85,6 +87,23 @@ def wsl_cmd(distro: str, script: str, root: bool = False) -> list[str]:
         cmd.extend(["-u", "root"])
     cmd.extend(["--", "bash", "-lc", script])
     return cmd
+
+
+def wsl_script_cmd(distro: str, root: bool = False) -> list[str]:
+    """Feed the script through stdin: wsl.exe mangles `$` and command
+    substitution when they arrive as argv."""
+    cmd = ["wsl.exe"]
+    if distro:
+        cmd.extend(["-d", distro])
+    if root:
+        cmd.extend(["-u", "root"])
+    cmd.extend(["--", "bash", "-ls"])
+    return cmd
+
+
+def run_wsl_script(distro: str, script: str, root: bool = False,
+                   timeout: float = 12.0) -> subprocess.CompletedProcess:
+    return run_cmd(wsl_script_cmd(distro, root), timeout=timeout, stdin_text=script)
 
 
 def list_wsl_distros() -> list[str]:
@@ -573,7 +592,7 @@ class ToolApp:
                 f"ip link set {iface} type can bitrate {bitrate} restart-ms 100 && "
                 f"ip link set {iface} txqueuelen 1000 up"
             )
-            cfg = run_cmd(wsl_cmd(distro, setup_sh, root=True), timeout=10.0)
+            cfg = run_wsl_script(distro, setup_sh, root=True, timeout=10.0)
             if cfg.returncode != 0:
                 self.log(f"{iface} 配置失败: {(cfg.stderr or cfg.stdout).strip()}")
                 self._probe_usb_and_can()
@@ -597,7 +616,7 @@ class ToolApp:
                 f"ip link set {iface} type can bitrate {bitrate} restart-ms 100 && "
                 f"ip link set {iface} txqueuelen 1000 up"
             )
-            res = run_cmd(wsl_cmd(distro, sh, root=True), timeout=8.0)
+            res = run_wsl_script(distro, sh, root=True, timeout=8.0)
             if res.returncode == 0:
                 self.log(f"已切换 {iface} 波特率为 {bitrate // 1000} kbps")
             else:
