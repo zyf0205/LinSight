@@ -1,8 +1,16 @@
 /*
  * LinSight CAN analyzer UI (320x240, LVGL 8.3)
- * Two pages: DASH (live metrics) and SETUP (bitrate / mode / host link).
- * The 20 Hz tick only reads bounded snapshots; no SD, I2C, NVS or network I/O
- * runs inside the LVGL lock.
+ * Precision Dark Telemetry architecture:
+ *   - DASH: dual hero gauges (12-segment tri-color load bar + FPS/total/drops),
+ *           4-cell diagnostic strip (TEC / REC / ERR+MISS / PSRAM RING),
+ *           SD black-box status bar + high-contrast amber MARK shutter button.
+ *   - SETUP: 4-way bitrate matrix, LISTEN / NORMAL (amber ACK warning) selector,
+ *            dedicated touch [CLEAR] button, and host link diagnostic card.
+ *
+ * Hard constraints:
+ *   - Zero heap allocation on the 20 Hz tick (all strings use static buffers
+ *     with strcmp dirty-checking before lv_label_set_text_static).
+ *   - No SD, I2C, NVS, or TWAI restart inside the LVGL lock.
  */
 
 #include "ui.h"
@@ -11,6 +19,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "can_ring.h"
 #include "esp_lvgl_port.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -19,35 +28,37 @@
 #include "twai.h"
 
 /* -------------------------------------------------------------- geometry */
-#define UI_W            320
-#define UI_H            240
-#define TOP_H           24
-#define VIEWPORT_Y      24
-#define VIEWPORT_H      180
-#define BOT_Y           204
-#define BOT_H           36
+#define UI_W                320
+#define UI_H                240
+#define TOP_H               24
+#define VIEWPORT_Y          24
+#define VIEWPORT_H          182
+#define BOT_Y               206
+#define BOT_H               34
 
-#define PAD_X           6
-#define PAD_Y           6
-#define CARD_FULL_W     (UI_W - (PAD_X * 2)) /* 308 */
-#define MARK_BTN_X      216
-#define MARK_BTN_W      78
+#define PAD_X               6
+#define CARD_FULL_W         (UI_W - (PAD_X * 2)) /* 308 */
+#define LOAD_SEGMENTS       12
 
 /* ---------------------------------------------------------------- colors */
-#define COL_BG_ROOT       lv_color_hex(0x0B0F14)
-#define COL_BG_CARD       lv_color_hex(0x151C24)
-#define COL_BG_CARD_ACT   lv_color_hex(0x1E293B)
-#define COL_BG_PRESSED    lv_color_hex(0x283548)
-#define COL_BORDER        lv_color_hex(0x2A3644)
+#define COL_BG_ROOT         lv_color_hex(0x070A0F)
+#define COL_BG_SURFACE      lv_color_hex(0x101620)
+#define COL_BG_ELEVATED     lv_color_hex(0x182232)
+#define COL_BG_WELL         lv_color_hex(0x0B1018)
+#define COL_BG_PRESSED      lv_color_hex(0x26354D)
+#define COL_BG_AMBER_DIM    lv_color_hex(0x271B09)
 
-#define COL_TEXT_PRI      lv_color_hex(0xF1F5F9)
-#define COL_TEXT_SEC      lv_color_hex(0x94A3B8)
-#define COL_TEXT_MUTED    lv_color_hex(0x475569)
+#define COL_BORDER_SUBTLE   lv_color_hex(0x1E293B)
+#define COL_BORDER_FOCUS    lv_color_hex(0x334155)
 
-#define COL_OK_GREEN      lv_color_hex(0x10B981)
-#define COL_WARN_AMBER    lv_color_hex(0xF59E0B)
-#define COL_ERR_RED       lv_color_hex(0xEF4444)
-#define COL_ACCENT_CYAN   lv_color_hex(0x06B6D4)
+#define COL_TEXT_PRI        lv_color_hex(0xF8FAFC)
+#define COL_TEXT_SEC        lv_color_hex(0x94A3B8)
+#define COL_TEXT_DIM        lv_color_hex(0x475569)
+
+#define COL_CYAN            lv_color_hex(0x06B6D4)
+#define COL_GREEN           lv_color_hex(0x10B981)
+#define COL_AMBER           lv_color_hex(0xF59E0B)
+#define COL_RED             lv_color_hex(0xEF4444)
 
 /* ----------------------------------------------------------------- types */
 typedef enum {
@@ -65,48 +76,83 @@ typedef enum {
 static lv_obj_t *s_views[VIEW_COUNT];
 static view_id_t s_current_view = VIEW_DASH;
 
-/* Top bar */
+/* Top status bar */
 static lv_obj_t *s_top_bar;
 static lv_obj_t *s_top_state_pill, *s_top_state_lbl;
 static lv_obj_t *s_top_cfg_lbl, *s_top_link_lbl;
 
-/* Bottom dock */
+/* Bottom navigation dock */
 static lv_obj_t *s_dock;
 static lv_obj_t *s_dock_btn[VIEW_COUNT];
 static lv_obj_t *s_dock_line[VIEW_COUNT];
 static lv_obj_t *s_dock_lbl[VIEW_COUNT];
 
-/* DASH */
-static lv_obj_t *s_dash_load_val, *s_dash_load_bar;
-static lv_obj_t *s_dash_fps_val, *s_dash_total_lbl;
-static lv_obj_t *s_dash_health_lbl, *s_dash_sd_lbl;
+/* DASH: Hero Left (Bus Load) */
+static lv_obj_t *s_dash_load_grade_lbl;
+static lv_obj_t *s_dash_load_val_lbl;
+static lv_obj_t *s_dash_load_seg[LOAD_SEGMENTS];
 
-/* SETUP */
+/* DASH: Hero Right (FPS & Totals) */
+static lv_obj_t *s_dash_drop_lbl;
+static lv_obj_t *s_dash_fps_val_lbl;
+static lv_obj_t *s_dash_total_lbl;
+
+/* DASH: 4-Cell Diagnostic Strip (TEC / REC / ERR+MISS / PSRAM RING) */
+static lv_obj_t *s_cell_card[4];
+static lv_obj_t *s_cell_bar[4];
+static lv_obj_t *s_cell_val[4];
+
+/* DASH: SD Black-Box Bar & MARK Shutter */
+static lv_obj_t *s_sd_badge, *s_sd_badge_lbl;
+static lv_obj_t *s_sd_main_lbl, *s_sd_sub_lbl;
+
+/* SETUP: Bitrate Matrix, Mode & Clear Row, Host Link Card */
 static lv_obj_t *s_set_br_btn[4];
-static lv_obj_t *s_set_mode_btn[2];
-static lv_obj_t *s_set_host_lbl;
+static lv_obj_t *s_set_br_line[4];
+static lv_obj_t *s_set_br_lbl[4];
 
-/* Toast */
-static lv_obj_t *s_toast, *s_toast_lbl;
+static lv_obj_t *s_set_mode_btn[2];
+static lv_obj_t *s_set_mode_line[2];
+static lv_obj_t *s_set_mode_lbl[2];
+
+static lv_obj_t *s_set_host_ep_lbl;
+static lv_obj_t *s_set_host_pill, *s_set_host_pill_lbl;
+
+/* Toast overlay */
+static lv_obj_t *s_toast, *s_toast_bar, *s_toast_lbl;
 static uint32_t s_toast_tick;
 
-/* Static string buffers (no heap allocation on the 20 Hz tick) */
-static char s_txt_top_state[12], s_txt_top_cfg[24], s_txt_top_link[20];
-static char s_txt_dash_load[12], s_txt_dash_fps[12], s_txt_dash_total[20];
-static char s_txt_dash_health[48], s_txt_dash_sd[48];
-static char s_txt_set_host[56];
-static char s_txt_toast[40];
+/* Static string buffers (zero heap allocation on the 20 Hz tick) */
+static char s_txt_top_state[12];
+static char s_txt_top_cfg[24];
+static char s_txt_top_link[20];
 
-/* Runtime state */
+static char s_txt_load_grade[12];
+static char s_txt_load_val[12];
+static char s_txt_drop[16];
+static char s_txt_fps_val[12];
+static char s_txt_total[24];
+
+static char s_txt_cell[4][12];
+
+static char s_txt_sd_badge[8];
+static char s_txt_sd_main[32];
+static char s_txt_sd_sub[36];
+
+static char s_txt_host_ep[32];
+static char s_txt_host_pill[20];
+static char s_txt_toast[32];
+
+/* Lock-free mailbox for connection state & RTT */
 static uint32_t s_conn_mailbox = (uint32_t)UI_CONN_WIFI << 24;
 
-/* Host endpoint published by net_task; a short critical section is enough. */
+/* Host endpoint published by net_task; protected by a short critical section */
 static portMUX_TYPE s_ep_lock = portMUX_INITIALIZER_UNLOCKED;
 static uint32_t s_ep_ip;
 static uint16_t s_ep_port;
 static bool s_ep_valid;
 
-/* Deferred CAN reconfiguration (never run from the LVGL task). */
+/* Deferred CAN reconfiguration (runs outside the LVGL lock) */
 static volatile bool s_cfg_busy;
 static volatile uint32_t s_cfg_req;
 static volatile int32_t s_cfg_result;
@@ -122,6 +168,13 @@ static void obj_bg_color(lv_obj_t *obj, lv_color_t color, lv_style_selector_t se
 {
     if (lv_obj_get_style_bg_color(obj, selector).full != color.full) {
         lv_obj_set_style_bg_color(obj, color, selector);
+    }
+}
+
+static void obj_border_color(lv_obj_t *obj, lv_color_t color, lv_style_selector_t selector)
+{
+    if (lv_obj_get_style_border_color(obj, selector).full != color.full) {
+        lv_obj_set_style_border_color(obj, color, selector);
     }
 }
 
@@ -152,24 +205,20 @@ static void label_printf(lv_obj_t *label, char *buf, size_t cap, const char *fmt
     lv_label_set_text_static(label, buf);
 }
 
-static void bar_update(lv_obj_t *bar, int32_t val, lv_color_t ind_col)
-{
-    if (lv_bar_get_value(bar) != val) {
-        lv_bar_set_value(bar, val, LV_ANIM_OFF);
-    }
-    obj_bg_color(bar, ind_col, LV_PART_INDICATOR);
-}
-
-#define LBL_SET(lbl, buf, text)       label_set_str((lbl), (buf), sizeof(buf), (text))
-#define LBL_FMT(lbl, buf, fmt, ...)   label_printf((lbl), (buf), sizeof(buf), (fmt), __VA_ARGS__)
+#define LBL_SET(lbl, buf, text)     label_set_str((lbl), (buf), sizeof(buf), (text))
+#define LBL_FMT(lbl, buf, fmt, ...) label_printf((lbl), (buf), sizeof(buf), (fmt), __VA_ARGS__)
 
 static void object_show(lv_obj_t *obj, bool show)
 {
     if (!obj) return;
     if (show) {
-        if (lv_obj_has_flag(obj, LV_OBJ_FLAG_HIDDEN)) lv_obj_clear_flag(obj, LV_OBJ_FLAG_HIDDEN);
+        if (lv_obj_has_flag(obj, LV_OBJ_FLAG_HIDDEN)) {
+            lv_obj_clear_flag(obj, LV_OBJ_FLAG_HIDDEN);
+        }
     } else {
-        if (!lv_obj_has_flag(obj, LV_OBJ_FLAG_HIDDEN)) lv_obj_add_flag(obj, LV_OBJ_FLAG_HIDDEN);
+        if (!lv_obj_has_flag(obj, LV_OBJ_FLAG_HIDDEN)) {
+            lv_obj_add_flag(obj, LV_OBJ_FLAG_HIDDEN);
+        }
     }
 }
 
@@ -180,14 +229,24 @@ static lv_obj_t *card_new(lv_obj_t *parent, lv_coord_t x, lv_coord_t y, lv_coord
     lv_obj_t *c = lv_obj_create(parent);
     lv_obj_set_pos(c, x, y);
     lv_obj_set_size(c, w, h);
-    lv_obj_set_style_bg_color(c, COL_BG_CARD, 0);
+    lv_obj_set_style_bg_color(c, COL_BG_SURFACE, 0);
     lv_obj_set_style_bg_opa(c, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_color(c, COL_BORDER, 0);
+    lv_obj_set_style_border_color(c, COL_BORDER_SUBTLE, 0);
     lv_obj_set_style_border_width(c, 1, 0);
-    lv_obj_set_style_radius(c, 4, 0);
+    lv_obj_set_style_radius(c, 5, 0);
     lv_obj_set_style_pad_all(c, 0, 0);
     lv_obj_clear_flag(c, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
     return c;
+}
+
+static lv_obj_t *rect_new(lv_obj_t *parent, lv_coord_t x, lv_coord_t y, lv_coord_t w,
+                          lv_coord_t h, lv_color_t bg, lv_coord_t radius)
+{
+    lv_obj_t *r = card_new(parent, x, y, w, h);
+    lv_obj_set_style_bg_color(r, bg, 0);
+    lv_obj_set_style_border_width(r, 0, 0);
+    lv_obj_set_style_radius(r, radius, 0);
+    return r;
 }
 
 static lv_obj_t *btn_new(lv_obj_t *parent, lv_coord_t x, lv_coord_t y, lv_coord_t w,
@@ -195,8 +254,9 @@ static lv_obj_t *btn_new(lv_obj_t *parent, lv_coord_t x, lv_coord_t y, lv_coord_
 {
     lv_obj_t *b = card_new(parent, x, y, w, h);
     lv_obj_set_style_bg_color(b, bg, 0);
+    lv_obj_set_style_border_color(b, COL_BORDER_FOCUS, 0);
     lv_obj_set_style_bg_color(b, COL_BG_PRESSED, LV_STATE_PRESSED);
-    lv_obj_set_style_border_color(b, COL_ACCENT_CYAN, LV_STATE_PRESSED);
+    lv_obj_set_style_border_color(b, COL_CYAN, LV_STATE_PRESSED);
     lv_obj_add_flag(b, LV_OBJ_FLAG_CLICKABLE);
     if (cb) lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, user_data);
     return b;
@@ -214,29 +274,13 @@ static lv_obj_t *lbl_new(lv_obj_t *parent, const char *txt, lv_coord_t x, lv_coo
     return l;
 }
 
-static lv_obj_t *bar_new(lv_obj_t *parent, lv_coord_t x, lv_coord_t y, lv_coord_t w,
-                         lv_coord_t h, int32_t max, lv_color_t ind_col)
-{
-    lv_obj_t *b = lv_bar_create(parent);
-    lv_obj_set_pos(b, x, y);
-    lv_obj_set_size(b, w, h);
-    lv_bar_set_range(b, 0, max);
-    lv_bar_set_value(b, 0, LV_ANIM_OFF);
-    lv_obj_set_style_bg_color(b, COL_BG_ROOT, LV_PART_MAIN);
-    lv_obj_set_style_border_color(b, COL_BORDER, LV_PART_MAIN);
-    lv_obj_set_style_border_width(b, 1, LV_PART_MAIN);
-    lv_obj_set_style_radius(b, 3, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(b, ind_col, LV_PART_INDICATOR);
-    lv_obj_set_style_radius(b, 3, LV_PART_INDICATOR);
-    lv_obj_clear_flag(b, LV_OBJ_FLAG_CLICKABLE);
-    return b;
-}
-
 /* ------------------------------------------------------------ Toast / View */
-static void toast_show(const char *msg)
+static void toast_show(const char *msg, lv_color_t accent)
 {
     if (!s_toast) return;
     LBL_SET(s_toast_lbl, s_txt_toast, msg);
+    obj_border_color(s_toast, accent, 0);
+    obj_bg_color(s_toast_bar, accent, 0);
     s_toast_tick = lv_tick_get();
     object_show(s_toast, true);
     lv_obj_move_foreground(s_toast);
@@ -255,7 +299,7 @@ static void view_show(view_id_t view)
             lv_obj_invalidate(s_views[i]);
         }
         object_show(s_dock_line[i], active);
-        obj_bg_color(s_dock_btn[i], active ? COL_BG_CARD_ACT : COL_BG_ROOT, 0);
+        obj_bg_color(s_dock_btn[i], active ? COL_BG_ELEVATED : COL_BG_ROOT, 0);
         label_color(s_dock_lbl[i], active ? COL_TEXT_PRI : COL_TEXT_SEC);
     }
 
@@ -273,7 +317,18 @@ static void dock_click_cb(lv_event_t *e)
 static void mark_event_cb(lv_event_t *e)
 {
     (void)e;
-    toast_show(sd_store_mark("MANUAL", 0, 0) ? "MARK SAVED" : "NO RECORDING");
+    if (sd_store_mark("MANUAL", 0, 0)) {
+        toast_show("MARK SAVED", COL_AMBER);
+    } else {
+        toast_show("NO SD RECORDING", COL_RED);
+    }
+}
+
+static void clear_stats_cb(lv_event_t *e)
+{
+    (void)e;
+    twai_stats_clear();
+    toast_show("STATS CLEARED", COL_CYAN);
 }
 
 static void cfg_apply_task(void *arg)
@@ -293,14 +348,15 @@ static void cfg_apply_task(void *arg)
 
     const esp_err_t err = twai_capture_restart(bitrate, mode);
     __atomic_store_n(&s_cfg_result, err == ESP_OK ? 1 : -1, __ATOMIC_RELEASE);
-    s_cfg_busy = false;
+    __atomic_store_n(&s_cfg_busy, false, __ATOMIC_RELEASE);
     vTaskDelete(NULL);
 }
 
 static void cfg_request(cfg_kind_t kind, int idx)
 {
-    if (s_cfg_busy || s_cfg_result != 0) {
-        toast_show("APPLYING...");
+    if (__atomic_load_n(&s_cfg_busy, __ATOMIC_ACQUIRE) ||
+        __atomic_load_n(&s_cfg_result, __ATOMIC_ACQUIRE) != 0) {
+        toast_show("APPLYING...", COL_CYAN);
         return;
     }
     if ((kind == CFG_BITRATE && BITRATES[idx] == twai_current_bitrate()) ||
@@ -310,12 +366,12 @@ static void cfg_request(cfg_kind_t kind, int idx)
 
     __atomic_store_n(&s_cfg_req, ((uint32_t)kind << 8) | (uint32_t)idx, __ATOMIC_RELAXED);
     __atomic_store_n(&s_cfg_result, 0, __ATOMIC_RELEASE);
-    s_cfg_busy = true;
+    __atomic_store_n(&s_cfg_busy, true, __ATOMIC_RELEASE);
     if (xTaskCreate(cfg_apply_task, "cfg_apply", 4096, NULL, 3, NULL) != pdPASS) {
-        s_cfg_busy = false;
+        __atomic_store_n(&s_cfg_busy, false, __ATOMIC_RELEASE);
         __atomic_store_n(&s_cfg_result, -1, __ATOMIC_RELEASE);
     } else {
-        toast_show("APPLYING...");
+        toast_show("APPLYING...", COL_CYAN);
     }
 }
 
@@ -337,11 +393,7 @@ static void build_top_bar(lv_obj_t *parent)
     lv_obj_set_style_radius(s_top_bar, 0, 0);
     lv_obj_set_style_border_side(s_top_bar, LV_BORDER_SIDE_BOTTOM, 0);
 
-    s_top_state_pill = card_new(s_top_bar, PAD_X, 3, 76, 18);
-    lv_obj_set_style_radius(s_top_state_pill, 9, 0);
-    lv_obj_set_style_border_width(s_top_state_pill, 0, 0);
-    lv_obj_set_style_bg_color(s_top_state_pill, COL_OK_GREEN, 0);
-
+    s_top_state_pill = rect_new(s_top_bar, PAD_X, 3, 76, 18, COL_GREEN, 9);
     snprintf(s_txt_top_state, sizeof(s_txt_top_state), "RUNNING");
     s_top_state_lbl = lbl_new(s_top_state_pill, s_txt_top_state, 0, 0,
                               &lv_font_montserrat_12, COL_BG_ROOT);
@@ -353,7 +405,7 @@ static void build_top_bar(lv_obj_t *parent)
 
     snprintf(s_txt_top_link, sizeof(s_txt_top_link), "WIFI ...");
     s_top_link_lbl = lbl_new(s_top_bar, s_txt_top_link, 200, 5, &lv_font_montserrat_12,
-                             COL_TEXT_MUTED);
+                             COL_TEXT_DIM);
     lv_obj_set_width(s_top_link_lbl, 114);
     lv_obj_set_style_text_align(s_top_link_lbl, LV_TEXT_ALIGN_RIGHT, 0);
 }
@@ -365,17 +417,18 @@ static void build_bottom_dock(lv_obj_t *parent)
     lv_obj_set_style_radius(s_dock, 0, 0);
     lv_obj_set_style_border_side(s_dock, LV_BORDER_SIDE_TOP, 0);
 
-    const char *names[VIEW_COUNT] = {"DASH", "SETUP"};
+    const char *names[VIEW_COUNT] = {"DASH  TELEMETRY", "SETUP  CONSOLE"};
     const lv_coord_t w = UI_W / VIEW_COUNT;
 
     for (int i = 0; i < VIEW_COUNT; i++) {
         s_dock_btn[i] = btn_new(s_dock, i * w, 0, w, BOT_H, COL_BG_ROOT, dock_click_cb,
                                 (void *)(intptr_t)i);
-        s_dock_line[i] = card_new(s_dock_btn[i], 0, 0, w, 2);
-        lv_obj_set_style_bg_color(s_dock_line[i], COL_ACCENT_CYAN, 0);
-        lv_obj_set_style_border_width(s_dock_line[i], 0, 0);
+        lv_obj_set_style_radius(s_dock_btn[i], 0, 0);
+        lv_obj_set_style_border_width(s_dock_btn[i], 0, 0);
 
-        s_dock_lbl[i] = lbl_new(s_dock_btn[i], names[i], 0, 0, &lv_font_montserrat_14,
+        s_dock_line[i] = rect_new(s_dock_btn[i], 16, 0, w - 32, 3, COL_CYAN, 1);
+
+        s_dock_lbl[i] = lbl_new(s_dock_btn[i], names[i], 0, 1, &lv_font_montserrat_12,
                                 i == 0 ? COL_TEXT_PRI : COL_TEXT_SEC);
         lv_obj_center(s_dock_lbl[i]);
     }
@@ -383,75 +436,163 @@ static void build_bottom_dock(lv_obj_t *parent)
 
 static void build_dash_view(lv_obj_t *parent)
 {
-    lv_obj_t *c1 = card_new(parent, PAD_X, PAD_Y, CARD_FULL_W, 92);
-    lbl_new(c1, "BUS LOAD", 14, 12, &lv_font_montserrat_12, COL_TEXT_SEC);
-    snprintf(s_txt_dash_load, sizeof(s_txt_dash_load), "0.0%%");
-    s_dash_load_val = lbl_new(c1, s_txt_dash_load, 14, 28, &lv_font_montserrat_24,
-                              COL_TEXT_PRI);
-    s_dash_load_bar = bar_new(c1, 14, 73, 150, 6, 1000, COL_OK_GREEN);
+    /* ---- Row 1: Dual Hero Cards (y=4, h=76) ---- */
+    lv_obj_t *c_load = card_new(parent, PAD_X, 4, 151, 76);
+    rect_new(c_load, 0, 0, 151, 2, COL_CYAN, 0);
+    lbl_new(c_load, "BUS LOAD", 10, 7, &lv_font_montserrat_12, COL_TEXT_SEC);
 
-    lv_obj_t *divider = card_new(c1, 176, 14, 1, 64);
-    lv_obj_set_style_bg_color(divider, COL_BORDER, 0);
-    lv_obj_set_style_border_width(divider, 0, 0);
+    snprintf(s_txt_load_grade, sizeof(s_txt_load_grade), "IDLE");
+    s_dash_load_grade_lbl = lbl_new(c_load, s_txt_load_grade, 86, 7,
+                                    &lv_font_montserrat_12, COL_GREEN);
+    lv_obj_set_width(s_dash_load_grade_lbl, 55);
+    lv_obj_set_style_text_align(s_dash_load_grade_lbl, LV_TEXT_ALIGN_RIGHT, 0);
 
-    lbl_new(c1, "FPS", 194, 12, &lv_font_montserrat_12, COL_TEXT_SEC);
-    snprintf(s_txt_dash_fps, sizeof(s_txt_dash_fps), "0");
-    s_dash_fps_val = lbl_new(c1, s_txt_dash_fps, 194, 28, &lv_font_montserrat_24,
-                             COL_TEXT_PRI);
-    snprintf(s_txt_dash_total, sizeof(s_txt_dash_total), "TOTAL 0");
-    s_dash_total_lbl = lbl_new(c1, s_txt_dash_total, 194, 70, &lv_font_montserrat_12,
+    snprintf(s_txt_load_val, sizeof(s_txt_load_val), "0.0%%");
+    s_dash_load_val_lbl = lbl_new(c_load, s_txt_load_val, 10, 24,
+                                  &lv_font_montserrat_24, COL_TEXT_PRI);
+
+    /* 12-segment tri-color LED load bar inside a dark recessed trough */
+    lv_obj_t *seg_well = rect_new(c_load, 8, 56, 135, 12, COL_BG_ROOT, 3);
+    lv_obj_set_style_border_width(seg_well, 1, 0);
+    lv_obj_set_style_border_color(seg_well, COL_BORDER_SUBTLE, 0);
+    for (int i = 0; i < LOAD_SEGMENTS; i++) {
+        s_dash_load_seg[i] = rect_new(seg_well, 3 + i * 11, 2, 9, 8, COL_BG_ELEVATED, 1);
+    }
+
+    /* Right Hero Card: Frame Rate & Totals */
+    lv_obj_t *c_fps = card_new(parent, 163, 4, 151, 76);
+    rect_new(c_fps, 0, 0, 151, 2, COL_CYAN, 0);
+    lbl_new(c_fps, "FRAME RATE", 10, 7, &lv_font_montserrat_12, COL_TEXT_SEC);
+
+    snprintf(s_txt_drop, sizeof(s_txt_drop), "DROP 0");
+    s_dash_drop_lbl = lbl_new(c_fps, s_txt_drop, 80, 7, &lv_font_montserrat_12,
+                              COL_TEXT_DIM);
+    lv_obj_set_width(s_dash_drop_lbl, 61);
+    lv_obj_set_style_text_align(s_dash_drop_lbl, LV_TEXT_ALIGN_RIGHT, 0);
+
+    snprintf(s_txt_fps_val, sizeof(s_txt_fps_val), "0");
+    s_dash_fps_val_lbl = lbl_new(c_fps, s_txt_fps_val, 10, 24,
+                                 &lv_font_montserrat_24, COL_TEXT_PRI);
+
+    lv_obj_t *tot_well = rect_new(c_fps, 8, 54, 135, 16, COL_BG_WELL, 3);
+    snprintf(s_txt_total, sizeof(s_txt_total), "TOTAL 0");
+    s_dash_total_lbl = lbl_new(tot_well, s_txt_total, 6, 1, &lv_font_montserrat_12,
                                COL_TEXT_SEC);
 
-    lv_obj_t *c2 = card_new(parent, PAD_X, 106, CARD_FULL_W, 68);
-    snprintf(s_txt_dash_health, sizeof(s_txt_dash_health), "TEC 0 • REC 0 • ERR 0");
-    s_dash_health_lbl = lbl_new(c2, s_txt_dash_health, 14, 14, &lv_font_montserrat_12,
-                                COL_TEXT_SEC);
-    lv_obj_set_width(s_dash_health_lbl, 194);
-    lv_label_set_long_mode(s_dash_health_lbl, LV_LABEL_LONG_DOT);
-    snprintf(s_txt_dash_sd, sizeof(s_txt_dash_sd), "SD NO CARD");
-    s_dash_sd_lbl = lbl_new(c2, s_txt_dash_sd, 14, 40, &lv_font_montserrat_12,
-                            COL_TEXT_MUTED);
-    lv_obj_set_width(s_dash_sd_lbl, 194);
-    lv_label_set_long_mode(s_dash_sd_lbl, LV_LABEL_LONG_DOT);
+    /* ---- Row 2: 4-Cell Diagnostic Strip (y=85, h=46) ---- */
+    static const char *CELL_TITLES[4] = {"TEC", "REC", "ERR", "RING"};
+    for (int i = 0; i < 4; i++) {
+        const lv_coord_t cx = PAD_X + i * 78;
+        s_cell_card[i] = card_new(parent, cx, 85, 74, 46);
+        s_cell_bar[i] = rect_new(s_cell_card[i], 0, 0, 74, 2, COL_GREEN, 0);
 
-    lv_obj_t *mark = btn_new(c2, MARK_BTN_X, 19, MARK_BTN_W, 30, COL_BG_CARD, mark_event_cb,
-                             NULL);
-    lv_obj_set_style_border_color(mark, COL_WARN_AMBER, 0);
-    lv_obj_t *mark_lbl = lbl_new(mark, "MARK", 0, 0, &lv_font_montserrat_12,
-                                 COL_WARN_AMBER);
-    lv_obj_center(mark_lbl);
+        lbl_new(s_cell_card[i], CELL_TITLES[i], 7, 5, &lv_font_montserrat_12,
+                COL_TEXT_SEC);
+
+        snprintf(s_txt_cell[i], sizeof(s_txt_cell[i]), i == 3 ? "0%%" : "0");
+        s_cell_val[i] = lbl_new(s_cell_card[i], s_txt_cell[i], 7, 21,
+                                &lv_font_montserrat_20, COL_TEXT_PRI);
+    }
+
+    /* ---- Row 3: SD Black-Box Bar + MARK Shutter Button (y=136, h=42) ---- */
+    lv_obj_t *c_sd = card_new(parent, PAD_X, 136, 214, 42);
+    s_sd_badge = rect_new(c_sd, 7, 7, 46, 28, COL_BG_ELEVATED, 4);
+    snprintf(s_txt_sd_badge, sizeof(s_txt_sd_badge), "NO SD");
+    s_sd_badge_lbl = lbl_new(s_sd_badge, s_txt_sd_badge, 0, 0, &lv_font_montserrat_12,
+                             COL_TEXT_DIM);
+    lv_obj_center(s_sd_badge_lbl);
+
+    snprintf(s_txt_sd_main, sizeof(s_txt_sd_main), "SD CARD OFFLINE");
+    s_sd_main_lbl = lbl_new(c_sd, s_txt_sd_main, 60, 5, &lv_font_montserrat_14,
+                            COL_TEXT_SEC);
+    lv_obj_set_width(s_sd_main_lbl, 148);
+    lv_label_set_long_mode(s_sd_main_lbl, LV_LABEL_LONG_DOT);
+
+    snprintf(s_txt_sd_sub, sizeof(s_txt_sd_sub), "INSERT FAT32 TF CARD");
+    s_sd_sub_lbl = lbl_new(c_sd, s_txt_sd_sub, 60, 23, &lv_font_montserrat_12,
+                           COL_TEXT_DIM);
+    lv_obj_set_width(s_sd_sub_lbl, 148);
+    lv_label_set_long_mode(s_sd_sub_lbl, LV_LABEL_LONG_DOT);
+
+    /* High-contrast Amber MARK Shutter Button */
+    lv_obj_t *mark_btn = btn_new(parent, 226, 136, 88, 42, COL_BG_AMBER_DIM,
+                                 mark_event_cb, NULL);
+    lv_obj_set_style_border_color(mark_btn, COL_AMBER, 0);
+    lv_obj_set_style_border_width(mark_btn, 2, 0);
+    rect_new(mark_btn, 0, 0, 88, 3, COL_AMBER, 0);
+
+    lv_obj_t *m_lbl1 = lbl_new(mark_btn, "MARK", 0, 6, &lv_font_montserrat_16,
+                               COL_AMBER);
+    lv_obj_align(m_lbl1, LV_ALIGN_TOP_MID, 0, 5);
+    lv_obj_t *m_lbl2 = lbl_new(mark_btn, "LOG .TRG", 0, 0, &lv_font_montserrat_12,
+                               COL_TEXT_PRI);
+    lv_obj_align(m_lbl2, LV_ALIGN_BOTTOM_MID, 0, -4);
 }
 
 static void build_set_view(lv_obj_t *parent)
 {
-    lv_obj_t *l = lbl_new(parent, "BITRATE", PAD_X, 12, &lv_font_montserrat_12,
-                          COL_TEXT_SEC);
-    lv_obj_set_style_text_letter_space(l, 1, 0);
+    /* ---- Section 1: 4-Way Bitrate Matrix ---- */
+    lbl_new(parent, "CAN BITRATE", PAD_X, 5, &lv_font_montserrat_12, COL_TEXT_SEC);
+    lv_obj_t *nvs_tag = lbl_new(parent, "NVS AUTO-SAVE", 200, 5,
+                                &lv_font_montserrat_12, COL_TEXT_DIM);
+    lv_obj_set_width(nvs_tag, 114);
+    lv_obj_set_style_text_align(nvs_tag, LV_TEXT_ALIGN_RIGHT, 0);
+
     for (int i = 0; i < 4; i++) {
-        s_set_br_btn[i] = btn_new(parent, PAD_X + i * 79, 30, 71, 36, COL_BG_CARD,
+        const lv_coord_t bx = PAD_X + i * 78;
+        s_set_br_btn[i] = btn_new(parent, bx, 21, 74, 38, COL_BG_SURFACE,
                                   bitrate_click_cb, (void *)(intptr_t)i);
-        lv_obj_t *bl = lbl_new(s_set_br_btn[i], BITRATE_LABELS[i], 0, 0,
-                               &lv_font_montserrat_14, COL_TEXT_PRI);
-        lv_obj_center(bl);
+        s_set_br_line[i] = rect_new(s_set_br_btn[i], 0, 0, 74, 3, COL_CYAN, 0);
+        s_set_br_lbl[i] = lbl_new(s_set_br_btn[i], BITRATE_LABELS[i], 0, 1,
+                                  &lv_font_montserrat_16, COL_TEXT_PRI);
+        lv_obj_center(s_set_br_lbl[i]);
     }
 
-    l = lbl_new(parent, "MODE", PAD_X, 80, &lv_font_montserrat_12, COL_TEXT_SEC);
-    lv_obj_set_style_text_letter_space(l, 1, 0);
+    /* ---- Section 2: Controller Mode & Touch CLEAR Button ---- */
+    lbl_new(parent, "CONTROLLER MODE", PAD_X, 66, &lv_font_montserrat_12, COL_TEXT_SEC);
+    lv_obj_t *act_tag = lbl_new(parent, "COUNTERS", 224, 66,
+                                &lv_font_montserrat_12, COL_TEXT_SEC);
+    lv_obj_set_width(act_tag, 90);
+    lv_obj_set_style_text_align(act_tag, LV_TEXT_ALIGN_RIGHT, 0);
+
     for (int i = 0; i < 2; i++) {
-        s_set_mode_btn[i] = btn_new(parent, PAD_X + i * 158, 98, 150, 36, COL_BG_CARD,
+        const lv_coord_t mx = PAD_X + i * 106;
+        s_set_mode_btn[i] = btn_new(parent, mx, 82, 102, 38, COL_BG_SURFACE,
                                     mode_click_cb, (void *)(intptr_t)i);
-        lv_obj_t *bl = lbl_new(s_set_mode_btn[i], MODE_LABELS[i], 0, 0,
-                               &lv_font_montserrat_14, COL_TEXT_PRI);
-        lv_obj_center(bl);
+        s_set_mode_line[i] = rect_new(s_set_mode_btn[i], 0, 0, 102, 3,
+                                      i == 0 ? COL_CYAN : COL_AMBER, 0);
+        s_set_mode_lbl[i] = lbl_new(s_set_mode_btn[i], MODE_LABELS[i], 0, 1,
+                                    &lv_font_montserrat_16, COL_TEXT_PRI);
+        lv_obj_center(s_set_mode_lbl[i]);
     }
 
-    lv_obj_t *footer = card_new(parent, PAD_X, 150, CARD_FULL_W, 24);
-    snprintf(s_txt_set_host, sizeof(s_txt_set_host), "NO HOST LINK");
-    s_set_host_lbl = lbl_new(footer, s_txt_set_host, 10, 5, &lv_font_montserrat_12,
-                             COL_TEXT_MUTED);
-    lv_obj_set_width(s_set_host_lbl, CARD_FULL_W - 20);
-    lv_obj_set_style_text_align(s_set_host_lbl, LV_TEXT_ALIGN_CENTER, 0);
-    lv_label_set_long_mode(s_set_host_lbl, LV_LABEL_LONG_DOT);
+    /* Dedicated Touch CLEAR Button (also triggered via long-press GPIO0) */
+    lv_obj_t *clr_btn = btn_new(parent, 220, 82, 94, 38, COL_BG_ELEVATED,
+                                clear_stats_cb, NULL);
+    lv_obj_set_style_border_color(clr_btn, COL_CYAN, 0);
+    rect_new(clr_btn, 0, 0, 94, 3, COL_CYAN, 0);
+    lv_obj_t *clr_lbl = lbl_new(clr_btn, "CLEAR", 0, 1, &lv_font_montserrat_16,
+                                COL_CYAN);
+    lv_obj_center(clr_lbl);
+
+    /* ---- Section 3: Host Stream Diagnostic Card ---- */
+    lv_obj_t *c_host = card_new(parent, PAD_X, 128, CARD_FULL_W, 48);
+    rect_new(c_host, 0, 0, 3, 48, COL_CYAN, 0);
+
+    lbl_new(c_host, "HOST STREAM ENDPOINT", 12, 6, &lv_font_montserrat_12,
+            COL_TEXT_SEC);
+
+    snprintf(s_txt_host_ep, sizeof(s_txt_host_ep), "UDP DISCOVERY :8889");
+    s_set_host_ep_lbl = lbl_new(c_host, s_txt_host_ep, 12, 23,
+                                &lv_font_montserrat_16, COL_TEXT_PRI);
+    lv_obj_set_width(s_set_host_ep_lbl, 196);
+    lv_label_set_long_mode(s_set_host_ep_lbl, LV_LABEL_LONG_DOT);
+
+    s_set_host_pill = rect_new(c_host, 212, 13, 88, 22, COL_BG_ELEVATED, 11);
+    snprintf(s_txt_host_pill, sizeof(s_txt_host_pill), "WIFI ...");
+    s_set_host_pill_lbl = lbl_new(s_set_host_pill, s_txt_host_pill, 0, 0,
+                                  &lv_font_montserrat_12, COL_TEXT_DIM);
+    lv_obj_center(s_set_host_pill_lbl);
 }
 
 /* --------------------------------------------------------------- 20Hz Tick */
@@ -464,13 +605,17 @@ static void ui_tick_cb(lv_timer_t *timer)
     const uint32_t rtt_ms = conn_packed & 0xFFFFFFu;
 
     if (s_toast && !lv_obj_has_flag(s_toast, LV_OBJ_FLAG_HIDDEN) &&
-        lv_tick_elaps(s_toast_tick) > 1500u) {
+        lv_tick_elaps(s_toast_tick) > 1400u) {
         object_show(s_toast, false);
     }
 
     const int32_t cfg_result = __atomic_load_n(&s_cfg_result, __ATOMIC_ACQUIRE);
     if (cfg_result != 0) {
-        toast_show(cfg_result > 0 ? "CONFIG APPLIED" : "CONFIG FAILED");
+        if (cfg_result > 0) {
+            toast_show("CONFIG APPLIED", COL_GREEN);
+        } else {
+            toast_show("CONFIG FAILED", COL_RED);
+        }
         __atomic_store_n(&s_cfg_result, 0, __ATOMIC_RELEASE);
     }
 
@@ -478,118 +623,218 @@ static void ui_tick_cb(lv_timer_t *timer)
     twai_stats_snapshot(&st);
     sd_status_t sd = {0};
     sd_store_get_status(&sd);
+    can_ring_info_t ring = {0};
+    can_ring_get_info(&ring);
 
     const can_bitrate_t bitrate = twai_current_bitrate();
     const can_mode_t mode = twai_current_mode();
-    const bool bus_off = st.state == CAN_STATE_BUS_OFF;
-    const bool recovering = st.state == CAN_STATE_RECOVERING;
-    const bool passive = st.tec > 127u || st.rec > 127u;
+    const bool bus_off = (st.state == CAN_STATE_BUS_OFF);
+    const bool recovering = (st.state == CAN_STATE_RECOVERING);
+    const bool passive = (st.tec > 127u || st.rec > 127u);
 
-    /* Top bar: run state, active configuration, host link. */
+    /* ---- Top Status Bar ---- */
     if (bus_off) {
         LBL_SET(s_top_state_lbl, s_txt_top_state, "BUS-OFF");
-        obj_bg_color(s_top_state_pill, COL_ERR_RED, 0);
+        obj_bg_color(s_top_state_pill, COL_RED, 0);
         label_color(s_top_state_lbl, COL_TEXT_PRI);
     } else if (recovering) {
         LBL_SET(s_top_state_lbl, s_txt_top_state, "RECOVER");
-        obj_bg_color(s_top_state_pill, COL_WARN_AMBER, 0);
+        obj_bg_color(s_top_state_pill, COL_AMBER, 0);
         label_color(s_top_state_lbl, COL_BG_ROOT);
     } else if (passive) {
         LBL_SET(s_top_state_lbl, s_txt_top_state, "PASSIVE");
-        obj_bg_color(s_top_state_pill, COL_WARN_AMBER, 0);
+        obj_bg_color(s_top_state_pill, COL_AMBER, 0);
         label_color(s_top_state_lbl, COL_BG_ROOT);
     } else if (st.state == CAN_STATE_RUNNING) {
         LBL_SET(s_top_state_lbl, s_txt_top_state, "RUNNING");
-        obj_bg_color(s_top_state_pill, COL_OK_GREEN, 0);
+        obj_bg_color(s_top_state_pill, COL_GREEN, 0);
         label_color(s_top_state_lbl, COL_BG_ROOT);
     } else {
         LBL_SET(s_top_state_lbl, s_txt_top_state, "STOPPED");
-        obj_bg_color(s_top_state_pill, COL_BG_CARD_ACT, 0);
+        obj_bg_color(s_top_state_pill, COL_BG_ELEVATED, 0);
         label_color(s_top_state_lbl, COL_TEXT_SEC);
     }
 
     LBL_FMT(s_top_cfg_lbl, s_txt_top_cfg, "%s • %s", can_bitrate_name(bitrate),
             can_mode_name(mode));
+    label_color(s_top_cfg_lbl, mode == CAN_MODE_NORMAL ? COL_AMBER : COL_TEXT_PRI);
 
     if (conn == UI_CONN_ONLINE) {
         LBL_FMT(s_top_link_lbl, s_txt_top_link, "HOST %lums", (unsigned long)rtt_ms);
-        label_color(s_top_link_lbl, COL_OK_GREEN);
+        label_color(s_top_link_lbl, COL_GREEN);
     } else if (conn == UI_CONN_HOST) {
         LBL_SET(s_top_link_lbl, s_txt_top_link, "HOST ...");
-        label_color(s_top_link_lbl, COL_ACCENT_CYAN);
+        label_color(s_top_link_lbl, COL_CYAN);
     } else if (conn == UI_CONN_RECONNECT) {
         LBL_SET(s_top_link_lbl, s_txt_top_link, "RETRY");
-        label_color(s_top_link_lbl, COL_WARN_AMBER);
+        label_color(s_top_link_lbl, COL_AMBER);
     } else {
         LBL_SET(s_top_link_lbl, s_txt_top_link, "WIFI ...");
-        label_color(s_top_link_lbl, COL_TEXT_MUTED);
+        label_color(s_top_link_lbl, COL_TEXT_DIM);
     }
 
+    /* ---- Page 1: DASH Telemetry ---- */
     if (s_current_view == VIEW_DASH) {
         const uint32_t permille = st.load_permille > 1000u ? 1000u : st.load_permille;
-        LBL_FMT(s_dash_load_val, s_txt_dash_load, "%lu.%lu%%",
+        LBL_FMT(s_dash_load_val_lbl, s_txt_load_val, "%lu.%lu%%",
                 (unsigned long)(permille / 10u), (unsigned long)(permille % 10u));
-        const lv_color_t load_col = permille < 500u ? COL_OK_GREEN
-                                    : permille < 800u ? COL_WARN_AMBER
-                                                      : COL_ERR_RED;
-        bar_update(s_dash_load_bar, (int32_t)permille, load_col);
 
-        LBL_FMT(s_dash_fps_val, s_txt_dash_fps, "%lu", (unsigned long)st.fps);
-        if (st.rx_total < 10000u) {
-            LBL_FMT(s_dash_total_lbl, s_txt_dash_total, "TOTAL %lu",
-                    (unsigned long)st.rx_total);
+        if (permille == 0u) {
+            LBL_SET(s_dash_load_grade_lbl, s_txt_load_grade, "IDLE");
+            label_color(s_dash_load_grade_lbl, COL_TEXT_DIM);
+        } else if (permille < 500u) {
+            LBL_SET(s_dash_load_grade_lbl, s_txt_load_grade, "NOMINAL");
+            label_color(s_dash_load_grade_lbl, COL_GREEN);
+        } else if (permille < 800u) {
+            LBL_SET(s_dash_load_grade_lbl, s_txt_load_grade, "HIGH");
+            label_color(s_dash_load_grade_lbl, COL_AMBER);
         } else {
-            LBL_FMT(s_dash_total_lbl, s_txt_dash_total, "TOTAL %.1fk",
-                    (double)st.rx_total / 1000.0);
+            LBL_SET(s_dash_load_grade_lbl, s_txt_load_grade, "PEAK");
+            label_color(s_dash_load_grade_lbl, COL_RED);
         }
 
-        LBL_FMT(s_dash_health_lbl, s_txt_dash_health, "TEC %lu • REC %lu • ERR %lu",
-                (unsigned long)st.tec, (unsigned long)st.rec,
-                (unsigned long)st.bus_errors);
-        label_color(s_dash_health_lbl,
-                    bus_off ? COL_ERR_RED
-                    : (passive || st.tec > 96u) ? COL_WARN_AMBER
-                                                : COL_TEXT_SEC);
+        /* 12-segment tri-color LED bar: 0..5 green, 6..8 amber, 9..11 red */
+        const int lit = (permille == 0u)
+                            ? 0
+                            : (int)((permille * LOAD_SEGMENTS + 999u) / 1000u);
+        for (int i = 0; i < LOAD_SEGMENTS; i++) {
+            lv_color_t seg_col = COL_BG_ELEVATED;
+            if (i < lit) {
+                seg_col = (i < 6) ? COL_GREEN : (i < 9) ? COL_AMBER : COL_RED;
+            }
+            obj_bg_color(s_dash_load_seg[i], seg_col, 0);
+        }
 
-        if (!sd.mounted) {
-            LBL_SET(s_dash_sd_lbl, s_txt_dash_sd, "SD NO CARD");
-            label_color(s_dash_sd_lbl, COL_TEXT_MUTED);
+        /* FPS, Ring Drops, and Total Frames */
+        LBL_FMT(s_dash_fps_val_lbl, s_txt_fps_val, "%lu", (unsigned long)st.fps);
+        if (ring.dropped == 0u) {
+            LBL_SET(s_dash_drop_lbl, s_txt_drop, "DROP 0");
+            label_color(s_dash_drop_lbl, COL_TEXT_DIM);
+        } else if (ring.dropped < 1000u) {
+            LBL_FMT(s_dash_drop_lbl, s_txt_drop, "DROP %lu",
+                    (unsigned long)ring.dropped);
+            label_color(s_dash_drop_lbl, COL_RED);
         } else {
-            char size[12];
-            if (sd.free_kb > 1024u * 1024u) {
-                snprintf(size, sizeof(size), "%.1f GB",
+            LBL_FMT(s_dash_drop_lbl, s_txt_drop, "DROP %luk",
+                    (unsigned long)(ring.dropped / 1000u));
+            label_color(s_dash_drop_lbl, COL_RED);
+        }
+
+        if (st.rx_total < 100000u) {
+            LBL_FMT(s_dash_total_lbl, s_txt_total, "TOTAL %lu",
+                    (unsigned long)st.rx_total);
+        } else if (st.rx_total < 1000000u) {
+            LBL_FMT(s_dash_total_lbl, s_txt_total, "TOTAL %.1fk",
+                    (double)st.rx_total / 1000.0);
+        } else {
+            LBL_FMT(s_dash_total_lbl, s_txt_total, "TOTAL %.2fM",
+                    (double)st.rx_total / 1000000.0);
+        }
+
+        /* 4-Cell Diagnostic Strip: TEC, REC, ERR+MISS, PSRAM RING % */
+        LBL_FMT(s_cell_val[0], s_txt_cell[0], "%lu", (unsigned long)st.tec);
+        const lv_color_t tec_col = st.tec > 127u ? COL_RED
+                                   : st.tec > 96u ? COL_AMBER
+                                                  : COL_GREEN;
+        obj_bg_color(s_cell_bar[0], tec_col, 0);
+        label_color(s_cell_val[0], st.tec > 96u ? tec_col : COL_TEXT_PRI);
+
+        LBL_FMT(s_cell_val[1], s_txt_cell[1], "%lu", (unsigned long)st.rec);
+        const lv_color_t rec_col = st.rec > 127u ? COL_RED
+                                   : st.rec > 96u ? COL_AMBER
+                                                  : COL_GREEN;
+        obj_bg_color(s_cell_bar[1], rec_col, 0);
+        label_color(s_cell_val[1], st.rec > 96u ? rec_col : COL_TEXT_PRI);
+
+        const uint32_t err_sum = st.bus_errors + st.rx_missed;
+        if (err_sum < 10000u) {
+            LBL_FMT(s_cell_val[2], s_txt_cell[2], "%lu", (unsigned long)err_sum);
+        } else {
+            LBL_FMT(s_cell_val[2], s_txt_cell[2], "%luk",
+                    (unsigned long)(err_sum / 1000u));
+        }
+        const lv_color_t err_col = (bus_off || err_sum > 0u) ? COL_RED : COL_GREEN;
+        obj_bg_color(s_cell_bar[2], err_col, 0);
+        label_color(s_cell_val[2], err_sum > 0u ? COL_RED : COL_TEXT_PRI);
+
+        const uint32_t ring_pct =
+            ring.cap > 0u ? (uint32_t)(((uint64_t)ring.used * 100ull) / ring.cap) : 0u;
+        LBL_FMT(s_cell_val[3], s_txt_cell[3], "%lu%%", (unsigned long)ring_pct);
+        const lv_color_t ring_col = ring_pct >= 80u ? COL_RED
+                                    : ring_pct >= 40u ? COL_AMBER
+                                                      : COL_CYAN;
+        obj_bg_color(s_cell_bar[3], ring_col, 0);
+        label_color(s_cell_val[3], ring_pct >= 40u ? ring_col : COL_TEXT_PRI);
+
+        /* SD Black-Box Bar */
+        if (!sd.mounted) {
+            LBL_SET(s_sd_badge_lbl, s_txt_sd_badge, "NO SD");
+            obj_bg_color(s_sd_badge, COL_BG_ELEVATED, 0);
+            label_color(s_sd_badge_lbl, COL_TEXT_DIM);
+
+            LBL_SET(s_sd_main_lbl, s_txt_sd_main, "SD CARD OFFLINE");
+            label_color(s_sd_main_lbl, COL_TEXT_SEC);
+            LBL_SET(s_sd_sub_lbl, s_txt_sd_sub, "INSERT FAT32 TF CARD");
+            label_color(s_sd_sub_lbl, COL_TEXT_DIM);
+        } else {
+            char size_str[16];
+            if (sd.free_kb >= 1024u * 1024u) {
+                snprintf(size_str, sizeof(size_str), "%.1f GB",
                          (double)sd.free_kb / (1024.0 * 1024.0));
             } else {
-                snprintf(size, sizeof(size), "%lu MB",
+                snprintf(size_str, sizeof(size_str), "%lu MB",
                          (unsigned long)(sd.free_kb / 1024u));
             }
+
             if (sd.recording) {
-                if (sd.dropped > 0) {
-                    LBL_FMT(s_dash_sd_lbl, s_txt_dash_sd, "SD %02lu • %s • DROP %lu",
-                            (unsigned long)sd.files, size, (unsigned long)sd.dropped);
+                LBL_SET(s_sd_badge_lbl, s_txt_sd_badge, "REC");
+                obj_bg_color(s_sd_badge, COL_GREEN, 0);
+                label_color(s_sd_badge_lbl, COL_BG_ROOT);
+
+                LBL_FMT(s_sd_main_lbl, s_txt_sd_main, "LOG #%02lu • %s",
+                        (unsigned long)sd.files, size_str);
+                label_color(s_sd_main_lbl, COL_TEXT_PRI);
+
+                if (sd.dropped > 0u) {
+                    LBL_FMT(s_sd_sub_lbl, s_txt_sd_sub, "CANDUMP • DROP %lu",
+                            (unsigned long)sd.dropped);
+                    label_color(s_sd_sub_lbl, COL_AMBER);
                 } else {
-                    LBL_FMT(s_dash_sd_lbl, s_txt_dash_sd, "SD %02lu • %s",
-                            (unsigned long)sd.files, size);
+                    LBL_SET(s_sd_sub_lbl, s_txt_sd_sub, "CANDUMP ACTIVE • 0 DROP");
+                    label_color(s_sd_sub_lbl, COL_GREEN);
                 }
             } else {
-                LBL_FMT(s_dash_sd_lbl, s_txt_dash_sd, "SD IDLE • %s", size);
+                LBL_SET(s_sd_badge_lbl, s_txt_sd_badge, "IDLE");
+                obj_bg_color(s_sd_badge, COL_BG_ELEVATED, 0);
+                label_color(s_sd_badge_lbl, COL_CYAN);
+
+                LBL_FMT(s_sd_main_lbl, s_txt_sd_main, "SD READY • %s", size_str);
+                label_color(s_sd_main_lbl, COL_TEXT_PRI);
+                LBL_FMT(s_sd_sub_lbl, s_txt_sd_sub, "%lu FILES RETAINED",
+                        (unsigned long)sd.files);
+                label_color(s_sd_sub_lbl, COL_TEXT_SEC);
             }
-            label_color(s_dash_sd_lbl, sd.recording ? COL_OK_GREEN : COL_TEXT_SEC);
         }
     }
 
+    /* ---- Page 2: SETUP Console ---- */
     if (s_current_view == VIEW_SET) {
         for (int i = 0; i < 4; i++) {
             const bool active = (BITRATES[i] == bitrate);
-            obj_bg_color(s_set_br_btn[i], active ? COL_ACCENT_CYAN : COL_BG_CARD, 0);
-            label_color(lv_obj_get_child(s_set_br_btn[i], 0),
-                        active ? COL_BG_ROOT : COL_TEXT_PRI);
+            obj_bg_color(s_set_br_btn[i], active ? COL_CYAN : COL_BG_SURFACE, 0);
+            obj_border_color(s_set_br_btn[i], active ? COL_CYAN : COL_BORDER_FOCUS, 0);
+            object_show(s_set_br_line[i], !active);
+            label_color(s_set_br_lbl[i], active ? COL_BG_ROOT : COL_TEXT_PRI);
         }
+
         for (int i = 0; i < 2; i++) {
             const bool active = (MODES[i] == mode);
-            obj_bg_color(s_set_mode_btn[i], active ? COL_ACCENT_CYAN : COL_BG_CARD, 0);
-            label_color(lv_obj_get_child(s_set_mode_btn[i], 0),
-                        active ? COL_BG_ROOT : COL_TEXT_PRI);
+            const lv_color_t active_col = (i == 0) ? COL_CYAN : COL_AMBER;
+            obj_bg_color(s_set_mode_btn[i], active ? active_col : COL_BG_SURFACE, 0);
+            obj_border_color(s_set_mode_btn[i],
+                             active ? active_col : COL_BORDER_FOCUS, 0);
+            object_show(s_set_mode_line[i], !active);
+            label_color(s_set_mode_lbl[i], active ? COL_BG_ROOT : COL_TEXT_PRI);
         }
 
         portENTER_CRITICAL(&s_ep_lock);
@@ -600,21 +845,32 @@ static void ui_tick_cb(lv_timer_t *timer)
 
         if (valid) {
             const uint8_t *o = (const uint8_t *)&ip;
-            if (conn == UI_CONN_ONLINE) {
-                LBL_FMT(s_set_host_lbl, s_txt_set_host,
-                        "HOST %u.%u.%u.%u:%u • %lu ms", (unsigned)o[0], (unsigned)o[1],
-                        (unsigned)o[2], (unsigned)o[3], (unsigned)port,
-                        (unsigned long)rtt_ms);
-                label_color(s_set_host_lbl, COL_OK_GREEN);
-            } else {
-                LBL_FMT(s_set_host_lbl, s_txt_set_host, "HOST %u.%u.%u.%u:%u • OFFLINE",
-                        (unsigned)o[0], (unsigned)o[1], (unsigned)o[2], (unsigned)o[3],
-                        (unsigned)port);
-                label_color(s_set_host_lbl, COL_TEXT_SEC);
-            }
+            LBL_FMT(s_set_host_ep_lbl, s_txt_host_ep, "%u.%u.%u.%u:%u",
+                    (unsigned)o[0], (unsigned)o[1], (unsigned)o[2], (unsigned)o[3],
+                    (unsigned)port);
+            label_color(s_set_host_ep_lbl, COL_TEXT_PRI);
         } else {
-            LBL_SET(s_set_host_lbl, s_txt_set_host, "NO HOST LINK");
-            label_color(s_set_host_lbl, COL_TEXT_MUTED);
+            LBL_SET(s_set_host_ep_lbl, s_txt_host_ep, "UDP DISCOVERY :8889");
+            label_color(s_set_host_ep_lbl, COL_TEXT_SEC);
+        }
+
+        if (conn == UI_CONN_ONLINE) {
+            LBL_FMT(s_set_host_pill_lbl, s_txt_host_pill, "ONLINE %lums",
+                    (unsigned long)rtt_ms);
+            obj_bg_color(s_set_host_pill, COL_GREEN, 0);
+            label_color(s_set_host_pill_lbl, COL_BG_ROOT);
+        } else if (conn == UI_CONN_HOST) {
+            LBL_SET(s_set_host_pill_lbl, s_txt_host_pill, "CONNECTING");
+            obj_bg_color(s_set_host_pill, COL_CYAN, 0);
+            label_color(s_set_host_pill_lbl, COL_BG_ROOT);
+        } else if (conn == UI_CONN_RECONNECT) {
+            LBL_SET(s_set_host_pill_lbl, s_txt_host_pill, "RECONNECT");
+            obj_bg_color(s_set_host_pill, COL_AMBER, 0);
+            label_color(s_set_host_pill_lbl, COL_BG_ROOT);
+        } else {
+            LBL_SET(s_set_host_pill_lbl, s_txt_host_pill, "NO WIFI");
+            obj_bg_color(s_set_host_pill, COL_BG_ELEVATED, 0);
+            label_color(s_set_host_pill_lbl, COL_TEXT_DIM);
         }
     }
 }
@@ -641,12 +897,14 @@ void linsight_ui_init(void)
     build_set_view(s_views[VIEW_SET]);
     build_bottom_dock(root);
 
-    s_toast = card_new(root, 0, 0, 220, 36);
+    s_toast = card_new(root, 0, 0, 236, 40);
     lv_obj_center(s_toast);
-    lv_obj_set_style_bg_color(s_toast, COL_BG_CARD_ACT, 0);
-    lv_obj_set_style_border_color(s_toast, COL_ACCENT_CYAN, 0);
-    lv_obj_set_style_border_width(s_toast, 1, 0);
-    s_toast_lbl = lbl_new(s_toast, "", 0, 0, &lv_font_montserrat_14, COL_TEXT_PRI);
+    lv_obj_set_style_bg_color(s_toast, COL_BG_ELEVATED, 0);
+    lv_obj_set_style_border_color(s_toast, COL_CYAN, 0);
+    lv_obj_set_style_border_width(s_toast, 2, 0);
+    lv_obj_set_style_radius(s_toast, 6, 0);
+    s_toast_bar = rect_new(s_toast, 0, 0, 232, 3, COL_CYAN, 0);
+    s_toast_lbl = lbl_new(s_toast, "", 0, 2, &lv_font_montserrat_16, COL_TEXT_PRI);
     lv_obj_center(s_toast_lbl);
     object_show(s_toast, false);
 
@@ -678,8 +936,7 @@ void linsight_ui_handle_key(bool long_press)
     } else if (s_current_view == VIEW_DASH) {
         mark_event_cb(NULL);
     } else {
-        twai_stats_clear();
-        toast_show("STATS CLEARED");
+        clear_stats_cb(NULL);
     }
     lvgl_port_unlock();
 }

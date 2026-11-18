@@ -465,6 +465,7 @@ static bool mount_card(void)
 static void sd_task(void *arg)
 {
     (void)arg;
+    bool first_try = true;
     uint32_t last_mount = 0;
     uint32_t last_mount_log = 0;
     uint32_t last_free = 0;
@@ -472,7 +473,8 @@ static void sd_task(void *arg)
     for (;;) {
         const uint32_t now = now_ms();
         if (!s_mounted) {
-            if (now - last_mount >= SD_RETRY_MS) {
+            if (first_try || now - last_mount >= SD_RETRY_MS) {
+                first_try = false;
                 last_mount = now;
                 if (!mount_card() && (now - last_mount_log >= 30000u)) {
                     last_mount_log = now;
@@ -548,7 +550,13 @@ void sd_store_push(const linsight_can_record_t *rec)
 
 bool sd_store_mark(const char *reason, uint32_t id, uint16_t seq)
 {
-    if (!s_marks) {
+    if (!s_marks || !s_lock) {
+        return false;
+    }
+    status_lock();
+    const bool rec = s_status.mounted && s_status.recording;
+    status_unlock();
+    if (!rec) {
         return false;
     }
     sd_mark_t mark = {
@@ -557,9 +565,6 @@ bool sd_store_mark(const char *reason, uint32_t id, uint16_t seq)
         .ts_ms = now_ms(),
     };
     snprintf(mark.reason, sizeof(mark.reason), "%s", reason ? reason : "mark");
-    if (s_fd < 0) {
-        return false;
-    }
     return xQueueSend(s_marks, &mark, 0) == pdTRUE; /* a dropped mark never blocks TX */
 }
 

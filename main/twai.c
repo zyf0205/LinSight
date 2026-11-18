@@ -39,6 +39,7 @@ typedef struct {
     QueueHandle_t events;
 
     can_stats_t stats; /* counters; single writer (twai task) + UI/net readers */
+    uint32_t rx_missed_base;
     volatile uint32_t rx_total;
 } twai_ctx_t;
 
@@ -99,12 +100,12 @@ const char *can_state_name(can_state_t state)
 
 can_bitrate_t twai_current_bitrate(void)
 {
-    return s_can.bitrate;
+    return (can_bitrate_t)__atomic_load_n(&s_can.bitrate, __ATOMIC_RELAXED);
 }
 
 can_mode_t twai_current_mode(void)
 {
-    return s_can.mode;
+    return (can_mode_t)__atomic_load_n(&s_can.mode, __ATOMIC_RELAXED);
 }
 
 static void stats_lock(void)
@@ -268,7 +269,10 @@ static void twai_task(void *arg)
                                        ((uint64_t)bitrate_info(s_can.bitrate)->hz * elapsed_us));
         s_can.stats.load_permille = permille > 1000u ? 1000u : permille;
         if (status_ok) {
-            s_can.stats.rx_missed = status.rx_missed_count;
+            if (status.rx_missed_count < s_can.rx_missed_base) {
+                s_can.rx_missed_base = 0;
+            }
+            s_can.stats.rx_missed = status.rx_missed_count - s_can.rx_missed_base;
             s_can.stats.tec = status.tx_error_counter;
             s_can.stats.rec = status.rx_error_counter;
             s_can.stats.state = driver_state(status.state);
@@ -351,8 +355,9 @@ esp_err_t twai_capture_start(can_bitrate_t bitrate, can_mode_t mode)
     /* Commit only after the driver is live: a failed install/start must not
      * leave the UI advertising a configuration that never took effect. */
     stats_lock();
-    s_can.bitrate = bitrate;
-    s_can.mode = mode;
+    __atomic_store_n(&s_can.bitrate, bitrate, __ATOMIC_RELAXED);
+    __atomic_store_n(&s_can.mode, mode, __ATOMIC_RELAXED);
+    s_can.rx_missed_base = 0;
     s_can.stats.state = CAN_STATE_RUNNING;
     stats_unlock();
 
@@ -430,10 +435,20 @@ bool twai_event_pop(can_event_t *out)
 
 void twai_stats_clear(void)
 {
+    twai_status_info_t status = {0};
+    const bool status_ok = twai_get_status_info(&status) == ESP_OK;
+
     stats_lock();
     const can_state_t state = s_can.stats.state;
+    const uint32_t tec = s_can.stats.tec;
+    const uint32_t rec = s_can.stats.rec;
     memset(&s_can.stats, 0, sizeof(s_can.stats));
     s_can.stats.state = state;
+    s_can.stats.tec = tec;
+    s_can.stats.rec = rec;
+    if (status_ok) {
+        s_can.rx_missed_base = status.rx_missed_count;
+    }
     __atomic_store_n(&s_can.rx_total, 0u, __ATOMIC_RELAXED);
     stats_unlock();
     ESP_LOGI(TAG, "stats cleared");
