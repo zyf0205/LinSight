@@ -27,6 +27,22 @@
 #include "sd_store.h"
 #include "twai.h"
 
+/* Font macros with graceful fallback if local sdkconfig has not yet regenerated
+ * from sdkconfig.defaults (where MONTSERRAT_16 and MONTSERRAT_20 are enabled). */
+#define FONT_12 (&lv_font_montserrat_12)
+#define FONT_14 (&lv_font_montserrat_14)
+#if defined(LV_FONT_MONTSERRAT_16) && LV_FONT_MONTSERRAT_16
+#define FONT_16 (&lv_font_montserrat_16)
+#else
+#define FONT_16 (&lv_font_montserrat_14)
+#endif
+#if defined(LV_FONT_MONTSERRAT_20) && LV_FONT_MONTSERRAT_20
+#define FONT_20 (&lv_font_montserrat_20)
+#else
+#define FONT_20 (&lv_font_montserrat_24)
+#endif
+#define FONT_24 (&lv_font_montserrat_24)
+
 /* -------------------------------------------------------------- geometry */
 #define UI_W                320
 #define UI_H                240
@@ -396,15 +412,15 @@ static void build_top_bar(lv_obj_t *parent)
     s_top_state_pill = rect_new(s_top_bar, PAD_X, 3, 76, 18, COL_GREEN, 9);
     snprintf(s_txt_top_state, sizeof(s_txt_top_state), "RUNNING");
     s_top_state_lbl = lbl_new(s_top_state_pill, s_txt_top_state, 0, 0,
-                              &lv_font_montserrat_12, COL_BG_ROOT);
+                              FONT_12, COL_BG_ROOT);
     lv_obj_center(s_top_state_lbl);
 
     snprintf(s_txt_top_cfg, sizeof(s_txt_top_cfg), "500K • LISTEN");
-    s_top_cfg_lbl = lbl_new(s_top_bar, s_txt_top_cfg, 90, 5, &lv_font_montserrat_12,
+    s_top_cfg_lbl = lbl_new(s_top_bar, s_txt_top_cfg, 90, 5, FONT_12,
                             COL_TEXT_PRI);
 
     snprintf(s_txt_top_link, sizeof(s_txt_top_link), "WIFI ...");
-    s_top_link_lbl = lbl_new(s_top_bar, s_txt_top_link, 200, 5, &lv_font_montserrat_12,
+    s_top_link_lbl = lbl_new(s_top_bar, s_txt_top_link, 200, 5, FONT_12,
                              COL_TEXT_DIM);
     lv_obj_set_width(s_top_link_lbl, 114);
     lv_obj_set_style_text_align(s_top_link_lbl, LV_TEXT_ALIGN_RIGHT, 0);
@@ -428,7 +444,7 @@ static void build_bottom_dock(lv_obj_t *parent)
 
         s_dock_line[i] = rect_new(s_dock_btn[i], 16, 0, w - 32, 3, COL_CYAN, 1);
 
-        s_dock_lbl[i] = lbl_new(s_dock_btn[i], names[i], 0, 1, &lv_font_montserrat_12,
+        s_dock_lbl[i] = lbl_new(s_dock_btn[i], names[i], 0, 1, FONT_12,
                                 i == 0 ? COL_TEXT_PRI : COL_TEXT_SEC);
         lv_obj_center(s_dock_lbl[i]);
     }
@@ -439,17 +455,17 @@ static void build_dash_view(lv_obj_t *parent)
     /* ---- Row 1: Dual Hero Cards (y=4, h=76) ---- */
     lv_obj_t *c_load = card_new(parent, PAD_X, 4, 151, 76);
     rect_new(c_load, 0, 0, 151, 2, COL_CYAN, 0);
-    lbl_new(c_load, "BUS LOAD", 10, 7, &lv_font_montserrat_12, COL_TEXT_SEC);
+    lbl_new(c_load, "BUS LOAD", 10, 7, FONT_12, COL_TEXT_SEC);
 
     snprintf(s_txt_load_grade, sizeof(s_txt_load_grade), "IDLE");
     s_dash_load_grade_lbl = lbl_new(c_load, s_txt_load_grade, 86, 7,
-                                    &lv_font_montserrat_12, COL_GREEN);
+                                    FONT_12, COL_GREEN);
     lv_obj_set_width(s_dash_load_grade_lbl, 55);
     lv_obj_set_style_text_align(s_dash_load_grade_lbl, LV_TEXT_ALIGN_RIGHT, 0);
 
     snprintf(s_txt_load_val, sizeof(s_txt_load_val), "0.0%%");
     s_dash_load_val_lbl = lbl_new(c_load, s_txt_load_val, 10, 24,
-                                  &lv_font_montserrat_24, COL_TEXT_PRI);
+                                  FONT_24, COL_TEXT_PRI);
 
     /* 12-segment tri-color LED load bar inside a dark recessed trough */
     lv_obj_t *seg_well = rect_new(c_load, 8, 56, 135, 12, COL_BG_ROOT, 3);
@@ -462,21 +478,21 @@ static void build_dash_view(lv_obj_t *parent)
     /* Right Hero Card: Frame Rate & Totals */
     lv_obj_t *c_fps = card_new(parent, 163, 4, 151, 76);
     rect_new(c_fps, 0, 0, 151, 2, COL_CYAN, 0);
-    lbl_new(c_fps, "FRAME RATE", 10, 7, &lv_font_montserrat_12, COL_TEXT_SEC);
+    lbl_new(c_fps, "FRAME RATE", 10, 7, FONT_12, COL_TEXT_SEC);
 
     snprintf(s_txt_drop, sizeof(s_txt_drop), "DROP 0");
-    s_dash_drop_lbl = lbl_new(c_fps, s_txt_drop, 80, 7, &lv_font_montserrat_12,
+    s_dash_drop_lbl = lbl_new(c_fps, s_txt_drop, 80, 7, FONT_12,
                               COL_TEXT_DIM);
     lv_obj_set_width(s_dash_drop_lbl, 61);
     lv_obj_set_style_text_align(s_dash_drop_lbl, LV_TEXT_ALIGN_RIGHT, 0);
 
     snprintf(s_txt_fps_val, sizeof(s_txt_fps_val), "0");
     s_dash_fps_val_lbl = lbl_new(c_fps, s_txt_fps_val, 10, 24,
-                                 &lv_font_montserrat_24, COL_TEXT_PRI);
+                                 FONT_24, COL_TEXT_PRI);
 
     lv_obj_t *tot_well = rect_new(c_fps, 8, 54, 135, 16, COL_BG_WELL, 3);
     snprintf(s_txt_total, sizeof(s_txt_total), "TOTAL 0");
-    s_dash_total_lbl = lbl_new(tot_well, s_txt_total, 6, 1, &lv_font_montserrat_12,
+    s_dash_total_lbl = lbl_new(tot_well, s_txt_total, 6, 1, FONT_12,
                                COL_TEXT_SEC);
 
     /* ---- Row 2: 4-Cell Diagnostic Strip (y=85, h=46) ---- */
@@ -486,30 +502,30 @@ static void build_dash_view(lv_obj_t *parent)
         s_cell_card[i] = card_new(parent, cx, 85, 74, 46);
         s_cell_bar[i] = rect_new(s_cell_card[i], 0, 0, 74, 2, COL_GREEN, 0);
 
-        lbl_new(s_cell_card[i], CELL_TITLES[i], 7, 5, &lv_font_montserrat_12,
+        lbl_new(s_cell_card[i], CELL_TITLES[i], 7, 5, FONT_12,
                 COL_TEXT_SEC);
 
         snprintf(s_txt_cell[i], sizeof(s_txt_cell[i]), i == 3 ? "0%%" : "0");
         s_cell_val[i] = lbl_new(s_cell_card[i], s_txt_cell[i], 7, 21,
-                                &lv_font_montserrat_20, COL_TEXT_PRI);
+                                FONT_20, COL_TEXT_PRI);
     }
 
     /* ---- Row 3: SD Black-Box Bar + MARK Shutter Button (y=136, h=42) ---- */
     lv_obj_t *c_sd = card_new(parent, PAD_X, 136, 214, 42);
     s_sd_badge = rect_new(c_sd, 7, 7, 46, 28, COL_BG_ELEVATED, 4);
     snprintf(s_txt_sd_badge, sizeof(s_txt_sd_badge), "NO SD");
-    s_sd_badge_lbl = lbl_new(s_sd_badge, s_txt_sd_badge, 0, 0, &lv_font_montserrat_12,
+    s_sd_badge_lbl = lbl_new(s_sd_badge, s_txt_sd_badge, 0, 0, FONT_12,
                              COL_TEXT_DIM);
     lv_obj_center(s_sd_badge_lbl);
 
     snprintf(s_txt_sd_main, sizeof(s_txt_sd_main), "SD CARD OFFLINE");
-    s_sd_main_lbl = lbl_new(c_sd, s_txt_sd_main, 60, 5, &lv_font_montserrat_14,
+    s_sd_main_lbl = lbl_new(c_sd, s_txt_sd_main, 60, 5, FONT_14,
                             COL_TEXT_SEC);
     lv_obj_set_width(s_sd_main_lbl, 148);
     lv_label_set_long_mode(s_sd_main_lbl, LV_LABEL_LONG_DOT);
 
     snprintf(s_txt_sd_sub, sizeof(s_txt_sd_sub), "INSERT FAT32 TF CARD");
-    s_sd_sub_lbl = lbl_new(c_sd, s_txt_sd_sub, 60, 23, &lv_font_montserrat_12,
+    s_sd_sub_lbl = lbl_new(c_sd, s_txt_sd_sub, 60, 23, FONT_12,
                            COL_TEXT_DIM);
     lv_obj_set_width(s_sd_sub_lbl, 148);
     lv_label_set_long_mode(s_sd_sub_lbl, LV_LABEL_LONG_DOT);
@@ -521,10 +537,10 @@ static void build_dash_view(lv_obj_t *parent)
     lv_obj_set_style_border_width(mark_btn, 2, 0);
     rect_new(mark_btn, 0, 0, 88, 3, COL_AMBER, 0);
 
-    lv_obj_t *m_lbl1 = lbl_new(mark_btn, "MARK", 0, 6, &lv_font_montserrat_16,
+    lv_obj_t *m_lbl1 = lbl_new(mark_btn, "MARK", 0, 6, FONT_16,
                                COL_AMBER);
     lv_obj_align(m_lbl1, LV_ALIGN_TOP_MID, 0, 5);
-    lv_obj_t *m_lbl2 = lbl_new(mark_btn, "LOG .TRG", 0, 0, &lv_font_montserrat_12,
+    lv_obj_t *m_lbl2 = lbl_new(mark_btn, "LOG .TRG", 0, 0, FONT_12,
                                COL_TEXT_PRI);
     lv_obj_align(m_lbl2, LV_ALIGN_BOTTOM_MID, 0, -4);
 }
@@ -532,9 +548,9 @@ static void build_dash_view(lv_obj_t *parent)
 static void build_set_view(lv_obj_t *parent)
 {
     /* ---- Section 1: 4-Way Bitrate Matrix ---- */
-    lbl_new(parent, "CAN BITRATE", PAD_X, 5, &lv_font_montserrat_12, COL_TEXT_SEC);
+    lbl_new(parent, "CAN BITRATE", PAD_X, 5, FONT_12, COL_TEXT_SEC);
     lv_obj_t *nvs_tag = lbl_new(parent, "NVS AUTO-SAVE", 200, 5,
-                                &lv_font_montserrat_12, COL_TEXT_DIM);
+                                FONT_12, COL_TEXT_DIM);
     lv_obj_set_width(nvs_tag, 114);
     lv_obj_set_style_text_align(nvs_tag, LV_TEXT_ALIGN_RIGHT, 0);
 
@@ -544,14 +560,14 @@ static void build_set_view(lv_obj_t *parent)
                                   bitrate_click_cb, (void *)(intptr_t)i);
         s_set_br_line[i] = rect_new(s_set_br_btn[i], 0, 0, 74, 3, COL_CYAN, 0);
         s_set_br_lbl[i] = lbl_new(s_set_br_btn[i], BITRATE_LABELS[i], 0, 1,
-                                  &lv_font_montserrat_16, COL_TEXT_PRI);
+                                  FONT_16, COL_TEXT_PRI);
         lv_obj_center(s_set_br_lbl[i]);
     }
 
     /* ---- Section 2: Controller Mode & Touch CLEAR Button ---- */
-    lbl_new(parent, "CONTROLLER MODE", PAD_X, 66, &lv_font_montserrat_12, COL_TEXT_SEC);
+    lbl_new(parent, "CONTROLLER MODE", PAD_X, 66, FONT_12, COL_TEXT_SEC);
     lv_obj_t *act_tag = lbl_new(parent, "COUNTERS", 224, 66,
-                                &lv_font_montserrat_12, COL_TEXT_SEC);
+                                FONT_12, COL_TEXT_SEC);
     lv_obj_set_width(act_tag, 90);
     lv_obj_set_style_text_align(act_tag, LV_TEXT_ALIGN_RIGHT, 0);
 
@@ -562,7 +578,7 @@ static void build_set_view(lv_obj_t *parent)
         s_set_mode_line[i] = rect_new(s_set_mode_btn[i], 0, 0, 102, 3,
                                       i == 0 ? COL_CYAN : COL_AMBER, 0);
         s_set_mode_lbl[i] = lbl_new(s_set_mode_btn[i], MODE_LABELS[i], 0, 1,
-                                    &lv_font_montserrat_16, COL_TEXT_PRI);
+                                    FONT_16, COL_TEXT_PRI);
         lv_obj_center(s_set_mode_lbl[i]);
     }
 
@@ -571,7 +587,7 @@ static void build_set_view(lv_obj_t *parent)
                                 clear_stats_cb, NULL);
     lv_obj_set_style_border_color(clr_btn, COL_CYAN, 0);
     rect_new(clr_btn, 0, 0, 94, 3, COL_CYAN, 0);
-    lv_obj_t *clr_lbl = lbl_new(clr_btn, "CLEAR", 0, 1, &lv_font_montserrat_16,
+    lv_obj_t *clr_lbl = lbl_new(clr_btn, "CLEAR", 0, 1, FONT_16,
                                 COL_CYAN);
     lv_obj_center(clr_lbl);
 
@@ -579,19 +595,19 @@ static void build_set_view(lv_obj_t *parent)
     lv_obj_t *c_host = card_new(parent, PAD_X, 128, CARD_FULL_W, 48);
     rect_new(c_host, 0, 0, 3, 48, COL_CYAN, 0);
 
-    lbl_new(c_host, "HOST STREAM ENDPOINT", 12, 6, &lv_font_montserrat_12,
+    lbl_new(c_host, "HOST STREAM ENDPOINT", 12, 6, FONT_12,
             COL_TEXT_SEC);
 
     snprintf(s_txt_host_ep, sizeof(s_txt_host_ep), "UDP DISCOVERY :8889");
     s_set_host_ep_lbl = lbl_new(c_host, s_txt_host_ep, 12, 23,
-                                &lv_font_montserrat_16, COL_TEXT_PRI);
+                                FONT_16, COL_TEXT_PRI);
     lv_obj_set_width(s_set_host_ep_lbl, 196);
     lv_label_set_long_mode(s_set_host_ep_lbl, LV_LABEL_LONG_DOT);
 
     s_set_host_pill = rect_new(c_host, 212, 13, 88, 22, COL_BG_ELEVATED, 11);
     snprintf(s_txt_host_pill, sizeof(s_txt_host_pill), "WIFI ...");
     s_set_host_pill_lbl = lbl_new(s_set_host_pill, s_txt_host_pill, 0, 0,
-                                  &lv_font_montserrat_12, COL_TEXT_DIM);
+                                  FONT_12, COL_TEXT_DIM);
     lv_obj_center(s_set_host_pill_lbl);
 }
 
@@ -904,7 +920,7 @@ void linsight_ui_init(void)
     lv_obj_set_style_border_width(s_toast, 2, 0);
     lv_obj_set_style_radius(s_toast, 6, 0);
     s_toast_bar = rect_new(s_toast, 0, 0, 232, 3, COL_CYAN, 0);
-    s_toast_lbl = lbl_new(s_toast, "", 0, 2, &lv_font_montserrat_16, COL_TEXT_PRI);
+    s_toast_lbl = lbl_new(s_toast, "", 0, 2, FONT_16, COL_TEXT_PRI);
     lv_obj_center(s_toast_lbl);
     object_show(s_toast, false);
 
