@@ -260,13 +260,15 @@ static void twai_task(void *arg)
          * real elapsed time instead of an integer second count: a window that
          * fires 100 ms late would otherwise over-report by 10% at low rates. */
         const uint64_t elapsed_us = now - window_start;
+        const can_bitrate_t br = twai_current_bitrate();
+        const can_mode_t mode = twai_current_mode();
         twai_status_info_t status = {0};
         const bool status_ok = twai_get_status_info(&status) == ESP_OK;
 
         stats_lock();
         s_can.stats.fps = (uint32_t)((uint64_t)frames_window * 1000000u / elapsed_us);
         uint32_t permille = (uint32_t)((uint64_t)bits_window * 1000000000ull /
-                                       ((uint64_t)bitrate_info(s_can.bitrate)->hz * elapsed_us));
+                                       ((uint64_t)bitrate_info(br)->hz * elapsed_us));
         s_can.stats.load_permille = permille > 1000u ? 1000u : permille;
         if (status_ok) {
             if (status.rx_missed_count < s_can.rx_missed_base) {
@@ -288,7 +290,7 @@ static void twai_task(void *arg)
         const uint32_t rx_total = __atomic_load_n(&s_can.rx_total, __ATOMIC_RELAXED);
         ESP_LOGI(TAG, "%s %s fps=%u load=%u.%u%% total=%u drop=%u missed=%u bus_err=%u "
                       "ring=%u/%u state=%s heap=%u psram=%u",
-                 can_bitrate_name(s_can.bitrate), can_mode_name(s_can.mode),
+                 can_bitrate_name(br), can_mode_name(mode),
                  (unsigned)snap.fps, (unsigned)(snap.load_permille / 10),
                  (unsigned)(snap.load_permille % 10),
                  (unsigned)rx_total, (unsigned)ring.dropped, (unsigned)snap.rx_missed,

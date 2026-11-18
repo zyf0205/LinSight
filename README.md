@@ -7,9 +7,9 @@
 - **CAN**：125k / 250k / 500k / 1M；LISTEN_ONLY / NORMAL；仅 CAN 2.0A/B。
 - **抓包缓冲**：4 MiB PSRAM 环形队列（约 20.9 万条）；满时覆盖最旧记录并计数，序号暴露缺口。
 - **SD 黑盒**：`recNNNNN.log` candump 文本；32 MiB 或 10 分钟轮转；保留最新 8 个；`.trg` 记录手动标记。
-- **本地界面**：320×240 LVGL；DASH / SETUP 两页；GPIO0 短按切页、长按在 DASH 标记日志、在 SETUP 清统计。
+- **本地界面**：320×240 LVGL；DASH / SETUP 两页；GPIO0 短按切页、长按在 DASH 标记日志、在 SETUP 清统计（SETUP 页亦提供触控 `CLEAR` 按钮）。
 - **网络推流**：Wi-Fi STA + TCP 主动连接主机；UDP 广播自动发现主机；HELLO / CAN_BATCH / EVENT / PING / PONG；断线自动重连。
-- **台架工具**：`tools/can_gui.py` 在 Windows 侧管理 usbipd 与 WSL2 `can0`，支持发帧、监听、统计和 CSV 导出。
+- **台架工具**：`tools/can_gui.py` 在 Windows 侧一键管理 usbipd 挂载与 WSL2 `can0` 波特率配置，支持单帧/预设发包、`cangen` 连续压测与 `candump` 实时监听。
 
 台架实测：4330 fps、96% 总线负载下零丢帧。
 
@@ -29,10 +29,10 @@
 
 | 路径 | 内容 |
 |---|---|
-| `main/` | 固件：`twai.c` 抓包、`can_ring.c` 环形缓冲、`sd_store.c` SD 黑盒、`net.c` 网络、`ui.c` 界面、`bsp.c` 板级、`settings.c` NVS 配置 |
+| `main/` | 固件：`twai.c` 抓包、`can_ring.c` 环形缓冲、`sd_store.c` SD 黑盒、`net.c` 网络、`ui.c` 界面、`bsp.c` 板级、`settings.c` NVS 配置与设备标识 |
 | `protocol/` | 与 WSL 主机仓库共享的线格式与解析器；两份 `frame.h` / `frame.c` 必须一致 |
 | `docs/` | 固件文档；`hardware.md` 是引脚与外设的唯一事实来源 |
-| `tools/can_gui.py` | Windows 台架 GUI |
+| `tools/can_gui.py` | Windows 台架轻量 GUI（usbipd + WSL2 `can0` 一键连线、发包、压测与监听） |
 | `sdkconfig.defaults` | 默认构建配置；`sdkconfig` 为本地生成文件，不入库 |
 | `partitions.csv` | 4 MB factory 应用 + 64 KB coredump |
 
@@ -42,6 +42,7 @@
 
 ```bash
 idf.py set-target esp32s3      # 首次
+idf.py reconfigure             # 同步 sdkconfig.defaults（开启 Montserrat 16/20 号字体等）
 idf.py menuconfig              # LinSight → Wi-Fi SSID/密码、主机回退 IP/端口、发现端口、默认 CAN 模式
 idf.py build
 idf.py -p COMx flash monitor
@@ -53,11 +54,11 @@ idf.py -p COMx flash monitor
 ## 使用
 
 1. **上电**：初始化屏幕、SD、CAN，然后连接 Wi-Fi 和主机。
-2. **界面**：底部 DOCK 点击切页，GPIO0 短按在 DASH / SETUP 间切换；长按在 DASH 打 MARK，在 SETUP 清统计。SETUP 页可改比特率和控制器模式，写入 NVS；切换在独立任务中执行，不阻塞界面。背光固定 80%。
+2. **界面**：底部 DOCK 点击切页，GPIO0 短按在 DASH / SETUP 间切换；长按在 DASH 打 MARK，在 SETUP 清统计（或直接点击 SETUP 页 `CLEAR` 按钮）。SETUP 页可改比特率和控制器模式，写入 NVS；切换在独立任务中执行，不阻塞界面。背光固定 80%。
 3. **CAN 安全**：默认 LISTEN_ONLY，不发送也不 ACK。只有恰好两个节点的台架才切 NORMAL。
-4. **SD 记录**：插入 FAT32 卡后自动挂载并记录，不自动格式化；卡满或写失败时停止记录，不阻塞抓包；每 5 秒重试挂载。
+4. **SD 记录**：插入 FAT32 卡后开机立即挂载并记录，不自动格式化；卡满或写失败时停止记录，不阻塞抓包；未插卡时每 5 秒重试挂载。
 5. **主机推流**：在 WSL 的 `~/linsight` 运行 `linsightd`。设备在首次连接、Wi-Fi 重连和连续失败重试时向 UDP 8889 广播发现，使用回复中的主机 IP 和 TCP 端口；无回复时回退到 `CONFIG_LINSIGHT_HOST_IP/PORT`。只接受单个 TCP 客户端。
-6. **Windows 台架**：`python tools/can_gui.py`，自动完成 usbipd attach 与 `can0` 配置，可发帧、监听和查看统计。
+6. **Windows 台架**：`python tools/can_gui.py`，一键完成 usbipd attach 与 `can0` 配置，可单帧/连续发帧、监听和查看实时统计。
 
 SD 日志行格式与 can-utils 一致，SavvyCAN 可直接打开：
 

@@ -2,9 +2,11 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #include "esp_check.h"
 #include "esp_log.h"
+#include "esp_mac.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "sdkconfig.h"
@@ -15,6 +17,8 @@
 #define NVS_KEY_BITRATE "br"
 #define NVS_KEY_MODE "mode"
 
+static char s_device_id[13];
+static bool s_id_ready;
 static uint32_t s_boot_count;
 static can_bitrate_t s_bitrate = CAN_BITRATE_500K;
 #if CONFIG_LINSIGHT_CAN_MODE_NORMAL
@@ -24,6 +28,18 @@ static can_mode_t s_mode = CAN_MODE_LISTEN_ONLY;
 #endif
 static bool s_has_bitrate;
 static bool s_has_mode;
+
+const char *linsight_device_id(void)
+{
+    if (!s_id_ready) {
+        uint8_t mac[6] = {0};
+        esp_read_mac(mac, ESP_MAC_WIFI_STA);
+        snprintf(s_device_id, sizeof(s_device_id), "%02X%02X%02X%02X%02X%02X",
+                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        s_id_ready = true;
+    }
+    return s_device_id;
+}
 
 esp_err_t settings_init(void)
 {

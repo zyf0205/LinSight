@@ -240,6 +240,9 @@ static void close_current(void)
 static bool open_new(void)
 {
     uint64_t kb = free_kb();
+    while ((s_file_count >= SD_KEEP_FILES || kb < SD_FREE_PRUNE_KB) && prune_oldest()) {
+        kb = free_kb();
+    }
     if (kb < SD_FREE_STOP_KB) {
         status_lock();
         s_status.free_kb = kb;
@@ -248,21 +251,6 @@ static bool open_new(void)
         ESP_LOGW(TAG, "card nearly full (< %u KB), recording stopped",
                  (unsigned)SD_FREE_STOP_KB);
         return false;
-    }
-    while (s_file_count >= SD_KEEP_FILES) {
-        if (!prune_oldest()) {
-            break;
-        }
-    }
-    kb = free_kb();
-    if (kb < SD_FREE_PRUNE_KB) {
-        while (kb < SD_FREE_PRUNE_KB && prune_oldest()) {
-            kb = free_kb();
-        }
-        if (kb < SD_FREE_STOP_KB) {
-            twai_event_push("sd_full");
-            return false;
-        }
     }
 
     uint32_t index = s_next_index++;
@@ -290,6 +278,7 @@ static bool open_new(void)
     status_lock();
     s_status.recording = true;
     s_status.files = s_file_count;
+    s_status.free_kb = kb;
     status_unlock();
     twai_event_push("sd_record");
     ESP_LOGI(TAG, "recording %s", path);

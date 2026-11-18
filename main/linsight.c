@@ -1,6 +1,5 @@
 #include "bsp.h"
 #include "can_ring.h"
-#include "device_info.h"
 #include "esp_log.h"
 #include "esp_lvgl_port.h"
 #include "frame.h"

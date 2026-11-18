@@ -9,6 +9,11 @@
 extern "C" {
 #endif
 
+#define LINSIGHT_FW_VERSION "2.1.0"
+
+/* Stable 12-hex-char device identity derived from the Wi-Fi STA MAC. */
+const char *linsight_device_id(void);
+
 /* One-time NVS bring-up. Must run before net_start()/Wi-Fi. */
 esp_err_t settings_init(void);
 

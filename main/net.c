@@ -10,7 +10,6 @@
 #include <unistd.h>
 
 #include "can_ring.h"
-#include "device_info.h"
 #include "esp_check.h"
 #include "esp_event.h"
 #include "esp_log.h"
@@ -158,6 +157,9 @@ static bool send_hello(int fd)
         (unsigned)LINSIGHT_PROTO_VERSION, LINSIGHT_FW_VERSION, linsight_device_id(),
         (unsigned)linsight_boot_count(), (unsigned)(esp_timer_get_time() / 1000),
         can_bitrate_name(twai_current_bitrate()), can_mode_name(twai_current_mode()));
+    if (n <= 0 || (size_t)n >= sizeof(json)) {
+        return false;
+    }
     return send_frame(fd, LINSIGHT_FRAME_HELLO, (const uint8_t *)json, (uint16_t)n);
 }
 
@@ -171,6 +173,9 @@ static bool send_events(int fd)
         char json[96];
         const int n = snprintf(json, sizeof(json), "{\"type\":\"%s\",\"ts_ms\":%u}", ev.type,
                                (unsigned)ev.ts_ms);
+        if (n <= 0 || (size_t)n >= sizeof(json)) {
+            return false;
+        }
         if (!send_frame(fd, LINSIGHT_FRAME_EVENT, (const uint8_t *)json, (uint16_t)n)) {
             return false;
         }
@@ -225,7 +230,6 @@ static void session_loop(int fd)
     }
     last_ping = last_rx_ms;
     linsight_ui_set_conn(UI_CONN_ONLINE, 0);
-    ESP_LOGI(TAG, "TCP session started");
 
     while (true) {
         if (!(xEventGroupGetBits(s_wifi_events) & WIFI_CONNECTED_BIT)) {
@@ -301,11 +305,7 @@ static void net_task(void *arg)
         if (__atomic_load_n(&s_need_discovery, __ATOMIC_ACQUIRE) || !s_host_valid) {
             uint32_t ip = 0;
             uint16_t port = 0;
-            bool found = false;
-#if CONFIG_LINSIGHT_DISCOVERY
-            found = discover_host(&ip, &port);
-#endif
-            if (found) {
+            if (discover_host(&ip, &port)) {
                 s_host_ip = ip;
                 s_host_port = port;
                 s_host_valid = true;
@@ -319,22 +319,11 @@ static void net_task(void *arg)
                     s_host_port = CONFIG_LINSIGHT_HOST_PORT;
                     s_host_valid = true;
                     linsight_ui_set_host_endpoint(s_host_ip, s_host_port);
-#if CONFIG_LINSIGHT_DISCOVERY
-                    ESP_LOGW(TAG, "discovery failed, fallback %s:%u",
+                    ESP_LOGI(TAG, "using fallback host %s:%u",
                              CONFIG_LINSIGHT_HOST_IP, (unsigned)CONFIG_LINSIGHT_HOST_PORT);
-#else
-                    ESP_LOGI(TAG, "discovery disabled, using %s:%u",
-                             CONFIG_LINSIGHT_HOST_IP, (unsigned)CONFIG_LINSIGHT_HOST_PORT);
-#endif
                 } else {
                     ESP_LOGE(TAG, "bad fallback host address: %s", CONFIG_LINSIGHT_HOST_IP);
                 }
-            } else {
-#if CONFIG_LINSIGHT_DISCOVERY
-                esp_ip4_addr_t ep = {.addr = s_host_ip};
-                ESP_LOGW(TAG, "discovery failed, keeping " IPSTR ":%u", IP2STR(&ep),
-                         (unsigned)s_host_port);
-#endif
             }
             __atomic_store_n(&s_need_discovery, false, __ATOMIC_RELEASE);
         }
@@ -347,10 +336,10 @@ static void net_task(void *arg)
         linsight_ui_set_conn(UI_CONN_HOST, 0);
         int err = 0;
         const int fd = tcp_connect_addr(s_host_ip, s_host_port, 3000, &err);
+        esp_ip4_addr_t ep = {.addr = s_host_ip};
         if (fd < 0) {
             fail_streak++;
             if (fail_streak == 1u || fail_streak % 10u == 0u) {
-                esp_ip4_addr_t ep = {.addr = s_host_ip};
                 ESP_LOGW(TAG, "host " IPSTR ":%u unreachable (attempt %u, errno %d)",
                          IP2STR(&ep), (unsigned)s_host_port, (unsigned)fail_streak, err);
             }
@@ -367,7 +356,6 @@ static void net_task(void *arg)
 
         backoff_ms = RECONNECT_DELAY_MIN_MS;
         fail_streak = 0;
-        esp_ip4_addr_t ep = {.addr = s_host_ip};
         ESP_LOGI(TAG, "TCP session started with " IPSTR ":%u", IP2STR(&ep),
                  (unsigned)s_host_port);
         session_loop(fd);
