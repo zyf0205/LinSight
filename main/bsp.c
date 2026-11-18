@@ -41,7 +41,6 @@ static esp_lcd_panel_io_handle_t s_lcd_io;
 static esp_lcd_panel_handle_t s_panel;
 static esp_lcd_touch_handle_t s_touch;
 static lv_disp_t *s_disp;
-static int s_brightness;
 
 static esp_err_t i2c_bus_init(void)
 {
@@ -96,7 +95,6 @@ static esp_err_t backlight_init(void)
 
     ESP_RETURN_ON_ERROR(ledc_timer_config(&timer), TAG, "ledc timer");
     ESP_RETURN_ON_ERROR(ledc_channel_config(&channel), TAG, "ledc channel");
-    s_brightness = 0;
     return ESP_OK;
 }
 
@@ -112,13 +110,7 @@ esp_err_t bsp_backlight_set(int percent)
                         TAG, "ledc duty");
     ESP_RETURN_ON_ERROR(ledc_update_duty(LEDC_LOW_SPEED_MODE, BSP_LCD_LEDC_CH),
                         TAG, "ledc update");
-    s_brightness = percent;
     return ESP_OK;
-}
-
-int bsp_backlight_get(void)
-{
-    return s_brightness;
 }
 
 /* GPIO0 user key: active-low, polled with 3-sample debounce */
@@ -264,6 +256,54 @@ static esp_err_t lvgl_init(void)
     return ESP_OK;
 }
 
+/* Touch polling runs in its own task: the I2C transfer can stall for up to a
+ * second on a disturbed bus, and that must never block lv_timer_handler(). */
+#define BSP_TOUCH_POLL_MS 30
+#define BSP_TOUCH_TASK_STACK 3072
+#define BSP_TOUCH_TASK_PRIO 2
+
+static portMUX_TYPE s_touch_lock = portMUX_INITIALIZER_UNLOCKED;
+static struct {
+    uint16_t x;
+    uint16_t y;
+    bool pressed;
+} s_touch_state;
+
+static void touch_read_cb(lv_indev_drv_t *drv, lv_indev_data_t *data)
+{
+    (void)drv;
+    portENTER_CRITICAL(&s_touch_lock);
+    data->point.x = s_touch_state.x;
+    data->point.y = s_touch_state.y;
+    data->state = s_touch_state.pressed ? LV_INDEV_STATE_PRESSED
+                                        : LV_INDEV_STATE_RELEASED;
+    portEXIT_CRITICAL(&s_touch_lock);
+}
+
+static void touch_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        uint16_t x = 0;
+        uint16_t y = 0;
+        uint8_t count = 0;
+        bool pressed = false;
+        esp_lcd_touch_point_data_t point = {0};
+        if (esp_lcd_touch_read_data(s_touch) == ESP_OK &&
+            esp_lcd_touch_get_data(s_touch, &point, &count, 1) == ESP_OK && count > 0) {
+            x = point.x;
+            y = point.y;
+            pressed = true;
+        }
+        portENTER_CRITICAL(&s_touch_lock);
+        s_touch_state.x = x;
+        s_touch_state.y = y;
+        s_touch_state.pressed = pressed;
+        portEXIT_CRITICAL(&s_touch_lock);
+        vTaskDelay(pdMS_TO_TICKS(BSP_TOUCH_POLL_MS));
+    }
+}
+
 static esp_err_t touch_init(void)
 {
     const esp_lcd_touch_config_t touch_cfg = {
@@ -290,11 +330,17 @@ static esp_err_t touch_init(void)
     ESP_RETURN_ON_ERROR(esp_lcd_touch_new_i2c_ft5x06(touch_io, &touch_cfg, &s_touch),
                         TAG, "touch");
 
-    const lvgl_port_touch_cfg_t lv_touch_cfg = {
-        .disp = s_disp,
-        .handle = s_touch,
-    };
-    ESP_RETURN_ON_FALSE(lvgl_port_add_touch(&lv_touch_cfg), ESP_FAIL, TAG, "add touch");
+    lvgl_port_lock(0);
+    static lv_indev_drv_t indev_drv;
+    lv_indev_drv_init(&indev_drv);
+    indev_drv.type = LV_INDEV_TYPE_POINTER;
+    indev_drv.read_cb = touch_read_cb;
+    lv_indev_drv_register(&indev_drv);
+    lvgl_port_unlock();
+
+    const BaseType_t ok = xTaskCreatePinnedToCore(touch_task, "touch", BSP_TOUCH_TASK_STACK,
+                                                  NULL, BSP_TOUCH_TASK_PRIO, NULL, 0);
+    ESP_RETURN_ON_FALSE(ok == pdPASS, ESP_ERR_NO_MEM, TAG, "touch task");
     return ESP_OK;
 }
 

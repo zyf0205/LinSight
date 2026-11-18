@@ -15,7 +15,6 @@ esp_err_t bsp_init(void);
 
 /* 0..100, active-low backlight on GPIO42 */
 esp_err_t bsp_backlight_set(int percent);
-int bsp_backlight_get(void);
 
 typedef enum {
     BSP_BUTTON_SHORT = 0,

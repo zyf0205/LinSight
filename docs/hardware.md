@@ -29,7 +29,7 @@
 
 - 除 J2 外没有引出其他 GPIO（GPIO12、22–25 需焊测试点）；所有 IO 为 3.3 V，不耐 5 V。
 - SD：板载 1-bit SDMMC，无卡检测脚；20 MHz 挂载，失败后降 10 MHz 重试；每 5 秒重试。
-- 用户键：GPIO0 每 20 ms 轮询消抖，长按阈值 800 ms；背光 GPIO42 用 LEDC 5 kHz、10-bit 占空比。
+- 用户键：GPIO0 每 20 ms 轮询消抖，长按阈值 800 ms；背光 GPIO42 用 LEDC 5 kHz、10-bit 占空比，固件固定 80%。
 
 ## 3. 显示与触摸
 
@@ -39,7 +39,7 @@
 | LCD RST | 未连接 |
 | SPI | Mode 2，80 MHz，`trans_queue_depth=10`，16 bpp |
 | 面板 | `invert_color=true`，`swap_xy=true`，`mirror_x=true` |
-| 触摸 | 地址 0x38，INT/RST 未接，轮询；`x_max=240, y_max=320, swap_xy=1, mirror_x=1` |
+| 触摸 | 地址 0x38，INT/RST 未接；独立任务 30 ms 轮询，LVGL 只读缓存坐标；`x_max=240, y_max=320, swap_xy=1, mirror_x=1` |
 
 初始化顺序（漏了会黑屏）：
 
@@ -48,7 +48,7 @@ i2c_bus_init() → pca9557_init() → panel_reset() → 写 PCA9557 输出 0x04�
 ```
 
 - Draw buffer：320×40、双缓冲、内部 DMA RAM（`MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL`）。
-- LVGL 任务固定在 core 1，优先级 4，栈 8 KB；`CONFIG_LV_COLOR_16_SWAP=y`。
+- LVGL 任务固定在 core 1，优先级 4，栈 8 KB；触摸任务在 core 0，优先级 2，栈 3 KB；`CONFIG_LV_COLOR_16_SWAP=y`。
 
 ## 4. PCA9557 与 I2C
 
@@ -108,7 +108,7 @@ USB-CAN            CAN_H ── 收发器 CANH
 | Flash / PSRAM | 16 MB QIO；Octal PSRAM 80 MHz；`CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=1024`（≤1 KB 留内部 RAM） |
 | TCP | WND 32768、SND 32768、RECVMBOX 32 |
 | Wi-Fi 缓冲 | static RX 4、dynamic RX/TX 12、mgmt 16 |
-| LVGL | `CONFIG_LV_COLOR_16_SWAP=y`、`CONFIG_LV_MEM_CUSTOM=y` |
+| LVGL | `CONFIG_LV_COLOR_16_SWAP=y`、`CONFIG_LV_MEM_CUSTOM=y`；`LV_USE_ASSERT_NULL/MALLOC` 关闭（默认断言是死循环，会静默卡死 UI） |
 | FATFS | `CONFIG_FATFS_LFN_NONE=y`、`CONFIG_FATFS_ALLOC_PREFER_EXTRAM=y` |
 | 分区表 | 4 MB factory 应用 + 64 KB coredump |
 
@@ -116,4 +116,4 @@ USB-CAN            CAN_H ── 收发器 CANH
 
 - [ ] `esp_psram_get_size()` = 8 MB；I2C 扫描到 0x19 / 0x38 / 0x6A
 - [ ] 纯色全屏正常（红/绿）
-- [ ] 背光 0% / 100% 可控，触摸四角坐标准确
+- [ ] 背光固定 80%，触摸四角坐标准确

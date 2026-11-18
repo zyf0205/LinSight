@@ -15,7 +15,7 @@ Bench Wi-Fi credentials and the host IP are Kconfig defaults (`CONFIG_LINSIGHT_*
 - `README.md` — project overview, features, build/flash, repository layout
 - `docs/hardware.md` — verified pinout, CAN wiring, LCD/touch init, sdkconfig gotchas
 - `protocol/frame.h` — wire format, limits, parser contract (shared with the host repo; keep both copies identical)
-- `main/ui.h` — UI API and the DASH/DIAG/SETUP contract consumed by `ui.c`
+- `main/ui.h` — UI API and the DASH/SETUP contract consumed by `ui.c`
 - `~/linsight/README.md` — host bridge daemon and bench reference
 
 ## Documentation rules
@@ -49,18 +49,19 @@ idf.py menuconfig                  # LinSight → CAN mode, Wi-Fi SSID/password,
 - **Ring** (`can_ring.c`): mutex-protected SPSC-style; overwrite-oldest on overflow with a visible drop counter; sequence numbers expose gaps.
 - **SD black box** (`sd_store.c`): independent PSRAM queue (16k), never blocks `twai_task`; 1-bit SDMMC CLK/CMD/D0 = 47/48/21; FAT32/8.3 `recNNNNN.log` in candump text (`(uptime_s.usec) can0 ID#DATA`, same syntax as can-utils and the host `--dump`; opens directly in SavvyCAN), 32 MiB or 10 min rotation, keep 8 files, `.trg` mark sidecars, `README.TXT` rewritten at each mount. Timestamps are device uptime (no RTC), so SavvyCAN shows 1970 + uptime. Bench-validated 2026-11-13: mount/remount and index continuation across resets, case-insensitive 8.3 scan/prune (FATFS returns upper-case names), byte- and time-based rotation plus keep-N pruning (exercised with temporary reduced limits), zero SD drops at ~850 fps.
 - **Shared protocol**: `protocol/frame.c` is pure C (no IDF, no malloc); the WSL host repo compiles a mirror of the same parser. 5-byte header `AA 55 type len_lo len_hi`; types 01 HELLO, 02 CAN_BATCH, 03 STATS, 04 EVENT, 05/06 PING/PONG, 07 CONTROL, 08 ACK, 09 FLOW, 10 DEVICE_INFO; record `seq u16 | ts_ms u32 | id u32 | flags u8 | dlc u8 | data[8]`; HELLO carries `device_id`/`boot`/`uptime_ms`. The firmware implements only HELLO/CAN_BATCH/EVENT/PING/PONG; the other types remain in the shared header for the host mirror.
-- **UI** (`ui.c`): three tabs DASH/DIAG/SETUP. DASH shows bus load, throughput (fps, RX total), bus health (state, TEC/REC, errors) and PAUSE/MARK buttons; DIAG shows TEC/REC bars, bus errors/off, RX missed, SD black-box status/free/dropped and Clear Stats/MARK; SETUP selects bitrate (125k/250k/500k/1M), controller mode (LISTEN/NORMAL/SELFTEST), backlight (20/50/80/100%) and shows the active host endpoint plus link status. The bottom dock switches views; GPIO0 short = cycle DASH → DIAG → SETUP, long = current view action (pause / clear stats / back to DASH), and a dark screen only wakes on the first press. net_task setters publish into lock-free mailboxes (connection state/RTT and host endpoint seqlock) that the 20 Hz LVGL timer drains, while the GPIO0 handler takes the LVGL lock for its short action.
+- **UI** (`ui.c`): two tabs DASH/SETUP. DASH shows bus load, FPS, RX total, TEC/REC/errors, SD recording/free space and a MARK button; SETUP selects bitrate (125k/250k/500k/1M) and controller mode (LISTEN/NORMAL) and shows the discovered host endpoint plus link/RTT. The bottom dock switches views; GPIO0 short toggles DASH/SETUP, long marks the log on DASH and clears counters on SETUP. Bitrate/mode changes run in a one-shot task outside the LVGL lock; the 20 Hz tick only reads bounded snapshots (stats mutex, SD status mutex, atomic mailbox, portMUX-protected endpoint). `net_task` setters publish into the lock-free mailbox, while the GPIO0 handler takes the LVGL lock for its short action.
+- **Touch** (`bsp.c`): a dedicated task (core 0, prio 2, 30 ms) polls FT6336 and publishes x/y/pressed under a portMUX; the LVGL indev `read_cb` only reads that cache. A stalled I2C bus cannot block `lv_timer_handler`.
 
 ## Hard constraints
 
-- Only the LVGL task and the GPIO0 key handler touch LVGL. `linsight_ui_handle_key` runs on the button task and takes `lvgl_port_lock` for its short view-switch action; `net_task` must only publish into the lock-free mailbox in `ui.c` — never take the LVGL mutex from `net_task` (`lvgl_port_lock(0)` waits forever, which stalls PING/PONG until the host drops the session).
+- Only the LVGL task and the GPIO0 key handler touch LVGL. `linsight_ui_handle_key` runs on the button task and takes `lvgl_port_lock` for its short view-switch action; `net_task` must only publish into the lock-free mailbox in `ui.c` — never take the LVGL mutex from `net_task` (`lvgl_port_lock(0)` waits forever, which stalls PING/PONG until the host drops the session). The touch task must never call LVGL; only the indev `read_cb` (LVGL task) reads the cached point. Never call SD/FAT, NVS, TWAI restart or blocking I2C from the 20 Hz LVGL tick.
 - LCD CS is **PCA9557 BIT0 @0x19**, not a GPIO. Order: `bsp_i2c_init()` → `pca9557_init()` → `panel_reset()` → write PCA9557 output `0x04` (CS low) → `panel_init()`.
 - LVGL draw buffers: internal DMA RAM, 320×40 ×2. CAN ring: PSRAM.
 - `CONFIG_LV_COLOR_16_SWAP=y`.
 - sdkconfig: CPU 240 MHz, `CONFIG_COMPILER_OPTIMIZATION_PERF`, `FREERTOS_HZ=1000`, TCP window 32 KB.
 - Single TCP client; `net_task` is the only firmware writer.
 - Protocol parser must stay allocation-free and IDF-independent so it can be fuzzed on the host.
-- TWAI macros (`TWAI_TIMING_CONFIG_*`, `TWAI_FILTER_CONFIG_ACCEPT_ALL`) expand to struct initializers — they can only initialize objects, never be passed as arguments. Self-test mode in IDF 5.5 is `TWAI_MODE_NO_ACK` (not `TWAI_MODE_SELF_TEST`); pair it with `msg.self = 1` for single-node load testing.
+- TWAI macros (`TWAI_TIMING_CONFIG_*`, `TWAI_FILTER_CONFIG_ACCEPT_ALL`) expand to struct initializers — they can only initialize objects, never be passed as arguments.
 - CAN safety: default LISTEN_ONLY; NORMAL mode only on a bench with exactly two nodes; 3.3 V transceiver, 120 Ω termination, common ground (see `docs/hardware.md` §5).
 - SD fan-out must stay non-blocking on `twai_task`: `sd_store_push` only does `xQueueSend(...,0)` and increments a drop counter; the SD task is the only writer, and `net_task`/SD never take the LVGL mutex.
 

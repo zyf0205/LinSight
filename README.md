@@ -4,10 +4,10 @@
 
 ## 功能
 
-- **CAN**：125k / 250k / 500k / 1M；LISTEN_ONLY / NORMAL / SELFTEST；仅 CAN 2.0A/B。
+- **CAN**：125k / 250k / 500k / 1M；LISTEN_ONLY / NORMAL；仅 CAN 2.0A/B。
 - **抓包缓冲**：4 MiB PSRAM 环形队列（约 20.9 万条）；满时覆盖最旧记录并计数，序号暴露缺口。
 - **SD 黑盒**：`recNNNNN.log` candump 文本；32 MiB 或 10 分钟轮转；保留最新 8 个；`.trg` 记录手动标记。
-- **本地界面**：320×240 LVGL；DASH / DIAG / SETUP 三页；GPIO0 短按切页、长按执行当前页动作。
+- **本地界面**：320×240 LVGL；DASH / SETUP 两页；GPIO0 短按切页、长按在 DASH 标记日志、在 SETUP 清统计。
 - **网络推流**：Wi-Fi STA + TCP 主动连接主机；UDP 广播自动发现主机；HELLO / CAN_BATCH / EVENT / PING / PONG；断线自动重连。
 - **台架工具**：`tools/can_gui.py` 在 Windows 侧管理 usbipd 与 WSL2 `can0`，支持发帧、监听、统计和 CSV 导出。
 
@@ -53,7 +53,7 @@ idf.py -p COMx flash monitor
 ## 使用
 
 1. **上电**：初始化屏幕、SD、CAN，然后连接 Wi-Fi 和主机。
-2. **界面**：底部 DOCK 点击切页，GPIO0 短按循环 DASH → DIAG → SETUP；长按执行当前页动作（暂停/恢复、清统计、返回 DASH；BUS-OFF 时为恢复总线）。熄屏时第一次按键只唤醒。SETUP 页可改比特率、控制器模式和亮度，前两项写入 NVS。
+2. **界面**：底部 DOCK 点击切页，GPIO0 短按在 DASH / SETUP 间切换；长按在 DASH 打 MARK，在 SETUP 清统计。SETUP 页可改比特率和控制器模式，写入 NVS；切换在独立任务中执行，不阻塞界面。背光固定 80%。
 3. **CAN 安全**：默认 LISTEN_ONLY，不发送也不 ACK。只有恰好两个节点的台架才切 NORMAL。
 4. **SD 记录**：插入 FAT32 卡后自动挂载并记录，不自动格式化；卡满或写失败时停止记录，不阻塞抓包；每 5 秒重试挂载。
 5. **主机推流**：在 WSL 的 `~/linsight` 运行 `linsightd`。设备在首次连接、Wi-Fi 重连和连续失败重试时向 UDP 8889 广播发现，使用回复中的主机 IP 和 TCP 端口；无回复时回退到 `CONFIG_LINSIGHT_HOST_IP/PORT`。只接受单个 TCP 客户端。
@@ -71,7 +71,7 @@ SD 日志行格式与 can-utils 一致，SavvyCAN 可直接打开：
 ## 文档
 
 - 线格式、字段与解析器契约：[`protocol/frame.h`](protocol/frame.h)
-- UI 接口与 DASH/DIAG/SETUP 约定：[`main/ui.h`](main/ui.h)
+- UI 接口与 DASH/SETUP 约定：[`main/ui.h`](main/ui.h)
 - 引脚、CAN 接线、LCD/触摸、sdkconfig：[`docs/hardware.md`](docs/hardware.md)
 - WSL 主机桥接与台架脚本：`~/linsight/README.md`
 

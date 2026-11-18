@@ -20,20 +20,25 @@ typedef enum {
 typedef enum {
     CAN_MODE_LISTEN_ONLY = 0, /* never ACKs / transmits; safe on unknown buses */
     CAN_MODE_NORMAL = 1,      /* ACKs the bus; bench use only */
-    CAN_MODE_SELFTEST = 2,    /* ACKs its own frames; single-node load testing */
 } can_mode_t;
+
+typedef enum {
+    CAN_STATE_STOPPED = 0,
+    CAN_STATE_RUNNING,
+    CAN_STATE_BUS_OFF,
+    CAN_STATE_RECOVERING,
+} can_state_t;
 
 typedef struct {
     uint32_t rx_total;      /* frames stored since boot (or since clear) */
     uint32_t rx_missed;     /* lost in the TWAI RX FIFO */
-    uint32_t rx_queue_full; /* software RX queue full alerts */
     uint32_t bus_errors;    /* bus error alerts */
     uint32_t bus_off;       /* bus-off events */
     uint32_t tec;           /* transmit error counter */
     uint32_t rec;           /* receive error counter */
     uint32_t fps;           /* frames received in the last full second */
     uint32_t load_permille; /* estimated bus load, 0..1000 */
-    const char *state;      /* "RUNNING" / "BUS_OFF" / "RECOVERING" / "STOPPED" */
+    can_state_t state;
 } can_stats_t;
 
 typedef struct {
@@ -54,11 +59,8 @@ esp_err_t twai_capture_start(can_bitrate_t bitrate, can_mode_t mode);
  * manual recovery. */
 esp_err_t twai_capture_restart(can_bitrate_t bitrate, can_mode_t mode);
 
-/* Push an event into the host/UI event queue (SD mount/full/io, bus errors). */
+/* Push an event into the host event queue (SD mount/full/io, bus errors). */
 void twai_event_push(const char *type);
-
-/* Manual bus-off recovery (DASH/DIAG bus-off action). No-op while running. */
-esp_err_t twai_capture_recover(void);
 
 /* Copy the counters. Thread-safe. */
 void twai_stats_snapshot(can_stats_t *out);
@@ -66,11 +68,12 @@ void twai_stats_snapshot(can_stats_t *out);
 /* Drain at most one pending event. Thread-safe. */
 bool twai_event_pop(can_event_t *out);
 
-/* Reset the software counters (DIAG Clear Stats); TWAI TEC/REC untouched. */
+/* Reset the software counters; TWAI TEC/REC untouched. */
 void twai_stats_clear(void);
 
 const char *can_bitrate_name(can_bitrate_t br);   /* "500k" */
 const char *can_mode_name(can_mode_t mode);       /* "LISTEN" / "NORMAL" */
+const char *can_state_name(can_state_t state);    /* "RUNNING" / "BUS_OFF" / ... */
 can_bitrate_t twai_current_bitrate(void);
 can_mode_t twai_current_mode(void);
 

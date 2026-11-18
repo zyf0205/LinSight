@@ -1,11 +1,7 @@
 #include "bsp.h"
 #include "can_ring.h"
 #include "device_info.h"
-#include "esp_chip_info.h"
-#include "esp_heap_caps.h"
 #include "esp_log.h"
-#include "esp_psram.h"
-#include "esp_system.h"
 #include "esp_lvgl_port.h"
 #include "frame.h"
 #include "freertos/FreeRTOS.h"
@@ -22,25 +18,19 @@ static const char *TAG = "linsight";
 
 static void user_button_cb(bsp_button_event_t event)
 {
-    if (bsp_backlight_get() == 0) {
-        /* Dark screen: any key press only wakes it (design §4). */
-        bsp_backlight_set(80);
-        return;
-    }
     linsight_ui_handle_key(event == BSP_BUTTON_LONG);
 }
 
 void app_main(void)
 {
-    esp_chip_info_t chip;
-    esp_chip_info(&chip);
-    ESP_LOGI(TAG, "chip model=%d cores=%d revision=%d", chip.model, chip.cores, chip.revision);
-    ESP_LOGI(TAG, "PSRAM size: %u bytes", (unsigned)esp_psram_get_size());
-    ESP_LOGI(TAG, "reset reason: %d", (int)esp_reset_reason());
     ESP_LOGI(TAG, "device id: %s", linsight_device_id());
 
     ESP_ERROR_CHECK(bsp_init());
-    ESP_ERROR_CHECK(settings_init());
+    const esp_err_t settings_err = settings_init();
+    if (settings_err != ESP_OK) {
+        /* Keep capturing with Kconfig defaults even if NVS is unavailable. */
+        ESP_LOGE(TAG, "settings init failed: %s", esp_err_to_name(settings_err));
+    }
     sd_store_init();
 
     /* 4 MiB PSRAM ring (~209k records). */
@@ -67,15 +57,11 @@ void app_main(void)
     ESP_ERROR_CHECK(bsp_user_button_init(user_button_cb));
 
     ESP_ERROR_CHECK(twai_capture_start(bitrate, mode));
-    ESP_LOGI(TAG, "heap before net: internal=%u largest=%u psram=%u",
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
     const esp_err_t net_err = net_start();
     if (net_err != ESP_OK) {
         /* A black box must keep recording even if networking cannot start. */
         ESP_LOGE(TAG, "net start failed: %s", esp_err_to_name(net_err));
     }
 
-    ESP_LOGI(TAG, "LinSight CAN ready (key: short=cycle views, long=view action)");
+    ESP_LOGI(TAG, "LinSight ready (key: short=switch page, long=mark/clear)");
 }

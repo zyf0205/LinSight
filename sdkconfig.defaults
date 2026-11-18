@@ -9,8 +9,8 @@ CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_OCT=y
 CONFIG_SPIRAM_SPEED_80M=y
-# LVGL uses system malloc for its object tree (LV_MEM_CUSTOM); keep small
-# allocations in PSRAM so internal RAM stays free for task stacks and DMA.
+# LVGL uses system malloc for its object tree (LV_MEM_CUSTOM). Allocations
+# below 1 KB stay in internal RAM; only larger blocks prefer PSRAM.
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=1024
 
 # CPU / cache / optimization
@@ -50,6 +50,15 @@ CONFIG_LV_MEM_CUSTOM=y
 CONFIG_LV_FONT_MONTSERRAT_12=y
 CONFIG_LV_FONT_MONTSERRAT_14=y
 CONFIG_LV_FONT_MONTSERRAT_24=y
+CONFIG_LV_BUILD_EXAMPLES=n
+CONFIG_LV_USE_SNAPSHOT=n
+# main/linsight_lv_assert.h turns LVGL's default `while(1)` assert handler into
+# a real abort, so a failed internal check cannot freeze the UI silently. The
+# path is relative to lvgl's src/misc/lv_assert.h because every component that
+# includes lvgl.h must be able to resolve it.
+CONFIG_LV_USE_ASSERT_NULL=n
+CONFIG_LV_USE_ASSERT_MALLOC=n
+CONFIG_LV_ASSERT_HANDLER_INCLUDE="../../../../main/linsight_lv_assert.h"
 
 # Custom partition table: 4MB factory app + 64KB coredump
 CONFIG_PARTITION_TABLE_CUSTOM=y

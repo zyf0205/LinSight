@@ -37,15 +37,12 @@ typedef struct {
     TaskHandle_t volatile task;
     SemaphoreHandle_t lock;
     QueueHandle_t events;
-    const char *state; /* "RUNNING" / "BUS_OFF" / "RECOVERING" / "STOPPED" */
 
     can_stats_t stats; /* counters; single writer (twai task) + UI/net readers */
     volatile uint32_t rx_total;
-} can_state_t;
+} twai_ctx_t;
 
-static can_state_t s_can = {
-    .state = "STOPPED",
-};
+static twai_ctx_t s_can;
 
 /* Serializes start/restart/recover and bus-off alert handling. The restart
  * path releases this lock while waiting for the TWAI task to exit, so the
@@ -83,13 +80,20 @@ const char *can_bitrate_name(can_bitrate_t br)
 
 const char *can_mode_name(can_mode_t mode)
 {
-    switch (mode) {
-    case CAN_MODE_NORMAL:
-        return "NORMAL";
-    case CAN_MODE_SELFTEST:
-        return "SELFTEST";
+    return mode == CAN_MODE_NORMAL ? "NORMAL" : "LISTEN";
+}
+
+const char *can_state_name(can_state_t state)
+{
+    switch (state) {
+    case CAN_STATE_RUNNING:
+        return "RUNNING";
+    case CAN_STATE_BUS_OFF:
+        return "BUS_OFF";
+    case CAN_STATE_RECOVERING:
+        return "RECOVERING";
     default:
-        return "LISTEN";
+        return "STOPPED";
     }
 }
 
@@ -113,10 +117,10 @@ static void stats_unlock(void)
     xSemaphoreGive(s_can.lock);
 }
 
-static void set_state(const char *state)
+static void set_state(can_state_t state)
 {
     stats_lock();
-    s_can.state = state;
+    s_can.stats.state = state;
     stats_unlock();
 }
 
@@ -168,7 +172,7 @@ static void handle_alerts(void)
         ESP_LOGW(TAG, "BUS-OFF, starting recovery");
         stats_lock();
         s_can.stats.bus_off++;
-        s_can.state = "RECOVERING";
+        s_can.stats.state = CAN_STATE_RECOVERING;
         stats_unlock();
         push_event("bus_off");
     }
@@ -191,7 +195,7 @@ static void handle_alerts(void)
             if (alerts & TWAI_ALERT_BUS_RECOVERED) {
                 const esp_err_t err = twai_start();
                 if (err == ESP_OK) {
-                    set_state("RUNNING");
+                    set_state(CAN_STATE_RUNNING);
                 } else {
                     ESP_LOGE(TAG, "bus recovery start: %s", esp_err_to_name(err));
                 }
@@ -208,24 +212,21 @@ static void handle_alerts(void)
         stats_unlock();
     }
     if (alerts & TWAI_ALERT_RX_QUEUE_FULL) {
-        stats_lock();
-        s_can.stats.rx_queue_full++;
-        stats_unlock();
         push_event("rx_overflow");
     }
 }
 
-static const char *driver_state_name(twai_state_t state)
+static can_state_t driver_state(twai_state_t state)
 {
     switch (state) {
     case TWAI_STATE_RUNNING:
-        return "RUNNING";
+        return CAN_STATE_RUNNING;
     case TWAI_STATE_BUS_OFF:
-        return "BUS_OFF";
+        return CAN_STATE_BUS_OFF;
     case TWAI_STATE_RECOVERING:
-        return "RECOVERING";
+        return CAN_STATE_RECOVERING;
     default:
-        return "STOPPED";
+        return CAN_STATE_STOPPED;
     }
 }
 
@@ -270,10 +271,9 @@ static void twai_task(void *arg)
             s_can.stats.rx_missed = status.rx_missed_count;
             s_can.stats.tec = status.tx_error_counter;
             s_can.stats.rec = status.rx_error_counter;
-            s_can.state = driver_state_name(status.state);
+            s_can.stats.state = driver_state(status.state);
         }
         const can_stats_t snap = s_can.stats;
-        const char *state_name = s_can.state;
         stats_unlock();
 
         frames_window = 0;
@@ -282,15 +282,14 @@ static void twai_task(void *arg)
         can_ring_info_t ring;
         can_ring_get_info(&ring);
         const uint32_t rx_total = __atomic_load_n(&s_can.rx_total, __ATOMIC_RELAXED);
-        ESP_LOGI(TAG, "%s %s fps=%u load=%u.%u%% total=%u drop=%u missed=%u rxq_full=%u "
-                      "bus_err=%u ring=%u/%u msgs_to_rx=%u state=%s heap=%u psram=%u",
+        ESP_LOGI(TAG, "%s %s fps=%u load=%u.%u%% total=%u drop=%u missed=%u bus_err=%u "
+                      "ring=%u/%u state=%s heap=%u psram=%u",
                  can_bitrate_name(s_can.bitrate), can_mode_name(s_can.mode),
                  (unsigned)snap.fps, (unsigned)(snap.load_permille / 10),
                  (unsigned)(snap.load_permille % 10),
-                 (unsigned)rx_total, (unsigned)ring.dropped,
-                 (unsigned)snap.rx_missed, (unsigned)snap.rx_queue_full,
+                 (unsigned)rx_total, (unsigned)ring.dropped, (unsigned)snap.rx_missed,
                  (unsigned)snap.bus_errors, (unsigned)ring.used, (unsigned)ring.cap,
-                 (unsigned)status.msgs_to_rx, state_name,
+                 can_state_name(snap.state),
                  (unsigned)esp_get_free_heap_size(),
                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
@@ -300,7 +299,7 @@ static void twai_task(void *arg)
     stats_lock();
     s_can.stats.fps = 0;
     s_can.stats.load_permille = 0;
-    s_can.state = "STOPPED";
+    s_can.stats.state = CAN_STATE_STOPPED;
     stats_unlock();
     twai_stop();
     twai_driver_uninstall();
@@ -325,16 +324,8 @@ esp_err_t twai_capture_start(can_bitrate_t bitrate, can_mode_t mode)
 
     twai_general_config_t general = TWAI_GENERAL_CONFIG_DEFAULT(TWAI_TX_GPIO, TWAI_RX_GPIO,
                                                                TWAI_MODE_LISTEN_ONLY);
-    switch (mode) {
-    case CAN_MODE_NORMAL:
+    if (mode == CAN_MODE_NORMAL) {
         general.mode = TWAI_MODE_NORMAL;
-        break;
-    case CAN_MODE_SELFTEST:
-        general.mode = TWAI_MODE_NO_ACK;
-        break;
-    default:
-        general.mode = TWAI_MODE_LISTEN_ONLY;
-        break;
     }
     general.rx_queue_len = TWAI_RX_QUEUE_LEN;
     /* No TWAI_ALERT_RX_DATA: receive is polled; alerts are error conditions only. */
@@ -345,14 +336,14 @@ esp_err_t twai_capture_start(can_bitrate_t bitrate, can_mode_t mode)
     const esp_err_t install_err = twai_driver_install(&general, &bitrate_info(bitrate)->timing,
                                                       &FILTER_ACCEPT_ALL);
     if (install_err != ESP_OK) {
-        set_state("STOPPED");
+        set_state(CAN_STATE_STOPPED);
         ESP_LOGE(TAG, "twai install: %s", esp_err_to_name(install_err));
         return install_err;
     }
     const esp_err_t start_err = twai_start();
     if (start_err != ESP_OK) {
         twai_driver_uninstall();
-        set_state("STOPPED");
+        set_state(CAN_STATE_STOPPED);
         ESP_LOGE(TAG, "twai start: %s", esp_err_to_name(start_err));
         return start_err;
     }
@@ -362,7 +353,7 @@ esp_err_t twai_capture_start(can_bitrate_t bitrate, can_mode_t mode)
     stats_lock();
     s_can.bitrate = bitrate;
     s_can.mode = mode;
-    s_can.state = "RUNNING";
+    s_can.stats.state = CAN_STATE_RUNNING;
     stats_unlock();
 
     s_can.running = true;
@@ -374,7 +365,7 @@ esp_err_t twai_capture_start(can_bitrate_t bitrate, can_mode_t mode)
         s_can.running = false;
         twai_stop();
         twai_driver_uninstall();
-        set_state("STOPPED");
+        set_state(CAN_STATE_STOPPED);
         return ESP_ERR_NO_MEM;
     }
 
@@ -421,47 +412,14 @@ persist:
     return err;
 }
 
-esp_err_t twai_capture_recover(void)
-{
-    xSemaphoreTake(s_restart_lock, portMAX_DELAY);
-
-    esp_err_t err;
-    if (!s_can.task || !s_can.running) {
-        err = ESP_ERR_INVALID_STATE; /* stopped or a restart is in progress */
-        goto out;
-    }
-
-    twai_status_info_t status = {0};
-    err = twai_get_status_info(&status);
-    if (err != ESP_OK) {
-        goto out;
-    }
-
-    if (status.state == TWAI_STATE_BUS_OFF) {
-        err = twai_initiate_recovery();
-        if (err == ESP_OK) {
-            set_state("RECOVERING");
-            ESP_LOGW(TAG, "manual bus-off recovery");
-        }
-    } else if (status.state == TWAI_STATE_STOPPED) {
-        err = twai_start();
-        if (err == ESP_OK) {
-            set_state("RUNNING");
-        }
-    } else {
-        err = ESP_OK; /* running or already recovering */
-    }
-out:
-    xSemaphoreGive(s_restart_lock);
-    return err;
-}
-
 void twai_stats_snapshot(can_stats_t *out)
 {
+    if (!out) {
+        return;
+    }
     stats_lock();
     *out = s_can.stats;
     out->rx_total = __atomic_load_n(&s_can.rx_total, __ATOMIC_RELAXED);
-    out->state = s_can.state;
     stats_unlock();
 }
 
@@ -473,7 +431,9 @@ bool twai_event_pop(can_event_t *out)
 void twai_stats_clear(void)
 {
     stats_lock();
+    const can_state_t state = s_can.stats.state;
     memset(&s_can.stats, 0, sizeof(s_can.stats));
+    s_can.stats.state = state;
     __atomic_store_n(&s_can.rx_total, 0u, __ATOMIC_RELAXED);
     stats_unlock();
     ESP_LOGI(TAG, "stats cleared");

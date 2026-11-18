@@ -57,7 +57,7 @@ esp_err_t settings_init(void)
         s_bitrate = (can_bitrate_t)raw;
         s_has_bitrate = true;
     }
-    if (nvs_get_u8(h, NVS_KEY_MODE, &raw) == ESP_OK && raw <= CAN_MODE_SELFTEST) {
+    if (nvs_get_u8(h, NVS_KEY_MODE, &raw) == ESP_OK && raw <= CAN_MODE_NORMAL) {
         s_mode = (can_mode_t)raw;
         s_has_mode = true;
     }
@@ -69,13 +69,12 @@ esp_err_t settings_init(void)
     nvs_close(h);
 
     if (err != ESP_OK) {
+        /* A read-only NVS must not stop capture; keep the in-memory count. */
         ESP_LOGW(TAG, "boot counter write: %s", esp_err_to_name(err));
-        return err;
     }
     s_boot_count = boot;
-    ESP_LOGI(TAG, "boot count %u", (unsigned)s_boot_count);
-    ESP_LOGI(TAG, "CAN config %s %s", can_bitrate_name(s_bitrate),
-             can_mode_name(s_mode));
+    ESP_LOGI(TAG, "boot %u, CAN %s %s", (unsigned)s_boot_count,
+             can_bitrate_name(s_bitrate), can_mode_name(s_mode));
     return ESP_OK;
 }
 

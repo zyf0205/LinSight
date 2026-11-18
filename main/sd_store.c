@@ -451,9 +451,10 @@ static bool mount_card(void)
     s_open_retry_ms = 0;
     scan_files();
     write_readme();
+    const uint64_t kb = free_kb(); /* walk the FAT outside the status lock */
     status_lock();
     s_status.mounted = true;
-    s_status.free_kb = free_kb();
+    s_status.free_kb = kb;
     status_unlock();
     twai_event_push("sd_mount");
     ESP_LOGI(TAG, "mounted, %u log files, next rec%05u.log", (unsigned)s_file_count,
@@ -507,8 +508,9 @@ static void sd_task(void *arg)
         const uint32_t t = now_ms();
         if (t - last_free >= 2000u) {
             last_free = t;
+            const uint64_t kb = free_kb(); /* never hold s_lock across the FAT walk */
             status_lock();
-            s_status.free_kb = free_kb();
+            s_status.free_kb = kb;
             status_unlock();
         }
     }
@@ -544,10 +546,10 @@ void sd_store_push(const linsight_can_record_t *rec)
     }
 }
 
-void sd_store_mark(const char *reason, uint32_t id, uint16_t seq)
+bool sd_store_mark(const char *reason, uint32_t id, uint16_t seq)
 {
     if (!s_marks) {
-        return;
+        return false;
     }
     sd_mark_t mark = {
         .id = id,
@@ -555,12 +557,20 @@ void sd_store_mark(const char *reason, uint32_t id, uint16_t seq)
         .ts_ms = now_ms(),
     };
     snprintf(mark.reason, sizeof(mark.reason), "%s", reason ? reason : "mark");
-    (void)xQueueSend(s_marks, &mark, 0); /* a dropped mark never blocks TX */
+    if (s_fd < 0) {
+        return false;
+    }
+    return xQueueSend(s_marks, &mark, 0) == pdTRUE; /* a dropped mark never blocks TX */
 }
 
 void sd_store_get_status(sd_status_t *out)
 {
+    if (!out) {
+        return;
+    }
     if (!s_lock) {
+        memset(out, 0, sizeof(*out));
+        out->dropped = __atomic_load_n(&s_drops, __ATOMIC_RELAXED);
         return;
     }
     status_lock();

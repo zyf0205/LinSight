@@ -13,7 +13,6 @@
 #include "device_info.h"
 #include "esp_check.h"
 #include "esp_event.h"
-#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_timer.h"
@@ -78,7 +77,6 @@ static bool s_need_discovery = true;
 static uint32_t s_host_ip;      /* network byte order */
 static uint16_t s_host_port;    /* host byte order */
 static bool s_host_valid;
-static bool s_host_discovered;
 
 /* --------------------------------------------------------------- utilities */
 
@@ -287,10 +285,6 @@ static void net_task(void *arg)
         vTaskDelete(NULL);
         return;
     }
-    ESP_LOGI(TAG, "wifi up: internal=%u largest=%u psram=%u",
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
     ESP_LOGI(TAG, "connecting Wi-Fi SSID=\"%s\"", CONFIG_LINSIGHT_WIFI_SSID);
 
     uint32_t backoff_ms = RECONNECT_DELAY_MIN_MS;
@@ -315,7 +309,6 @@ static void net_task(void *arg)
                 s_host_ip = ip;
                 s_host_port = port;
                 s_host_valid = true;
-                s_host_discovered = true;
                 linsight_ui_set_host_endpoint(ip, port);
                 esp_ip4_addr_t ep = {.addr = ip};
                 ESP_LOGI(TAG, "discovered host " IPSTR ":%u", IP2STR(&ep), (unsigned)port);
@@ -325,7 +318,6 @@ static void net_task(void *arg)
                     s_host_ip = fallback.s_addr;
                     s_host_port = CONFIG_LINSIGHT_HOST_PORT;
                     s_host_valid = true;
-                    s_host_discovered = false;
                     linsight_ui_set_host_endpoint(s_host_ip, s_host_port);
 #if CONFIG_LINSIGHT_DISCOVERY
                     ESP_LOGW(TAG, "discovery failed, fallback %s:%u",
@@ -359,9 +351,8 @@ static void net_task(void *arg)
             fail_streak++;
             if (fail_streak == 1u || fail_streak % 10u == 0u) {
                 esp_ip4_addr_t ep = {.addr = s_host_ip};
-                ESP_LOGW(TAG, "host " IPSTR ":%u unreachable (attempt %u, errno %d, %s)",
-                         IP2STR(&ep), (unsigned)s_host_port, (unsigned)fail_streak, err,
-                         s_host_discovered ? "discovered" : "fallback");
+                ESP_LOGW(TAG, "host " IPSTR ":%u unreachable (attempt %u, errno %d)",
+                         IP2STR(&ep), (unsigned)s_host_port, (unsigned)fail_streak, err);
             }
             if (fail_streak % DISCOVERY_RETRY_FAILURES == 0u || err == EHOSTUNREACH ||
                 err == ENETUNREACH) {
@@ -377,8 +368,8 @@ static void net_task(void *arg)
         backoff_ms = RECONNECT_DELAY_MIN_MS;
         fail_streak = 0;
         esp_ip4_addr_t ep = {.addr = s_host_ip};
-        ESP_LOGI(TAG, "TCP session started with " IPSTR ":%u (%s)", IP2STR(&ep),
-                 (unsigned)s_host_port, s_host_discovered ? "discovered" : "fallback");
+        ESP_LOGI(TAG, "TCP session started with " IPSTR ":%u", IP2STR(&ep),
+                 (unsigned)s_host_port);
         session_loop(fd);
         close(fd);
         linsight_ui_set_conn(UI_CONN_RECONNECT, 0);
